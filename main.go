@@ -906,6 +906,34 @@ func discoverClusterHosts() ([]string, error) {
 	return hosts, nil
 }
 
+// getClusterName returns the Weka cluster name by parsing `weka status`.
+// Falls back to the local hostname if weka is unavailable or the output
+// cannot be parsed.
+func getClusterName() string {
+	out, err := exec.Command("weka", "status").Output()
+	if err == nil {
+		// Look for a line like:  "       cluster: CST-LTS (uuid)"
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "cluster:") {
+				// "cluster: CST-LTS (8cfb113b-...)"
+				rest := strings.TrimPrefix(line, "cluster:")
+				rest = strings.TrimSpace(rest)
+				// Take everything before the first '(' (the UUID part)
+				if idx := strings.IndexByte(rest, '('); idx > 0 {
+					rest = strings.TrimSpace(rest[:idx])
+				}
+				if rest != "" {
+					return sanitizeHostname(rest)
+				}
+			}
+		}
+	}
+	// Fallback: use local hostname
+	h, _ := os.Hostname()
+	return sanitizeHostname(h)
+}
+
 // ── archive merging ───────────────────────────────────────────────────────────
 
 // mergeArchive extracts the tar.gz in srcData and re-writes every entry into
@@ -1017,10 +1045,9 @@ func main() {
 	toStdout := *outputPath == "-"
 	outPath := *outputPath
 	if !toStdout && outPath == "" {
-		hostname, _ := os.Hostname()
-		hostname = sanitizeHostname(hostname)
+		clusterName := getClusterName()
 		ts := time.Now().Format("2006-01-02T15-04-05")
-		outPath = fmt.Sprintf("/tmp/%s-weka-logs-%s.tar.gz", hostname, ts)
+		outPath = fmt.Sprintf("/tmp/%s-weka-logs-%s.tar.gz", clusterName, ts)
 	}
 
 	// ── print collection plan ─────────────────────────────────────────────
@@ -1163,10 +1190,9 @@ func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, 
 
 // writeArchive performs a local collection and writes to outPath (or stdout).
 func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, extraManifests []HostManifest) {
-	hostname, _ := os.Hostname()
-	hostname = sanitizeHostname(hostname)
+	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
-	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", hostname, ts)
+	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
 
 	var outWriter io.Writer
 	var outDesc string
@@ -1217,10 +1243,9 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 
 // writeMergedArchive merges results from all cluster hosts into a single archive.
 func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration) {
-	hostname, _ := os.Hostname()
-	hostname = sanitizeHostname(hostname)
+	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
-	archiveRoot := fmt.Sprintf("cluster-weka-logs-%s-%s", hostname, ts)
+	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
 
 	var outWriter io.Writer
 	var outDesc string
