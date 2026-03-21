@@ -39,6 +39,18 @@ var relativeTimeRe = regexp.MustCompile(
 	`^-(\d+)\s*(d|day|days|h|hr|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)$`,
 )
 
+// rotatedFileSuffixRe matches filename suffixes that indicate a rotated/archived log file.
+// Matches: .1  .2  .gz  -20260301 (date-stamped rotation)
+// Does NOT match: .log  .json  (current active log extensions)
+var rotatedFileSuffixRe = regexp.MustCompile(`(\.\d+|\.gz|-\d{8})$`)
+
+// isRotatedFile returns true when the filename looks like a rotated log archive.
+// Current active log files (syslog.log, output.log, messages) are always collected.
+// Rotated files (syslog.log.1, syslog.log.2.gz, messages-20260301) are filtered by mtime.
+func isRotatedFile(name string) bool {
+	return rotatedFileSuffixRe.MatchString(name)
+}
+
 func parseInputTime(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	if m := relativeTimeRe.FindStringSubmatch(strings.ToLower(s)); m != nil {
@@ -95,10 +107,11 @@ func profileEnabled(selected, check string) bool {
 
 // CommandSpec describes a shell command to run and capture.
 type CommandSpec struct {
-	Name    string // output filename (without extension)
-	Cmd     string // shell command
-	Profile string // which profile this belongs to (empty = always run)
-	Fatal   bool   // if true, collection fails if this command fails; default non-fatal
+	Name      string // output filename (without extension)
+	Cmd       string // shell command
+	Profile   string // which profile this belongs to (empty = always run)
+	Fatal     bool   // if true, collection fails if this command fails; default non-fatal
+	NodeLocal bool   // if true, output varies per node (weka local *); otherwise cluster-wide
 }
 
 // defaultCommands are run on every node that has the weka CLI available.
@@ -135,11 +148,11 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_debug_buckets_dist", Cmd: "weka debug buckets dist"},
 	// ── security ───────────────────────────────────────────────────
 	{Name: "weka_security_kms", Cmd: "weka security kms"},
-	// ── local container info ───────────────────────────────────────
-	{Name: "weka_local_ps", Cmd: "weka local ps -v"},
-	{Name: "weka_local_resources_drives0", Cmd: "weka local resources -C drives0"},
-	{Name: "weka_local_resources_compute0", Cmd: "weka local resources -C compute0"},
-	{Name: "weka_local_resources_frontend0", Cmd: "weka local resources -C frontend0"},
+	// ── local container info (node-local: different per host) ─────────────
+	{Name: "weka_local_ps", Cmd: "weka local ps -v", NodeLocal: true},
+	{Name: "weka_local_resources_drives0", Cmd: "weka local resources -C drives0", NodeLocal: true},
+	{Name: "weka_local_resources_compute0", Cmd: "weka local resources -C compute0", NodeLocal: true},
+	{Name: "weka_local_resources_frontend0", Cmd: "weka local resources -C frontend0", NodeLocal: true},
 }
 
 // fullCommands are added when profile is "full" or "all".
@@ -147,7 +160,7 @@ var fullCommands = []CommandSpec{
 	{Name: "weka_events_major", Cmd: "weka events --severity major", Profile: ProfileFull},
 	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1", Profile: ProfileFull},
 	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw", Profile: ProfileFull},
-	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", Profile: ProfileFull},
+	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", Profile: ProfileFull, NodeLocal: true},
 }
 
 // perfCommands are added for profile "perf" or "all".
@@ -180,11 +193,11 @@ var nfsCommands = []CommandSpec{
 	{Name: "weka_nfs_global_config", Cmd: "weka nfs global-config show", Profile: ProfileNFS},
 	{Name: "weka_nfs_custom_options", Cmd: "weka nfs custom-options", Profile: ProfileNFS},
 	{Name: "showmount", Cmd: "showmount -e", Profile: ProfileNFS},
-	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS},
-	{Name: "nfs_ganesha_config", Cmd: "weka local run /weka/cfgdump --container frontend0 | grep -i nfsGaneshaConfig -A 20", Profile: ProfileNFS},
-	{Name: "nfs_ganesha_queue", Cmd: "weka local exec --container ganesha cat /proc/wekafs/frontend0/queue", Profile: ProfileNFS},
+	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS, NodeLocal: true},
+	{Name: "nfs_ganesha_config", Cmd: "weka local run /weka/cfgdump --container frontend0 | grep -i nfsGaneshaConfig -A 20", Profile: ProfileNFS, NodeLocal: true},
+	{Name: "nfs_ganesha_queue", Cmd: "weka local exec --container ganesha cat /proc/wekafs/frontend0/queue", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "weka_stats_ops_nfsw", Cmd: "weka stats --category ops_nfsw --per-node -Z", Profile: ProfileNFS},
-	{Name: "netstat_nfs", Cmd: "netstat -tupnl", Profile: ProfileNFS},
+	{Name: "netstat_nfs", Cmd: "netstat -tupnl", Profile: ProfileNFS, NodeLocal: true},
 }
 
 // s3Commands are added for profile "s3" or "all".
@@ -197,8 +210,8 @@ var s3Commands = []CommandSpec{
 	{Name: "weka_s3_service_account", Cmd: "weka s3 service-account list", Profile: ProfileS3},
 	{Name: "weka_s3_containers_list", Cmd: "weka s3 cluster containers list", Profile: ProfileS3},
 	{Name: "weka_stats_ops_s3", Cmd: "weka stats --show-internal --category ops_s3 -Z", Profile: ProfileS3},
-	{Name: "s3_cgroup_memory", Cmd: "cat /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes && cat /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes", Profile: ProfileS3},
-	{Name: "netstat_s3", Cmd: "netstat -tuln | grep 9001", Profile: ProfileS3},
+	{Name: "s3_cgroup_memory", Cmd: "cat /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes && cat /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes", Profile: ProfileS3, NodeLocal: true},
+	{Name: "netstat_s3", Cmd: "netstat -tuln | grep 9001", Profile: ProfileS3, NodeLocal: true},
 }
 
 // smbwCommands are added for profile "smbw" or "all".
@@ -208,25 +221,25 @@ var smbwCommands = []CommandSpec{
 	{Name: "weka_smb_domain", Cmd: "weka smb domain", Profile: ProfileSMBW},
 	{Name: "weka_smb_share", Cmd: "weka smb share", Profile: ProfileSMBW},
 	{Name: "weka_smb_cluster_info", Cmd: "weka debug config show sambaClusterInfo", Profile: ProfileSMBW},
-	{Name: "pcs_cluster_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs cluster status", Profile: ProfileSMBW},
-	{Name: "pcs_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs status", Profile: ProfileSMBW},
-	{Name: "pcs_status_resources", Cmd: "weka local exec --container smbw /usr/sbin/pcs status resources", Profile: ProfileSMBW},
-	{Name: "pcs_constraint", Cmd: "weka local exec --container smbw /usr/sbin/pcs constraint", Profile: ProfileSMBW},
-	{Name: "sssd_conf", Cmd: "cat /etc/sssd/sssd.conf", Profile: ProfileSMBW},
+	{Name: "pcs_cluster_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs cluster status", Profile: ProfileSMBW, NodeLocal: true},
+	{Name: "pcs_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs status", Profile: ProfileSMBW, NodeLocal: true},
+	{Name: "pcs_status_resources", Cmd: "weka local exec --container smbw /usr/sbin/pcs status resources", Profile: ProfileSMBW, NodeLocal: true},
+	{Name: "pcs_constraint", Cmd: "weka local exec --container smbw /usr/sbin/pcs constraint", Profile: ProfileSMBW, NodeLocal: true},
+	{Name: "sssd_conf", Cmd: "cat /etc/sssd/sssd.conf", Profile: ProfileSMBW, NodeLocal: true},
 }
 
 // clientCommands are added for profile "client" or "all".
 var clientCommands = []CommandSpec{
-	{Name: "lshw_network", Cmd: "lshw -C network -businfo", Profile: ProfileClient},
-	{Name: "ofed_info", Cmd: "ofed_info -s", Profile: ProfileClient},
-	{Name: "lsmod", Cmd: "lsmod", Profile: ProfileClient},
-	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core", Profile: ProfileClient},
-	{Name: "modinfo_ice", Cmd: "modinfo ice", Profile: ProfileClient},
-	{Name: "ip_rule", Cmd: "ip rule", Profile: ProfileClient},
-	{Name: "ip_route", Cmd: "ip route show", Profile: ProfileClient},
-	{Name: "ip_neighbor", Cmd: "ip neighbor", Profile: ProfileClient},
-	{Name: "netstat", Cmd: "netstat -tunlp", Profile: ProfileClient},
-	{Name: "rp_filter", Cmd: "sysctl -a | grep -w rp_filter", Profile: ProfileClient},
+	{Name: "lshw_network", Cmd: "lshw -C network -businfo", Profile: ProfileClient, NodeLocal: true},
+	{Name: "ofed_info", Cmd: "ofed_info -s", Profile: ProfileClient, NodeLocal: true},
+	{Name: "lsmod", Cmd: "lsmod", Profile: ProfileClient, NodeLocal: true},
+	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core", Profile: ProfileClient, NodeLocal: true},
+	{Name: "modinfo_ice", Cmd: "modinfo ice", Profile: ProfileClient, NodeLocal: true},
+	{Name: "ip_rule", Cmd: "ip rule", Profile: ProfileClient, NodeLocal: true},
+	{Name: "ip_route", Cmd: "ip route show", Profile: ProfileClient, NodeLocal: true},
+	{Name: "ip_neighbor", Cmd: "ip neighbor", Profile: ProfileClient, NodeLocal: true},
+	{Name: "netstat", Cmd: "netstat -tunlp", Profile: ProfileClient, NodeLocal: true},
+	{Name: "rp_filter", Cmd: "sysctl -a | grep -w rp_filter", Profile: ProfileClient, NodeLocal: true},
 	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", Profile: ProfileClient},
 }
 
@@ -550,8 +563,11 @@ func globBase(pattern string) string {
 
 // collectLogFile adds a single log file to the tar writer.
 // destPath is the full path inside the archive (archiveRoot already included).
+// from is the --from time window: rotated log files (*.1, *.gz, -YYYYMMDD) whose
+// mtime predates from are skipped and recorded in the manifest with a note.
+// Current active log files are always collected regardless of from.
 // Returns a FileResult describing success or failure.
-func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
+func collectLogFile(tw *tar.Writer, srcPath, destPath string, from time.Time) FileResult {
 	result := FileResult{
 		SrcPath:  srcPath,
 		DestPath: destPath,
@@ -570,6 +586,18 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 	if err != nil {
 		result.Error = fmt.Sprintf("stat: %v", err)
 		result.Skipped = true
+		return result
+	}
+
+	// Time-window filtering: only apply to rotated/archived files.
+	// Current active log files are always collected (mtime doesn't reliably
+	// reflect their content range — they're still being written to).
+	if !from.IsZero() && isRotatedFile(filepath.Base(srcPath)) && info.ModTime().Before(from) {
+		note := fmt.Sprintf("rotated file mtime %s is before --from %s; skipped to reduce bundle size",
+			info.ModTime().UTC().Format(time.RFC3339), from.UTC().Format(time.RFC3339))
+		result.Skipped = true
+		result.SkipNote = note
+		logf("  SKIP %s: %s", srcPath, note)
 		return result
 	}
 
@@ -614,8 +642,11 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 
 // CollectLocal collects all logs and command outputs from the local host and
 // writes them into the provided tar.Writer under archiveRoot.
+// When nodeOnly is true, cluster-wide weka commands (those with NodeLocal==false
+// in defaultCommands and profile command slices) are skipped — they will be run
+// once by the cluster orchestrator instead.
 // Returns a HostManifest describing what was collected.
-func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration) HostManifest {
+func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool) HostManifest {
 	hostname, _ := os.Hostname()
 	manifest := HostManifest{
 		Hostname:    hostname,
@@ -662,6 +693,12 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	allWekaCmds := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile)...)
 
 	for _, spec := range allWekaCmds {
+		// In node-only mode (remote SSH collection), skip cluster-wide commands.
+		// They will be run once by the orchestrator and stored in cluster/weka/.
+		if nodeOnly && !spec.NodeLocal {
+			vlogf("  [%s] skipping cluster-wide command %s (--node-only)", hostname, spec.Name)
+			continue
+		}
 		logf("  [%s] running: %s", hostname, spec.Name)
 		result, out := runCommand(spec, cmdTimeout)
 		manifest.Commands = append(manifest.Commands, result)
@@ -728,7 +765,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			base := globBase(spec.SrcGlob)
 			relPath := strings.TrimPrefix(srcPath, base)
 			destPath := filepath.Join(archiveRoot, "hosts", hostname, spec.DestDir, relPath)
-			fr := collectLogFile(tw, srcPath, destPath)
+			fr := collectLogFile(tw, srcPath, destPath, from)
 			manifest.Files = append(manifest.Files, fr)
 			if fr.Error != "" {
 				warnf("[%s] file %s: %s", hostname, srcPath, fr.Error)
@@ -768,6 +805,20 @@ func buildProfileCommands(profile string) []CommandSpec {
 	addIfProfile(s3Commands, ProfileS3)
 	addIfProfile(smbwCommands, ProfileSMBW)
 	addIfProfile(clientCommands, ProfileClient)
+	return cmds
+}
+
+// buildClusterWideCmds returns all commands (default + profile) that produce
+// identical output on every node and should be run exactly once by the orchestrator.
+// These are commands with NodeLocal==false.
+func buildClusterWideCmds(profile string) []CommandSpec {
+	all := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile)...)
+	var cmds []CommandSpec
+	for _, spec := range all {
+		if !spec.NodeLocal {
+			cmds = append(cmds, spec)
+		}
+	}
 	return cmds
 }
 
@@ -824,9 +875,11 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 	// ── build the remote command ───────────────────────────────────────────
 	// When self-deployed, wrap in a shell that removes the binary on exit
 	// (whether collection succeeds or fails) to keep /tmp clean.
+	// --node-only tells the remote to skip cluster-wide commands (run once by orchestrator).
 	collectionCmd := strings.Join(append([]string{
 		remoteBin,
 		"--local",
+		"--node-only",
 		"--profile", profile,
 		"--output", "-",
 	}, func() []string {
@@ -985,12 +1038,13 @@ func main() {
 		profileStr   = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
 		outputPath   = flag.String("output", "", "Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.")
 		localOnly    = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
+		nodeOnly     = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
 		maxSizeMB    = flag.Uint64("max-size", 2048, "Abort if estimated collection size exceeds this value (MB)")
 		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
-		remoteBinary   = flag.String("remote-binary", "/usr/local/bin/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
-		noSelfDeploy   = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
-		workerCount    = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
+		remoteBinary = flag.String("remote-binary", "/usr/local/bin/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
+		noSelfDeploy = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
+		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
 		cmdTimeout   = flag.Duration("cmd-timeout", 60*time.Second, "Timeout per command")
 		ver          = flag.Bool("version", false, "Print version and exit")
 	)
@@ -1119,7 +1173,7 @@ func main() {
 	// ── single local collection ───────────────────────────────────────────
 	if *localOnly {
 		phase("Local collection")
-		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, nil)
+		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, nil)
 		return
 	}
 
@@ -1131,7 +1185,7 @@ func main() {
 		if err != nil {
 			warnf("Could not discover cluster hosts: %v", err)
 			warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
-			writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, nil)
+			writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, nil)
 			return
 		}
 		clusterHosts = discovered
@@ -1189,7 +1243,7 @@ func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, 
 }
 
 // writeArchive performs a local collection and writes to outPath (or stdout).
-func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, extraManifests []HostManifest) {
+func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, extraManifests []HostManifest) {
 	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
@@ -1212,10 +1266,14 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 		outDesc = outPath
 	}
 
-	gz := gzip.NewWriter(outWriter)
+	gz, err := gzip.NewWriterLevel(outWriter, gzip.BestCompression)
+	if err != nil {
+		errorf("gzip init: %v", err)
+		os.Exit(1)
+	}
 	tw := tar.NewWriter(gz)
 
-	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout)
+	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, nodeOnly)
 
 	// Write manifest
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
@@ -1265,8 +1323,33 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		outDesc = outPath
 	}
 
-	gz := gzip.NewWriter(outWriter)
+	gz, err := gzip.NewWriterLevel(outWriter, gzip.BestCompression)
+	if err != nil {
+		errorf("gzip init: %v", err)
+		os.Exit(1)
+	}
 	tw := tar.NewWriter(gz)
+
+	// ── run cluster-wide weka commands once on the orchestrator ───────────
+	// These commands produce identical output on every node; running them once
+	// avoids duplicating the same files N times (once per cluster host).
+	phase("Cluster-wide Weka commands (run once from orchestrator)")
+	clusterCmds := buildClusterWideCmds(profile)
+	for _, spec := range clusterCmds {
+		logf("  [cluster] running: %s", spec.Name)
+		result, out := runCommand(spec, cmdTimeout)
+		if result.Error != "" {
+			warnf("[cluster] command %q failed (exit %d): %s", spec.Name, result.ExitCode, result.Error)
+		}
+		dest := filepath.Join(archiveRoot, "cluster", "weka", spec.Name+".txt")
+		content := out
+		if result.Error != "" && len(out) == 0 {
+			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, result.Error))
+		}
+		if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
+			warnf("[cluster] could not add %s to archive: %v", spec.Name, addErr)
+		}
+	}
 
 	var succeeded, failed int
 	var failedHosts []string
