@@ -263,6 +263,8 @@ var systemCommands = []CommandSpec{
 	// weka-agent service journal (last 50k lines; full journal captured via journalctlWithWindow)
 	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager -n 50000"},
 	{Name: "journalctl_weka_agent_verbose", Cmd: "journalctl -xu weka-agent --no-pager -n 10000"},
+	// kernel ring buffer with timestamps
+	{Name: "dmesg", Cmd: "dmesg -T"},
 }
 
 // LogFileSpec describes a set of log files to collect.
@@ -485,6 +487,40 @@ func phase(name string) {
 
 // ── command runner ────────────────────────────────────────────────────────────
 
+// cmdWorkers is the number of commands run in parallel within a single host collection.
+// Commands are weka CLI calls (API calls to the management plane) and OS commands
+// that are independent of each other — running them concurrently gives a large
+// speedup over sequential execution.
+const cmdWorkers = 8
+
+// cmdOutput holds the result of a single command execution.
+type cmdOutput struct {
+	result CommandResult
+	out    []byte
+}
+
+// runCommandsParallel runs specs concurrently (up to cmdWorkers at a time) and
+// returns results in the same order as specs. It is safe to call from a single
+// goroutine; tar writes happen after this returns.
+func runCommandsParallel(specs []CommandSpec, timeout time.Duration) []cmdOutput {
+	outputs := make([]cmdOutput, len(specs))
+	sem := make(chan struct{}, cmdWorkers)
+	var wg sync.WaitGroup
+	for i, spec := range specs {
+		i, spec := i, spec
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			result, out := runCommand(spec, timeout)
+			outputs[i] = cmdOutput{result, out}
+		}()
+	}
+	wg.Wait()
+	return outputs
+}
+
 // runCommand executes a shell command with a timeout and returns its output.
 // It is always non-fatal: errors are captured in the returned CommandResult.
 func runCommand(spec CommandSpec, timeout time.Duration) (CommandResult, []byte) {
@@ -664,58 +700,57 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 
 	hostRoot := filepath.Join(archiveRoot, "hosts", hostname)
 
-	// ── phase: system commands ────────────────────────────────────────────
-	phase(fmt.Sprintf("[%s] System commands", hostname))
-	for _, spec := range systemCommands {
-		result, out := runCommand(spec, cmdTimeout)
-		manifest.Commands = append(manifest.Commands, result)
-		if result.Error != "" {
-			warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, result.ExitCode, result.Error)
+	// ── phase: system commands (parallel) ────────────────────────────────
+	phase(fmt.Sprintf("[%s] System commands (%d parallel)", hostname, cmdWorkers))
+	sysOutputs := runCommandsParallel(systemCommands, cmdTimeout)
+	for i, spec := range systemCommands {
+		co := sysOutputs[i]
+		manifest.Commands = append(manifest.Commands, co.result)
+		if co.result.Error != "" {
+			warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+		}
+		content := co.out
+		if co.result.Error != "" && len(co.out) == 0 {
+			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
 		}
 		dest := filepath.Join(hostRoot, "system", spec.Name+".txt")
-		content := out
-		if result.Error != "" && len(out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, result.Error))
-		}
 		if err := addBytesToArchive(tw, dest, content); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
 	}
 
-	// dmesg separately (timestamped)
-	result, out := runCommand(CommandSpec{Name: "dmesg", Cmd: "dmesg -T"}, cmdTimeout)
-	manifest.Commands = append(manifest.Commands, result)
-	_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "dmesg.txt"), out)
-
-	// ── phase: weka CLI commands ──────────────────────────────────────────
-	phase(fmt.Sprintf("[%s] Weka commands (profile: %s)", hostname, profile))
+	// ── phase: weka CLI commands (parallel) ───────────────────────────────
+	phase(fmt.Sprintf("[%s] Weka commands (profile: %s, %d parallel)", hostname, profile, cmdWorkers))
 
 	allWekaCmds := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile)...)
 
+	// Filter to the commands we'll actually run on this node before parallelising.
+	var wekaToRun []CommandSpec
 	for _, spec := range allWekaCmds {
-		// In node-only mode (remote SSH collection), skip cluster-wide commands.
-		// They will be run once by the orchestrator and stored in cluster/weka/.
 		if nodeOnly && !spec.NodeLocal {
 			vlogf("  [%s] skipping cluster-wide command %s (--node-only)", hostname, spec.Name)
 			continue
 		}
-		logf("  [%s] running: %s", hostname, spec.Name)
-		result, out := runCommand(spec, cmdTimeout)
-		manifest.Commands = append(manifest.Commands, result)
-		if result.Error != "" {
-			warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, result.ExitCode, result.Error)
+		wekaToRun = append(wekaToRun, spec)
+	}
+	logf("  [%s] running %d weka commands", hostname, len(wekaToRun))
+	wekaOutputs := runCommandsParallel(wekaToRun, cmdTimeout)
+	for i, spec := range wekaToRun {
+		co := wekaOutputs[i]
+		manifest.Commands = append(manifest.Commands, co.result)
+		if co.result.Error != "" {
+			warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+		}
+		content := co.out
+		if co.result.Error != "" && len(co.out) == 0 {
+			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
 		}
 		dest := filepath.Join(hostRoot, "weka", spec.Name+".txt")
-		content := out
-		if result.Error != "" && len(out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, result.Error))
-		}
 		if err := addBytesToArchive(tw, dest, content); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
-		// capture weka version for manifest
-		if spec.Name == "weka_version" && len(out) > 0 {
-			manifest.WekaVersion = strings.TrimSpace(string(out))
+		if spec.Name == "weka_version" && len(co.out) > 0 {
+			manifest.WekaVersion = strings.TrimSpace(string(co.out))
 		}
 	}
 
@@ -1333,19 +1368,20 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	// ── run cluster-wide weka commands once on the orchestrator ───────────
 	// These commands produce identical output on every node; running them once
 	// avoids duplicating the same files N times (once per cluster host).
-	phase("Cluster-wide Weka commands (run once from orchestrator)")
 	clusterCmds := buildClusterWideCmds(profile)
-	for _, spec := range clusterCmds {
-		logf("  [cluster] running: %s", spec.Name)
-		result, out := runCommand(spec, cmdTimeout)
-		if result.Error != "" {
-			warnf("[cluster] command %q failed (exit %d): %s", spec.Name, result.ExitCode, result.Error)
+	phase(fmt.Sprintf("Cluster-wide Weka commands (run once, %d parallel)", cmdWorkers))
+	logf("  [cluster] running %d cluster-wide commands", len(clusterCmds))
+	clusterOutputs := runCommandsParallel(clusterCmds, cmdTimeout)
+	for i, spec := range clusterCmds {
+		co := clusterOutputs[i]
+		if co.result.Error != "" {
+			warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
+		}
+		content := co.out
+		if co.result.Error != "" && len(co.out) == 0 {
+			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
 		}
 		dest := filepath.Join(archiveRoot, "cluster", "weka", spec.Name+".txt")
-		content := out
-		if result.Error != "" && len(out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, result.Error))
-		}
 		if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
 			warnf("[cluster] could not add %s to archive: %v", spec.Name, addErr)
 		}
