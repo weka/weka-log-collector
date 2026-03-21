@@ -247,68 +247,81 @@ var systemCommands = []CommandSpec{
 	{Name: "lspci", Cmd: "lspci"},
 	{Name: "lsblk", Cmd: "lsblk -d"},
 	{Name: "sysctl_conf", Cmd: "cat /etc/sysctl.conf"},
+	// weka-agent service journal (last 50k lines; full journal captured via journalctlWithWindow)
+	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager -n 50000"},
+	{Name: "journalctl_weka_agent_verbose", Cmd: "journalctl -xu weka-agent --no-pager -n 10000"},
 }
 
-// logFiles are collected from disk. The From/To time window is applied to
-// filter lines from text log files when possible.
+// LogFileSpec describes a set of log files to collect.
+// All matched files are always collected in full — no time-window filtering.
+// The --from/--to window applies only to journalctl, not to file collection.
 type LogFileSpec struct {
 	// SrcGlob is a shell glob pattern for source files
 	SrcGlob string
 	// DestDir is the subdirectory inside the archive
 	DestDir string
-	// Profile — empty means always collect
+	// Profile — empty means always collect regardless of profile
 	Profile string
-	// MaxAgeDays: skip files not modified within this many days (0 = no limit)
-	MaxAgeDays int
 }
 
 var logFileSpecs = []LogFileSpec{
-	// ── system logs ───────────────────────────────────────────────────────
-	// RHEL/OCI uses /var/log/messages; Debian/Ubuntu uses /var/log/syslog
+	// ── system logs — collected in full, all rotated variants ─────────────
+	// RHEL/OCI family (/var/log/messages, /var/log/secure, /var/log/cron)
 	{SrcGlob: "/var/log/messages", DestDir: "system"},
+	{SrcGlob: "/var/log/messages-*", DestDir: "system"},
+	{SrcGlob: "/var/log/messages.?", DestDir: "system"},
+	{SrcGlob: "/var/log/secure", DestDir: "system"},
+	{SrcGlob: "/var/log/secure-*", DestDir: "system"},
+	{SrcGlob: "/var/log/cron", DestDir: "system"},
+	{SrcGlob: "/var/log/cron-*", DestDir: "system"},
+	// Debian/Ubuntu family
 	{SrcGlob: "/var/log/syslog", DestDir: "system"},
+	{SrcGlob: "/var/log/syslog.*", DestDir: "system"},
 	{SrcGlob: "/var/log/kern.log", DestDir: "system"},
+	{SrcGlob: "/var/log/kern.log.*", DestDir: "system"},
+	// Boot and init
+	{SrcGlob: "/var/log/boot.log", DestDir: "system"},
+	{SrcGlob: "/var/log/boot.log-*", DestDir: "system"},
 	{SrcGlob: "/var/log/dmesg", DestDir: "system"},
+	{SrcGlob: "/var/log/dmesg.*", DestDir: "system"},
+	// Cloud-init (important on OCI/AWS instances)
+	{SrcGlob: "/var/log/cloud-init.log", DestDir: "system"},
+	{SrcGlob: "/var/log/cloud-init-output.log", DestDir: "system"},
+	// Audit log
+	{SrcGlob: "/var/log/audit/audit.log", DestDir: "system/audit"},
+	{SrcGlob: "/var/log/audit/audit.log.*", DestDir: "system/audit"},
+	// Package manager logs (useful for kernel/driver upgrade history)
+	{SrcGlob: "/var/log/dnf.log", DestDir: "system"},
+	{SrcGlob: "/var/log/dnf.log-*", DestDir: "system"},
+	{SrcGlob: "/var/log/yum.log", DestDir: "system"},
+	{SrcGlob: "/var/log/yum.log-*", DestDir: "system"},
 
-	// ── weka container syslogs (always, default profile) ──────────────────
-	// Each container (drives0, compute0, frontend0, default, smbw) has its
-	// own syslog under /opt/weka/logs/<container>/syslog.log
-	{SrcGlob: "/opt/weka/logs/*/syslog.log", DestDir: "weka/containers", MaxAgeDays: 3},
+	// ── weka container logs — broad catch-alls cover the full tree ────────
+	//
+	// Directory structure (confirmed from live cluster):
+	//   /opt/weka/logs/<container>/<file>           depth-1: syslog.log*, supervisord.log*, upgrade.log*, tsmb.log*, etc.
+	//   /opt/weka/logs/<container>/weka/<file>      depth-2: output.log*, shelld.log*, events.log*, trace-server.log*, nginx-stdout.log*, rotator.log*, etc.
+	//   /opt/weka/logs/<container>/wtracer/<file>   depth-2: wtracer-dumper.log
+	//   /opt/weka/logs/<container>/nginx/<file>     depth-2: access.log, error.log
+	//   /opt/weka/logs/<container>/pacemaker/<file> depth-2: pacemaker.log*
+	//   /opt/weka/logs/<container>/corosync/<file>  depth-2: corosync.log
+	//   /opt/weka/logs/<container>/pcsd/<file>      depth-2: pcsd.log
+	//
+	// Two depth levels cover everything. seenSrcPaths deduplicates overlaps.
 
-	// ── core per-container weka logs (always, default profile) ────────────
-	// These live under /opt/weka/logs/<container>/weka/
-	{SrcGlob: "/opt/weka/logs/*/weka/output.log", DestDir: "weka/containers", MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/*/weka/events.log", DestDir: "weka/containers", MaxAgeDays: 7},
-	{SrcGlob: "/opt/weka/logs/*/weka/trace-server.log", DestDir: "weka/containers", MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/*/weka/weka_init.log", DestDir: "weka/containers", MaxAgeDays: 7},
+	// Depth-1: all *.log* and *.json files directly in each container dir
+	{SrcGlob: "/opt/weka/logs/*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/*/*.json", DestDir: "weka/containers"},
 
-	// ── full profile: additional container logs ───────────────────────────
-	{SrcGlob: "/opt/weka/logs/*/syslog.log.1", DestDir: "weka/containers", Profile: ProfileFull, MaxAgeDays: 7},
-	{SrcGlob: "/opt/weka/logs/*/supervisord.log", DestDir: "weka/containers", Profile: ProfileFull, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/*/weka/shelld.log", DestDir: "weka/containers", Profile: ProfileFull, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/*/weka/shelld.log.1", DestDir: "weka/containers", Profile: ProfileFull, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/*/weka/nginx-stderr.log", DestDir: "weka/containers", Profile: ProfileFull, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/*/weka/api-v2-stdout.log", DestDir: "weka/containers", Profile: ProfileFull, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/*/weka/output.log.1", DestDir: "weka/containers", Profile: ProfileFull, MaxAgeDays: 7},
+	// Depth-2: all *.log* files one level deeper (weka/, nginx/, wtracer/, pacemaker/, corosync/, pcsd/)
+	{SrcGlob: "/opt/weka/logs/*/*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/*/*/*.json", DestDir: "weka/containers"},
 
-	// ── smbw profile: SMB-W specific logs ────────────────────────────────
-	{SrcGlob: "/opt/weka/logs/smbw/supervisord.log", DestDir: "weka/containers/smbw", Profile: ProfileSMBW, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/smbw/jrpcserver-stderr.log", DestDir: "weka/containers/smbw", Profile: ProfileSMBW, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/smbw/jrpcserver-stdout.log", DestDir: "weka/containers/smbw", Profile: ProfileSMBW, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/smbw/cluster-aliveness-stdout.log", DestDir: "weka/containers/smbw", Profile: ProfileSMBW, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/smbw/cluster-aliveness-stderr.log", DestDir: "weka/containers/smbw", Profile: ProfileSMBW, MaxAgeDays: 3},
-	{SrcGlob: "/opt/weka/logs/smbw/pacemaker/pacemaker.log", DestDir: "weka/containers/smbw/pacemaker", Profile: ProfileSMBW, MaxAgeDays: 7},
-	{SrcGlob: "/opt/weka/logs/smbw/corosync/corosync.log", DestDir: "weka/containers/smbw/corosync", Profile: ProfileSMBW, MaxAgeDays: 7},
-
-	// ── nfs profile: Ganesha logs ─────────────────────────────────────────
-	{SrcGlob: "/opt/weka/logs/ganesha/*.log", DestDir: "weka/containers/ganesha", Profile: ProfileNFS, MaxAgeDays: 7},
-
-	// ── s3 profile: S3/envoy logs ─────────────────────────────────────────
-	{SrcGlob: "/opt/weka/logs/s3/*.log", DestDir: "weka/containers/s3", Profile: ProfileS3, MaxAgeDays: 7},
-
-	// ── vendor/driver logs (always, no time filter — these are build logs) ─
-	{SrcGlob: "/var/log/mlnx/*.log", DestDir: "vendor/mlnx", MaxAgeDays: 30},
-	{SrcGlob: "/opt/weka/data/driver/weka-driver/log/*.log", DestDir: "weka/driver", MaxAgeDays: 30},
+	// ── vendor/driver logs ────────────────────────────────────────────────
+	{SrcGlob: "/var/log/mlnx/*.log", DestDir: "vendor/mlnx"},
+	{SrcGlob: "/var/log/mlnx/*.log.*", DestDir: "vendor/mlnx"},
+	{SrcGlob: "/opt/weka/data/driver/weka-driver/log/*.log", DestDir: "weka/driver"},
+	{SrcGlob: "/opt/weka/data/driver/weka-driver/log/*.log.*", DestDir: "weka/driver"},
 }
 
 // ── space checking ────────────────────────────────────────────────────────────
@@ -351,7 +364,7 @@ func checkDiskSpace(path string) (diskInfo, error) {
 
 // estimateCollectionMB returns a rough upper-bound estimate of how much disk
 // space the collection will use (before compression).
-func estimateCollectionMB(profile string, logSpecs []LogFileSpec, fromTime time.Time) uint64 {
+func estimateCollectionMB(profile string, logSpecs []LogFileSpec) uint64 {
 	var totalBytes int64
 	for _, spec := range logSpecs {
 		if spec.Profile != "" && spec.Profile != profile && profile != ProfileAll {
@@ -364,9 +377,6 @@ func estimateCollectionMB(profile string, logSpecs []LogFileSpec, fromTime time.
 		for _, f := range matches {
 			info, err := os.Stat(f)
 			if err != nil {
-				continue
-			}
-			if !fromTime.IsZero() && info.ModTime().Before(fromTime) {
 				continue
 			}
 			totalBytes += info.Size()
@@ -389,8 +399,8 @@ type CollectionStatus int
 
 const (
 	StatusOK      CollectionStatus = iota
-	StatusWarning                   // collected but some items missing
-	StatusFailed                    // host/command collection failed
+	StatusWarning                  // collected but some items missing
+	StatusFailed                   // host/command collection failed
 )
 
 // CommandResult records the outcome of a single command.
@@ -406,33 +416,31 @@ type CommandResult struct {
 
 // FileResult records the outcome of a single log file collection.
 type FileResult struct {
-	SrcPath       string `json:"src_path"`
-	DestPath      string `json:"dest_path"`
-	SizeBytes     int64  `json:"size_bytes"`
-	Error         string `json:"error,omitempty"`
-	Skipped       bool   `json:"skipped,omitempty"`
-	SkipNote      string `json:"skip_reason,omitempty"`
-	TimeFiltered  bool   `json:"time_filtered,omitempty"` // skipped due to time window, not an error
+	SrcPath   string `json:"src_path"`
+	DestPath  string `json:"dest_path"`
+	SizeBytes int64  `json:"size_bytes"`
+	Error     string `json:"error,omitempty"`
+	Skipped   bool   `json:"skipped,omitempty"`
+	SkipNote  string `json:"skip_reason,omitempty"`
 }
 
 // HostManifest is written into the archive as collection_manifest.json
 // for each host, describing everything that was attempted and what succeeded.
 type HostManifest struct {
-	Hostname            string          `json:"hostname"`
-	CollectedAt         time.Time       `json:"collected_at"`
-	Profile             string          `json:"profile"`
-	From                *time.Time      `json:"from,omitempty"`
-	To                  *time.Time      `json:"to,omitempty"`
-	WekaVersion         string          `json:"weka_version,omitempty"`
-	Commands            []CommandResult `json:"commands"`
-	Files               []FileResult    `json:"files"`
-	Errors              []string        `json:"errors,omitempty"`
-	TotalFiles          int             `json:"total_files"`
-	CollectedFiles      int             `json:"collected_files"`
-	FailedFiles         int             `json:"failed_files"`
-	TimeFilteredFiles   int             `json:"time_filtered_files"`
-	TotalCommands       int             `json:"total_commands"`
-	FailedCommands      int             `json:"failed_commands"`
+	Hostname       string          `json:"hostname"`
+	CollectedAt    time.Time       `json:"collected_at"`
+	Profile        string          `json:"profile"`
+	From           *time.Time      `json:"from,omitempty"`
+	To             *time.Time      `json:"to,omitempty"`
+	WekaVersion    string          `json:"weka_version,omitempty"`
+	Commands       []CommandResult `json:"commands"`
+	Files          []FileResult    `json:"files"`
+	Errors         []string        `json:"errors,omitempty"`
+	TotalFiles     int             `json:"total_files"`
+	CollectedFiles int             `json:"collected_files"`
+	FailedFiles    int             `json:"failed_files"`
+	TotalCommands  int             `json:"total_commands"`
+	FailedCommands int             `json:"failed_commands"`
 }
 
 // ── progress output ───────────────────────────────────────────────────────────
@@ -523,9 +531,10 @@ func journalctlWithWindow(from, to time.Time, timeout time.Duration) (CommandRes
 // directory structure is preserved in the archive.
 //
 // Examples:
-//   /opt/weka/logs/*/syslog.log   → "/opt/weka/logs/"
-//   /var/log/messages             → "/var/log/"
-//   /opt/weka/logs/smbw/pacemaker/pacemaker.log → "/opt/weka/logs/smbw/pacemaker/"
+//
+//	/opt/weka/logs/*/syslog.log   → "/opt/weka/logs/"
+//	/var/log/messages             → "/var/log/"
+//	/opt/weka/logs/smbw/pacemaker/pacemaker.log → "/opt/weka/logs/smbw/pacemaker/"
 func globBase(pattern string) string {
 	idx := strings.IndexAny(pattern, "*?[")
 	if idx < 0 {
@@ -681,6 +690,10 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	}
 
 	// ── phase: log files ──────────────────────────────────────────────────
+	// seenSrcPaths prevents the same source file being added twice when
+	// multiple glob specs overlap (e.g. specific spec + catch-all).
+	seenSrcPaths := map[string]bool{}
+
 	phase(fmt.Sprintf("[%s] Log files", hostname))
 	for _, spec := range logFileSpecs {
 		if spec.Profile != "" && !profileEnabled(profile, spec.Profile) {
@@ -697,32 +710,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			continue
 		}
 		for _, srcPath := range matches {
-			// Skip files not modified within the time window
-			if !from.IsZero() || spec.MaxAgeDays > 0 {
-				info, err := os.Stat(srcPath)
-				if err != nil {
-					continue
-				}
-				cutoff := from
-				if spec.MaxAgeDays > 0 {
-					ageCutoff := time.Now().AddDate(0, 0, -spec.MaxAgeDays)
-					if cutoff.IsZero() || ageCutoff.After(cutoff) {
-						cutoff = ageCutoff
-					}
-				}
-				if !cutoff.IsZero() && info.ModTime().Before(cutoff) {
-					vlogf("[%s] skip %s: last modified %s before window start",
-						hostname, srcPath, info.ModTime().Format(time.RFC3339))
-					fr := FileResult{
-						SrcPath:      srcPath,
-						Skipped:      true,
-						TimeFiltered: true,
-						SkipNote:     fmt.Sprintf("last modified %s before window start", info.ModTime().Format(time.RFC3339)),
-					}
-					manifest.Files = append(manifest.Files, fr)
-					continue
-				}
+			if seenSrcPaths[srcPath] {
+				vlogf("[%s] skip duplicate %s", hostname, srcPath)
+				continue
 			}
+			seenSrcPaths[srcPath] = true
 			logf("  [%s] collecting: %s", hostname, srcPath)
 			// Preserve directory structure relative to the glob base so that
 			// e.g. /opt/weka/logs/compute0/syslog.log ends up at
@@ -749,12 +741,9 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	}
 	manifest.TotalFiles = len(manifest.Files)
 	for _, r := range manifest.Files {
-		switch {
-		case r.TimeFiltered:
-			manifest.TimeFilteredFiles++
-		case r.Error != "":
+		if r.Error != "" {
 			manifest.FailedFiles++
-		case !r.Skipped:
+		} else if !r.Skipped {
 			manifest.CollectedFiles++
 		}
 	}
@@ -841,18 +830,29 @@ func collectFromHost(host, binaryPath, profile string, from, to time.Time, sshUs
 	return result
 }
 
-// discoverClusterHosts returns the list of backend hostnames by running
-// `weka cluster container -l` and parsing the output.
+// discoverClusterHosts returns the list of backend node IPs by running
+// `weka cluster servers list --output ip --role backend`.
+// Using IPs (like wekachecker) avoids hostname-resolution failures.
 func discoverClusterHosts() ([]string, error) {
-	out, err := exec.Command("weka", "cluster", "container", "-l",
-		"--no-header", "--output", "hostname").Output()
+	out, err := exec.Command("weka", "cluster", "servers", "list",
+		"--no-header", "--output", "ip", "--role", "backend").Output()
 	if err != nil {
-		return nil, fmt.Errorf("weka cluster container -l failed: %v", err)
+		// Fall back to container hostname listing if servers list isn't available
+		out2, err2 := exec.Command("weka", "cluster", "container", "-l",
+			"--no-header", "--output", "ips").Output()
+		if err2 != nil {
+			return nil, fmt.Errorf("weka cluster servers list failed: %v; fallback also failed: %v", err, err2)
+		}
+		out = out2
 	}
 	seen := map[string]bool{}
 	var hosts []string
 	for _, line := range strings.Split(string(out), "\n") {
 		h := strings.TrimSpace(line)
+		// servers list may return comma-separated IPs per server; take first
+		if idx := strings.IndexByte(h, ','); idx >= 0 {
+			h = strings.TrimSpace(h[:idx])
+		}
 		if h == "" || seen[h] {
 			continue
 		}
@@ -907,20 +907,20 @@ type multiStringFlag []string
 func (f *multiStringFlag) String() string     { return strings.Join(*f, ",") }
 func (f *multiStringFlag) Set(v string) error { *f = append(*f, v); return nil }
 
-
 func main() {
 	var (
-		fromStr     = flag.String("from", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
-		toStr       = flag.String("to", "", "End of time window (default: now)")
-		profileStr  = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
-		outputPath  = flag.String("output", "", "Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.")
-		localOnly   = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
-		dryRun      = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
-		maxSizeMB   = flag.Uint64("max-size", 2048, "Abort if estimated collection size exceeds this value (MB)")
-		sshUser     = flag.String("ssh-user", "root", "SSH user for remote host collection")
-		workerCount = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
-		cmdTimeout  = flag.Duration("cmd-timeout", 60*time.Second, "Timeout per command")
-		ver         = flag.Bool("version", false, "Print version and exit")
+		fromStr      = flag.String("from", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
+		toStr        = flag.String("to", "", "End of time window (default: now)")
+		profileStr   = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
+		outputPath   = flag.String("output", "", "Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.")
+		localOnly    = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
+		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
+		maxSizeMB    = flag.Uint64("max-size", 2048, "Abort if estimated collection size exceeds this value (MB)")
+		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
+		remoteBinary = flag.String("remote-binary", "/usr/local/bin/weka-log-collector", "Path to weka-log-collector binary on remote hosts")
+		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
+		cmdTimeout   = flag.Duration("cmd-timeout", 60*time.Second, "Timeout per command")
+		ver          = flag.Bool("version", false, "Print version and exit")
 	)
 	var hosts multiStringFlag
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
@@ -1007,7 +1007,7 @@ func main() {
 			errorf("Tip: use --output to write to a different location (e.g. --output /data/weka-logs.tar.gz)")
 			os.Exit(1)
 		}
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs, from)
+		estimated := estimateCollectionMB(*profileStr, logFileSpecs)
 		logf("Disk:     %d MB available on %s (estimated collection: ~%d MB compressed)", di.AvailMB, di.Path, estimated)
 
 		if di.AvailMB < minFreeSpaceMB {
@@ -1033,7 +1033,7 @@ func main() {
 
 	if *dryRun {
 		phase("DRY RUN — showing what would be collected")
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs, from)
+		estimated := estimateCollectionMB(*profileStr, logFileSpecs)
 		logf("  Profile:   %s", *profileStr)
 		logf("  Estimated: ~%d MB compressed", estimated)
 		logf("  Commands:  %d weka + %d system", len(defaultCommands)+len(buildProfileCommands(*profileStr)), len(systemCommands))
@@ -1069,12 +1069,9 @@ func main() {
 		logf("Collecting from %d specified hosts: %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 	}
 
-	// Find this binary's path for remote deployment reference
-	selfPath, _ := os.Executable()
-
 	// Collect from all hosts in parallel
 	phase("Collecting from cluster hosts")
-	results := collectCluster(clusterHosts, selfPath, *profileStr, from, to, *sshUser, *cmdTimeout, *workerCount)
+	results := collectCluster(clusterHosts, *remoteBinary, *profileStr, from, to, *sshUser, *cmdTimeout, *workerCount)
 
 	// Write merged archive
 	phase("Writing archive")
@@ -1150,8 +1147,8 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 
 	logf("\nCollection complete → %s", outDesc)
 	logf("  Commands: %d total, %d failed", manifest.TotalCommands, manifest.FailedCommands)
-	logf("  Files:    %d collected, %d time-filtered (expected), %d failed",
-		manifest.CollectedFiles, manifest.TimeFilteredFiles, manifest.FailedFiles)
+	logf("  Files:    %d collected, %d failed",
+		manifest.CollectedFiles, manifest.FailedFiles)
 	if !toStdout {
 		if info, err := os.Stat(outPath); err == nil {
 			logf("  Size:     %d KB", info.Size()/1024)
@@ -1214,14 +1211,14 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 
 	// Write cluster-level summary
 	type clusterSummary struct {
-		CollectedAt  time.Time `json:"collected_at"`
-		Profile      string    `json:"profile"`
-		From         string    `json:"from,omitempty"`
-		To           string    `json:"to,omitempty"`
-		TotalHosts   int       `json:"total_hosts"`
-		Succeeded    int       `json:"succeeded"`
-		Failed       int       `json:"failed"`
-		FailedHosts  []string  `json:"failed_hosts,omitempty"`
+		CollectedAt time.Time `json:"collected_at"`
+		Profile     string    `json:"profile"`
+		From        string    `json:"from,omitempty"`
+		To          string    `json:"to,omitempty"`
+		TotalHosts  int       `json:"total_hosts"`
+		Succeeded   int       `json:"succeeded"`
+		Failed      int       `json:"failed"`
+		FailedHosts []string  `json:"failed_hosts,omitempty"`
 	}
 	summary := clusterSummary{
 		CollectedAt: time.Now(),
