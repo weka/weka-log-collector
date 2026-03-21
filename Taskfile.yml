@@ -1,0 +1,50 @@
+version: '3'
+
+vars:
+  BINARY: weka-log-collector
+  LINUX_BINARY: weka-log-collector_linux_amd64
+
+tasks:
+  fmt:
+    desc: Format code
+    cmds:
+      - gofmt -w .
+
+  vet:
+    desc: Static analysis
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Run staticcheck linter
+    cmds:
+      - staticcheck ./...
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test ./... -v
+
+  build:
+    desc: Build binary for current platform
+    cmds:
+      - go build -o {{.BINARY}} ./...
+
+  build-linux:
+    desc: Build portable static Linux binary (for deployment to Weka nodes)
+    cmds:
+      - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o {{.LINUX_BINARY}} ./...
+
+  check:
+    desc: Run all quality checks (fmt, vet, lint, test, build)
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: lint
+      - task: test
+      - task: build
+
+  clean:
+    desc: Remove built binaries
+    cmds:
+      - rm -f {{.BINARY}} {{.LINUX_BINARY}}
