@@ -37,15 +37,16 @@ weka-log-collector --local
 ### Entire cluster (run from any backend node)
 
 ```bash
-# First deploy the binary to ALL backend nodes
-for ip in $(weka cluster servers list --no-header --output ip --role backend); do
-  scp weka-log-collector root@${ip}:/usr/local/bin/weka-log-collector
-  echo "Deployed to $ip"
-done
-
-# Then collect from all nodes in parallel
+# Run from any backend node — binary is auto-deployed to /tmp on each node
 weka-log-collector
 # → /tmp/<cluster>-weka-logs-<timestamp>.tar.gz
+```
+
+The tool automatically SCPs itself to `/tmp/weka-log-collector` on each remote host before collecting, then removes it when done. No manual pre-deployment required.
+
+```bash
+# If you prefer to pre-deploy manually (e.g. binary already on all nodes):
+weka-log-collector --no-self-deploy --remote-binary /usr/local/bin/weka-log-collector
 ```
 
 ### Time-windowed collection (journalctl only)
@@ -92,7 +93,8 @@ Flags:
   --to               End of time window for journalctl (default: now)
   --output           Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.
   --host             Collect from this host only (repeatable; default: auto-discover all cluster nodes)
-  --remote-binary    Path to weka-log-collector binary on remote hosts (default: /usr/local/bin/weka-log-collector)
+  --no-self-deploy   Skip auto-deployment; use --remote-binary path on remote hosts instead
+  --remote-binary    Path to binary on remote hosts when using --no-self-deploy (default: /usr/local/bin/weka-log-collector)
   --ssh-user         SSH user for remote collection (default: root)
   --workers          Max parallel SSH workers (default: 10)
   --max-size         Abort if estimated size exceeds this MB (default: 2048)
@@ -342,23 +344,24 @@ weka-log-collector --output /data/weka-logs.tar.gz
 
 When run without `--local`, the tool:
 1. Discovers all backend node IPs via `weka cluster servers list --output ip --role backend`
-2. SSHs to each node in parallel (up to `--workers`, default 10)
-3. Runs `weka-log-collector --local --output -` on each node (streams tar.gz to stdout)
-4. Merges all host archives into a single `.tar.gz`
+2. **Auto-deploys itself** via `scp` to `/tmp/weka-log-collector` on each node
+3. SSHs to each node in parallel (up to `--workers`, default 10) and runs collection
+4. Cleans up the temporary binary after collection (via `trap ... EXIT`)
+5. Merges all host archives into a single `.tar.gz`
 
-**Prerequisite**: the binary must be deployed to `/usr/local/bin/weka-log-collector` on all nodes (or specify a different path with `--remote-binary`).
+No manual pre-deployment required — just copy the binary to one backend node and run.
 
 ```bash
-# Deploy to all backend nodes
-for ip in $(weka cluster servers list --no-header --output ip --role backend); do
-  scp weka-log-collector root@${ip}:/usr/local/bin/weka-log-collector
-done
-
-# Collect from all nodes, custom remote path
-weka-log-collector --remote-binary /opt/weka/weka-log-collector
+# Copy binary to one backend node and collect from entire cluster
+scp weka-log-collector root@<any-backend>:/usr/local/bin/weka-log-collector
+ssh root@<any-backend> weka-log-collector
+# → /tmp/<cluster>-weka-logs-<timestamp>.tar.gz
 
 # Collect from specific nodes by IP
 weka-log-collector --host 10.0.0.1 --host 10.0.0.2
+
+# Skip auto-deploy (binary must already exist on all nodes)
+weka-log-collector --no-self-deploy --remote-binary /usr/local/bin/weka-log-collector
 ```
 
 ---

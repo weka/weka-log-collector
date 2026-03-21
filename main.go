@@ -781,43 +781,82 @@ type HostResult struct {
 	Err      error
 }
 
-// collectFromHost SSHs into a host, runs weka-log-collector --local, and
-// streams the tar.gz back. The remote binary must be pre-deployed or available
-// via PATH. Falls back to running via sudo if needed.
-func collectFromHost(host, binaryPath, profile string, from, to time.Time, sshUser string, sshTimeout time.Duration) HostResult {
-	result := HostResult{Host: host}
+// sshArgs returns the common SSH option flags used for all SSH/SCP calls.
+func sshArgs() []string {
+	return []string{
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "ConnectTimeout=30",
+		"-o", "BatchMode=yes",
+	}
+}
 
-	// Build the remote command
-	remoteArgs := []string{
-		binaryPath,
-		"--local",
-		"--profile", profile,
-		"--output", "-", // stream to stdout
-	}
-	if !from.IsZero() {
-		remoteArgs = append(remoteArgs, "--from", from.Format("2006-01-02T15:04"))
-	}
-	if !to.IsZero() {
-		remoteArgs = append(remoteArgs, "--to", to.Format("2006-01-02T15:04"))
-	}
-	if verbose {
-		remoteArgs = append(remoteArgs, "--verbose")
-	}
+// collectFromHost SSHs into a host, runs weka-log-collector --local, and
+// streams the tar.gz back.
+//
+// When selfDeploy is true (the default), it first scps the running binary to
+// /tmp/weka-log-collector on the remote host, runs it there, then removes it
+// on exit — so no manual pre-deployment is required.
+//
+// When selfDeploy is false, binaryPath must already exist on the remote host.
+func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration) HostResult {
+	result := HostResult{Host: host}
 
 	sshTarget := host
 	if sshUser != "" {
 		sshTarget = sshUser + "@" + host
 	}
 
-	sshCmd := exec.Command("ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "ConnectTimeout=30",
-		"-o", "BatchMode=yes",
-		sshTarget,
-		strings.Join(remoteArgs, " "),
-	)
+	// ── auto-deploy: scp binary to /tmp on the remote host ────────────────
+	remoteBin := binaryPath
+	if selfDeploy {
+		remoteBin = "/tmp/weka-log-collector"
+		logf("  [%s] deploying binary via scp...", host)
+		scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
+		scpCmd := exec.Command("scp", scpArgs...)
+		if out, err := scpCmd.CombinedOutput(); err != nil {
+			result.Err = fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
+			errorf("[%s] collection failed: %v", host, result.Err)
+			return result
+		}
+		vlogf("[%s] binary deployed to %s", host, remoteBin)
+	}
 
-	logf("  [%s] connecting via SSH...", host)
+	// ── build the remote command ───────────────────────────────────────────
+	// When self-deployed, wrap in a shell that removes the binary on exit
+	// (whether collection succeeds or fails) to keep /tmp clean.
+	collectionCmd := strings.Join(append([]string{
+		remoteBin,
+		"--local",
+		"--profile", profile,
+		"--output", "-",
+	}, func() []string {
+		var extra []string
+		if !from.IsZero() {
+			extra = append(extra, "--from", from.Format("2006-01-02T15:04"))
+		}
+		if !to.IsZero() {
+			extra = append(extra, "--to", to.Format("2006-01-02T15:04"))
+		}
+		if verbose {
+			extra = append(extra, "--verbose")
+		}
+		return extra
+	}()...), " ")
+
+	var remoteShellCmd string
+	if selfDeploy {
+		// trap ensures cleanup even if collection fails or connection drops
+		remoteShellCmd = fmt.Sprintf(
+			"chmod +x %s; trap 'rm -f %s' EXIT; %s",
+			remoteBin, remoteBin, collectionCmd,
+		)
+	} else {
+		remoteShellCmd = collectionCmd
+	}
+
+	// ── run collection via SSH ─────────────────────────────────────────────
+	logf("  [%s] collecting...", host)
+	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
 	out, err := sshCmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -921,8 +960,9 @@ func main() {
 		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
 		maxSizeMB    = flag.Uint64("max-size", 2048, "Abort if estimated collection size exceeds this value (MB)")
 		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
-		remoteBinary = flag.String("remote-binary", "/usr/local/bin/weka-log-collector", "Path to weka-log-collector binary on remote hosts")
-		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
+		remoteBinary   = flag.String("remote-binary", "/usr/local/bin/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
+		noSelfDeploy   = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
+		workerCount    = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
 		cmdTimeout   = flag.Duration("cmd-timeout", 60*time.Second, "Timeout per command")
 		ver          = flag.Bool("version", false, "Print version and exit")
 	)
@@ -1073,9 +1113,24 @@ func main() {
 		logf("Collecting from %d specified hosts: %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 	}
 
+	// Determine self-deploy settings
+	selfDeploy := !*noSelfDeploy
+	selfPath := ""
+	if selfDeploy {
+		var err error
+		selfPath, err = os.Executable()
+		if err != nil {
+			warnf("Could not determine executable path (%v); falling back to --remote-binary mode", err)
+			selfDeploy = false
+		} else {
+			logf("Auto-deploying binary from %s to /tmp/weka-log-collector on each host", selfPath)
+			logf("(use --no-self-deploy to skip auto-deployment and use --remote-binary instead)")
+		}
+	}
+
 	// Collect from all hosts in parallel
 	phase("Collecting from cluster hosts")
-	results := collectCluster(clusterHosts, *remoteBinary, *profileStr, from, to, *sshUser, *cmdTimeout, *workerCount)
+	results := collectCluster(clusterHosts, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount)
 
 	// Write merged archive
 	phase("Writing archive")
@@ -1083,7 +1138,7 @@ func main() {
 }
 
 // collectCluster fans out collection to all hosts in parallel.
-func collectCluster(hosts []string, binaryPath, profile string, from, to time.Time, sshUser string, cmdTimeout time.Duration, workers int) []HostResult {
+func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int) []HostResult {
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
@@ -1096,7 +1151,7 @@ func collectCluster(hosts []string, binaryPath, profile string, from, to time.Ti
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r := collectFromHost(host, binaryPath, profile, from, to, sshUser, 5*cmdTimeout)
+			r := collectFromHost(host, selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 5*cmdTimeout)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
