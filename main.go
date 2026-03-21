@@ -863,7 +863,7 @@ func buildClusterWideCmds(profile string) []CommandSpec {
 type HostResult struct {
 	Host     string
 	Manifest *HostManifest
-	Archive  []byte // tar.gz bytes from remote host
+	TempFile string // path to temp .tar.gz on disk; caller must os.Remove when done
 	Err      error
 }
 
@@ -942,22 +942,41 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 		remoteShellCmd = collectionCmd
 	}
 
-	// ── run collection via SSH ─────────────────────────────────────────────
+	// ── run collection via SSH, streaming output to a temp file ──────────
+	// Streaming to disk (not RAM) prevents accumulating 200-400 MB per host
+	// in memory simultaneously when collecting a large cluster in parallel.
 	logf("  [%s] collecting...", host)
-	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
-	out, err := sshCmd.Output()
+	tmpFile, err := os.CreateTemp("", "wlc-host-*.tar.gz")
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		result.Err = fmt.Errorf("create temp file: %w", err)
+		errorf("[%s] collection failed: %v", host, result.Err)
+		return result
+	}
+	tmpPath := tmpFile.Name()
+
+	var stderrBuf bytes.Buffer
+	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
+	sshCmd.Stdout = tmpFile
+	sshCmd.Stderr = &stderrBuf
+	runErr := sshCmd.Run()
+	tmpFile.Close()
+
+	if runErr != nil {
+		os.Remove(tmpPath)
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			result.Err = fmt.Errorf("SSH command failed (exit %d): %s",
-				exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+				exitErr.ExitCode(), strings.TrimSpace(stderrBuf.String()))
 		} else {
-			result.Err = fmt.Errorf("SSH error: %v", err)
+			result.Err = fmt.Errorf("SSH error: %v", runErr)
 		}
 		errorf("[%s] collection failed: %v", host, result.Err)
 		return result
 	}
-	result.Archive = out
-	logf("  [%s] collected %d KB", host, len(out)/1024)
+
+	if info, err := os.Stat(tmpPath); err == nil {
+		logf("  [%s] collected %d KB", host, info.Size()/1024)
+	}
+	result.TempFile = tmpPath
 	return result
 }
 
@@ -1024,10 +1043,10 @@ func getClusterName() string {
 
 // ── archive merging ───────────────────────────────────────────────────────────
 
-// mergeArchive extracts the tar.gz in srcData and re-writes every entry into
+// mergeArchive reads a tar.gz from src and re-writes every entry into
 // the destination tar.Writer under a new root prefix.
-func mergeArchive(tw *tar.Writer, srcData []byte, newRoot string) error {
-	gr, err := gzip.NewReader(bytes.NewReader(srcData))
+func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
+	gr, err := gzip.NewReader(src)
 	if err != nil {
 		return fmt.Errorf("gzip open: %w", err)
 	}
@@ -1358,7 +1377,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		outDesc = outPath
 	}
 
-	gz, err := gzip.NewWriterLevel(outWriter, gzip.BestCompression)
+	// DefaultCompression (level 6) for the merge pass: the content is raw log
+	// data just like the per-node archives, compresses well at any level, and
+	// level 9 costs 3-4x more CPU for <5% size benefit — too expensive on a
+	// live Weka node receiving parallel SSH streams from the whole cluster.
+	gz, err := gzip.NewWriterLevel(outWriter, gzip.DefaultCompression)
 	if err != nil {
 		errorf("gzip init: %v", err)
 		os.Exit(1)
@@ -1402,14 +1425,27 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 				errContent)
 			continue
 		}
-		if err := mergeArchive(tw, r.Archive, archiveRoot); err != nil {
-			errorf("[%s] failed to merge archive: %v", r.Host, err)
+		// Open temp file, merge, then delete — only one host archive in memory at a time.
+		f, openErr := os.Open(r.TempFile)
+		if openErr != nil {
+			errorf("[%s] failed to open temp archive %s: %v", r.Host, r.TempFile, openErr)
+			failed++
+			failedHosts = append(failedHosts, r.Host)
+			os.Remove(r.TempFile)
+			continue
+		}
+		stat, _ := f.Stat()
+		mergeErr := mergeArchive(tw, f, archiveRoot)
+		f.Close()
+		os.Remove(r.TempFile)
+		if mergeErr != nil {
+			errorf("[%s] failed to merge archive: %v", r.Host, mergeErr)
 			failed++
 			failedHosts = append(failedHosts, r.Host)
 			continue
 		}
 		succeeded++
-		logf("  [%s] merged OK", r.Host)
+		logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
 	}
 
 	// Write cluster-level summary
