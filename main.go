@@ -541,7 +541,11 @@ func globBase(pattern string) string {
 		// No wildcard — use the directory containing the file.
 		return filepath.Dir(pattern) + "/"
 	}
-	return pattern[:idx]
+	// Use the directory that *contains* the first wildcard component.
+	// e.g. /var/log/messages-*  → /var/log/   (not /var/log/messages-)
+	// e.g. /opt/weka/logs/*/syslog.log → /opt/weka/logs/
+	// e.g. /var/log/audit/audit.log.*  → /var/log/audit/
+	return filepath.Dir(pattern[:idx]) + "/"
 }
 
 // collectLogFile adds a single log file to the tar writer.
