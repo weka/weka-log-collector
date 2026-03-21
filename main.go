@@ -518,12 +518,30 @@ func journalctlWithWindow(from, to time.Time, timeout time.Duration) (CommandRes
 
 // ── log file collector ────────────────────────────────────────────────────────
 
+// globBase returns the static prefix of a glob pattern — everything before the
+// first wildcard character. Used to strip the base from matched paths so that
+// directory structure is preserved in the archive.
+//
+// Examples:
+//   /opt/weka/logs/*/syslog.log   → "/opt/weka/logs/"
+//   /var/log/messages             → "/var/log/"
+//   /opt/weka/logs/smbw/pacemaker/pacemaker.log → "/opt/weka/logs/smbw/pacemaker/"
+func globBase(pattern string) string {
+	idx := strings.IndexAny(pattern, "*?[")
+	if idx < 0 {
+		// No wildcard — use the directory containing the file.
+		return filepath.Dir(pattern) + "/"
+	}
+	return pattern[:idx]
+}
+
 // collectLogFile adds a single log file to the tar writer.
+// destPath is the full path inside the archive (archiveRoot already included).
 // Returns a FileResult describing success or failure.
-func collectLogFile(tw *tar.Writer, archiveRoot, srcPath, destDir string) FileResult {
+func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 	result := FileResult{
 		SrcPath:  srcPath,
-		DestPath: filepath.Join(archiveRoot, destDir, filepath.Base(srcPath)),
+		DestPath: destPath,
 	}
 
 	f, err := os.Open(srcPath)
@@ -706,7 +724,15 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				}
 			}
 			logf("  [%s] collecting: %s", hostname, srcPath)
-			fr := collectLogFile(tw, archiveRoot, srcPath, filepath.Join("hosts", hostname, spec.DestDir))
+			// Preserve directory structure relative to the glob base so that
+			// e.g. /opt/weka/logs/compute0/syslog.log ends up at
+			// hosts/<host>/weka/containers/compute0/syslog.log, not
+			// hosts/<host>/weka/containers/syslog.log (which would overwrite
+			// the same filename from drives0, frontend0, etc.)
+			base := globBase(spec.SrcGlob)
+			relPath := strings.TrimPrefix(srcPath, base)
+			destPath := filepath.Join(archiveRoot, "hosts", hostname, spec.DestDir, relPath)
+			fr := collectLogFile(tw, srcPath, destPath)
 			manifest.Files = append(manifest.Files, fr)
 			if fr.Error != "" {
 				warnf("[%s] file %s: %s", hostname, srcPath, fr.Error)
