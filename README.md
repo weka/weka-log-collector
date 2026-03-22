@@ -8,17 +8,15 @@ Drop a single binary on any Weka node and collect a comprehensive, compressed ar
 
 ## Why this tool?
 
-`weka diags` is the official built-in diagnostic tool and the right first step for most support cases. This tool is a **complement** for scenarios where you need more targeted or flexible collection — particularly during active incident response or in environments where uploading large bundles isn't practical.
+For most support cases, `weka diags` is your starting point. This tool is a complement for situations where you need more targeted or flexible log collection.
 
-| Capability | weka diags | weka-log-collector |
-|------------|-----------|-------------------|
-| Built into the product | Yes — always available | Separate binary, drop on any node |
-| Upload to Weka support | Yes — integrated | No upload — local `.tar.gz` only |
-| S3/envoy/SMBW container logs | Profile-dependent | Always collected per profile |
-| Time-window targeting | Not available | `--from`/`--to` scopes journalctl to incident window |
-| IP-based node collection | Hostname-based | Uses node IPs directly — works without DNS |
-| Rotated log coverage | Current logs | All rotated variants collected |
-| Space safety | — | Disk check before writing, abort with clear error |
+- **Profile-based collection** — gather only what's relevant: default, full, perf, NFS, S3, SMB-W, client, or all
+- **Time-windowed journalctl** — scope `journalctl` to an incident window with `--from`/`--to`; all log files collected in full
+- **Full container log coverage** — all container log trees collected including rotated variants
+- **Cluster-wide in one shot** — auto-deploys itself to each node via SCP, collects in parallel, merges into a single archive
+- **IP-based node discovery** — uses node IPs directly, no DNS required
+- **Space-safe** — checks available disk before writing; aborts with a clear error if space is insufficient
+- **No upload** — produces a local `.tar.gz` you control; stream to stdout with `--output -` if needed
 
 ---
 
