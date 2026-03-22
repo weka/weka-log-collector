@@ -1094,6 +1094,61 @@ func getClusterName() string {
 	return sanitizeHostname(h)
 }
 
+// ── bash completion ───────────────────────────────────────────────────────────
+
+const bashCompletionScript = `# bash completion for weka-log-collector
+_weka_log_collector() {
+    local cur prev opts profiles
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    profiles="default full perf nfs s3 smbw client all"
+
+    opts="--local --clients --dry-run --verbose --version
+          --from --to --profile --output --host --container-id
+          --max-size --ssh-user --workers --cmd-timeout
+          --no-self-deploy --remote-binary"
+
+    case "$prev" in
+        --profile)
+            COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
+            return 0
+            ;;
+        --output|--remote-binary)
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            return 0
+            ;;
+        --from|--to)
+            COMPREPLY=( $(compgen -W "-1h -2h -4h -8h -12h -24h -1d -2d" -- "$cur") )
+            return 0
+            ;;
+        --ssh-user)
+            COMPREPLY=( $(compgen -W "root" -- "$cur") )
+            return 0
+            ;;
+    esac
+
+    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    return 0
+}
+complete -F _weka_log_collector weka-log-collector
+`
+
+const bashCompletionPath = "/etc/bash_completion.d/weka-log-collector"
+
+// installCompletion writes the bash completion script to /etc/bash_completion.d/.
+// Errors are silently ignored — this is best-effort.
+func installCompletion() {
+	// Skip if already installed with current content
+	existing, err := os.ReadFile(bashCompletionPath)
+	if err == nil && string(existing) == bashCompletionScript {
+		return
+	}
+	_ = os.MkdirAll("/etc/bash_completion.d", 0755)
+	_ = os.WriteFile(bashCompletionPath, []byte(bashCompletionScript), 0644)
+}
+
 // ── archive merging ───────────────────────────────────────────────────────────
 
 // mergeArchive reads a tar.gz from src and re-writes every entry into
@@ -1187,6 +1242,9 @@ func main() {
 		fmt.Printf("weka-log-collector %s\n", version)
 		return
 	}
+
+	// Silently install bash completion on first run (best-effort, no noise on failure).
+	go installCompletion()
 
 	// ── validate profile ──────────────────────────────────────────────────
 	validProfile := false
