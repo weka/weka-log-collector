@@ -8,16 +8,17 @@ Drop a single binary on any Weka node and collect a comprehensive, compressed ar
 
 ## Why this tool?
 
-`weka diags` has well-known gaps:
+`weka diags` is the official built-in diagnostic tool and the right first step for most support cases. This tool is a **complement** for scenarios where you need more targeted or flexible collection — particularly during active incident response or in environments where uploading large bundles isn't practical.
 
-| Problem | weka diags | weka-log-collector |
-|---------|-----------|-------------------|
-| Upload hangs on large clusters | Common | No upload — local `.tar.gz` only |
-| S3/envoy/SMBW container logs missing | Frequent | Always collected |
-| No time-window targeting | Not supported | `--from`/`--to` controls journalctl |
-| Hostname resolution failures silently skip nodes | Yes | Uses node IPs directly |
-| Incomplete rotated log coverage | Partial | All rotated variants collected |
-| Space safety checks | None | Disk check before writing |
+| Capability | weka diags | weka-log-collector |
+|------------|-----------|-------------------|
+| Built into the product | Yes — always available | Separate binary, drop on any node |
+| Upload to Weka support | Yes — integrated | No upload — local `.tar.gz` only |
+| S3/envoy/SMBW container logs | Profile-dependent | Always collected per profile |
+| Time-window targeting | Not available | `--from`/`--to` scopes journalctl to incident window |
+| IP-based node collection | Hostname-based | Uses node IPs directly — works without DNS |
+| Rotated log coverage | Current logs | All rotated variants collected |
+| Space safety | — | Disk check before writing, abort with clear error |
 
 ---
 
