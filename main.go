@@ -980,37 +980,90 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 	return result
 }
 
-// discoverClusterHosts returns the list of backend node IPs by running
-// `weka cluster servers list --output ip --role backend`.
-// Using IPs (like wekachecker) avoids hostname-resolution failures.
-func discoverClusterHosts() ([]string, error) {
-	out, err := exec.Command("weka", "cluster", "servers", "list",
-		"--no-header", "--output", "ip", "--role", "backend").Output()
+// clusterNode represents a Weka cluster container with its numeric ID, primary IP, and mode.
+type clusterNode struct {
+	ID   int
+	IP   string
+	Mode string // "backend", "client", "nfs", "smb", "s3"
+}
+
+// discoverClusterNodes returns cluster containers with their IDs, IPs, and modes.
+// Uses `weka cluster container --output id,ips,mode` — node IPs avoid hostname-resolution failures.
+// If includeClients is true, client-mode containers are included alongside backends.
+func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
+	out, err := exec.Command("weka", "cluster", "container",
+		"--no-header", "--output", "id,ips,mode").Output()
 	if err != nil {
-		// Fall back to container hostname listing if servers list isn't available
-		out2, err2 := exec.Command("weka", "cluster", "container", "-l",
-			"--no-header", "--output", "ips").Output()
+		// Fallback for older Weka versions without the mode column
+		out2, err2 := exec.Command("weka", "cluster", "container",
+			"--no-header", "--output", "id,ips").Output()
 		if err2 != nil {
-			return nil, fmt.Errorf("weka cluster servers list failed: %v; fallback also failed: %v", err, err2)
+			return nil, fmt.Errorf("weka cluster container list failed: %v; fallback also failed: %v", err, err2)
 		}
 		out = out2
 	}
-	seen := map[string]bool{}
-	var hosts []string
+	seenIP := map[string]bool{}
+	var nodes []clusterNode
 	for _, line := range strings.Split(string(out), "\n") {
-		h := strings.TrimSpace(line)
-		// servers list may return comma-separated IPs per server; take first
-		if idx := strings.IndexByte(h, ','); idx >= 0 {
-			h = strings.TrimSpace(h[:idx])
-		}
-		if h == "" || seen[h] {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		seen[h] = true
-		hosts = append(hosts, h)
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		id, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue // skip unparseable lines
+		}
+		// IPs column may be comma-separated; take the first one
+		ip := strings.SplitN(fields[1], ",", 2)[0]
+		if ip == "" || seenIP[ip] {
+			continue
+		}
+		mode := "backend"
+		if len(fields) >= 3 {
+			mode = strings.ToLower(fields[2])
+		}
+		isBackend := mode == "backend"
+		isClient := mode == "client"
+		if !isBackend && !(includeClients && isClient) {
+			continue
+		}
+		seenIP[ip] = true
+		nodes = append(nodes, clusterNode{ID: id, IP: ip, Mode: mode})
 	}
-	sort.Strings(hosts)
-	return hosts, nil
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].IP < nodes[j].IP })
+	return nodes, nil
+}
+
+// filterNodesByContainerID returns only the nodes whose IDs are in the given set.
+// If ids is empty, all nodes are returned unchanged.
+func filterNodesByContainerID(nodes []clusterNode, ids []int) []clusterNode {
+	if len(ids) == 0 {
+		return nodes
+	}
+	idSet := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+	var out []clusterNode
+	for _, n := range nodes {
+		if idSet[n.ID] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// nodeIPs extracts the IP from each clusterNode, preserving order.
+func nodeIPs(nodes []clusterNode) []string {
+	ips := make([]string, len(nodes))
+	for i, n := range nodes {
+		ips[i] = n.IP
+	}
+	return ips
 }
 
 // getClusterName returns the Weka cluster name by parsing `weka status`.
@@ -1085,6 +1138,25 @@ type multiStringFlag []string
 func (f *multiStringFlag) String() string     { return strings.Join(*f, ",") }
 func (f *multiStringFlag) Set(v string) error { *f = append(*f, v); return nil }
 
+// multiIntFlag implements flag.Value for repeatable integer flags (e.g. --container-id).
+type multiIntFlag []int
+
+func (f *multiIntFlag) String() string {
+	s := make([]string, len(*f))
+	for i, v := range *f {
+		s[i] = strconv.Itoa(v)
+	}
+	return strings.Join(s, ",")
+}
+func (f *multiIntFlag) Set(v string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return fmt.Errorf("invalid container ID %q: must be an integer", v)
+	}
+	*f = append(*f, n)
+	return nil
+}
+
 func main() {
 	var (
 		fromStr      = flag.String("from", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
@@ -1103,8 +1175,11 @@ func main() {
 		ver          = flag.Bool("version", false, "Print version and exit")
 	)
 	var hosts multiStringFlag
+	var containerIDs multiIntFlag
+	withClients := flag.Bool("clients", false, "Include client nodes in cluster collection (default: backends only)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
-	flag.Var(&hosts, "host", "Collect only from these hosts (repeatable; default: all cluster nodes)")
+	flag.Var(&hosts, "host", "Collect only from these hosts by IP (repeatable; default: all cluster backends)")
+	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (repeatable; e.g. --container-id 0 --container-id 2)")
 	flag.Usage = usageFunc
 	flag.Parse()
 
@@ -1235,17 +1310,25 @@ func main() {
 	phase("Discovering cluster hosts")
 	clusterHosts := []string(hosts)
 	if len(clusterHosts) == 0 {
-		discovered, err := discoverClusterHosts()
+		nodes, err := discoverClusterNodes(*withClients)
 		if err != nil {
 			warnf("Could not discover cluster hosts: %v", err)
 			warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
 			writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, nil)
 			return
 		}
-		clusterHosts = discovered
-		logf("Discovered %d cluster hosts: %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
+		if len(containerIDs) > 0 {
+			nodes = filterNodesByContainerID(nodes, []int(containerIDs))
+			if len(nodes) == 0 {
+				errorf("No nodes found matching --container-id %v", []int(containerIDs))
+				os.Exit(1)
+			}
+			logf("Filtered to %d node(s) matching --container-id %v", len(nodes), []int(containerIDs))
+		}
+		clusterHosts = nodeIPs(nodes)
+		logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 	} else {
-		logf("Collecting from %d specified hosts: %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
+		logf("Collecting from %d specified host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 	}
 
 	// Determine self-deploy settings
@@ -1537,7 +1620,9 @@ PROFILES
   all       Everything
 
 OPTIONS
-  --host HOST          Collect only from this host (repeatable; default: all cluster nodes)
+  --host HOST          Collect from this host by IP (repeatable; default: all cluster backends)
+  --container-id N     Collect from this container ID only (repeatable; e.g. --container-id 0 --container-id 2)
+  --clients            Include client nodes in cluster collection (default: backends only)
   --local              Collect from local host only
   --dry-run            Show collection plan; do not collect
   --output PATH        Output archive path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz)
@@ -1562,8 +1647,14 @@ EXAMPLES
   # Dry run: see what would be collected
   weka-log-collector --profile full --from -2h --dry-run
 
-  # Collect from specific hosts only
-  weka-log-collector --host backend01 --host backend02 --from -1h
+  # Collect from specific container IDs (as shown in 'weka cluster container')
+  weka-log-collector --container-id 0 --container-id 1 --from -2h
+
+  # Collect from all backends and clients
+  weka-log-collector --clients --from -2h
+
+  # Collect from specific hosts by IP
+  weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --from -1h
 
   # Stream to remote machine
   weka-log-collector --local --from -1h --output - | ssh analyst@host 'cat > weka-logs.tar.gz'
