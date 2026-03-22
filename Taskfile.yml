@@ -2,7 +2,7 @@ version: '3'
 
 vars:
   BINARY: weka-log-collector
-  LINUX_BINARY: weka-log-collector_linux_amd64
+  LINUX_BINARY: weka-log-collector
 
 tasks:
   fmt:
