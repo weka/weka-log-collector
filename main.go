@@ -1218,9 +1218,18 @@ func uploadBundle(archivePath string) error {
 			logf("Upload complete (%.0fs)", time.Since(start).Seconds())
 			return nil
 		}
-		// Progress log every 30s
-		if time.Since(lastLog) >= 30*time.Second {
-			logf("Still uploading... elapsed: %.0fs", time.Since(start).Seconds())
+		// Progress log every 60s
+		if time.Since(lastLog) >= 60*time.Second {
+			elapsed := time.Since(start)
+			var pct int
+			if sizeMB > 0 {
+				uploadedMB := int64(elapsed.Seconds()) // ~1 MB/s estimate
+				if uploadedMB > sizeMB {
+					uploadedMB = sizeMB
+				}
+				pct = int(uploadedMB * 100 / sizeMB)
+			}
+			logf("Uploading... ~%d%% elapsed: %s", pct, elapsed.Round(time.Second))
 			lastLog = time.Now()
 		}
 		// Warn at 10-minute mark
