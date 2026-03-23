@@ -1198,16 +1198,38 @@ func uploadBundle(archivePath string) error {
 	if err != nil {
 		return fmt.Errorf("resolve archive path: %w", err)
 	}
+
+	// The weka uploader daemon runs inside the wekanode container process which
+	// has /opt/weka/ bind-mounted but NOT /tmp/ or other host paths. If the
+	// archive lives outside /opt/weka/ (e.g. /tmp/), the uploader cannot open
+	// the symlink target. Stage a hard-link (same inode, no extra disk space)
+	// under the container's directory so it is always reachable.
+	stagedPath := filepath.Join(supportDir, "..", filename)
+	staged := false
+	if err := os.Link(absArchive, stagedPath); err == nil {
+		// Hard-link succeeded (same filesystem) — point symlink at staged copy
+		absArchive = stagedPath
+		staged = true
+	}
+	// If hard-link failed (cross-device) we fall back to the original path and
+	// hope it is accessible; the uploader will skip it silently if not.
+
 	if err := os.Symlink(absArchive, linkPath); err != nil {
+		if staged {
+			os.Remove(stagedPath)
+		}
 		return fmt.Errorf("create upload symlink in %s: %w", supportDir, err)
 	}
 
-	// Clean up symlink on any return (error, timeout) or signal (Ctrl+C).
-	// If upload succeeded the uploader already moved it, so Remove is a no-op.
+	// Clean up symlink (and staged hard-link) on any return or signal (Ctrl+C).
+	// If upload succeeded the uploader already moved the symlink, so Remove is a no-op.
 	defer func() {
 		if _, err := os.Lstat(linkPath); err == nil {
 			os.Remove(linkPath)
 			vlogf("Cleaned up upload symlink: %s", linkPath)
+		}
+		if staged {
+			os.Remove(stagedPath)
 		}
 	}()
 	sigCh := make(chan os.Signal, 1)
@@ -1216,8 +1238,11 @@ func uploadBundle(archivePath string) error {
 		if _, ok := <-sigCh; ok {
 			if _, err := os.Lstat(linkPath); err == nil {
 				os.Remove(linkPath)
-				warnf("Upload interrupted — cleaned up %s", linkPath)
 			}
+			if staged {
+				os.Remove(stagedPath)
+			}
+			warnf("Upload interrupted — cleaned up staging files")
 			os.Exit(1)
 		}
 	}()
@@ -1230,6 +1255,9 @@ func uploadBundle(archivePath string) error {
 		sizeMB = info.Size() / (1024 * 1024)
 	}
 	estMins := (sizeMB / 60) + 1
+	if staged {
+		logf("Staged %s (%d MB) under /opt/weka/ for container access", filename, sizeMB)
+	}
 	logf("Queued %s (%d MB) in %s", filename, sizeMB, supportDir)
 	logf("Waiting for weka uploader daemon (~1 MB/s, estimated ~%d min)...", estMins)
 
@@ -1258,10 +1286,10 @@ func uploadBundle(archivePath string) error {
 			var pct int
 			if sizeMB > 0 {
 				uploadedMB := int64(elapsed.Seconds()) // ~1 MB/s estimate
-				if uploadedMB > sizeMB {
-					uploadedMB = sizeMB
-				}
 				pct = int(uploadedMB * 100 / sizeMB)
+				if pct > 99 {
+					pct = 99 // cap at 99% until uploader confirms completion
+				}
 			}
 			logf("Uploading... ~%d%% elapsed: %s", pct, elapsed.Round(time.Second))
 			lastLog = time.Now()
