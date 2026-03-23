@@ -1096,33 +1096,28 @@ func getClusterName() string {
 
 // ── upload to Weka Home ───────────────────────────────────────────────────────
 
-// checkCloudEnabled verifies that weka cloud is enabled on this cluster.
+// checkCloudEnabled verifies that weka cloud is registered on this cluster.
+// A cluster is upload-ready when it has a URL and registration status is "registered",
+// regardless of the health/monitoring status field.
 func checkCloudEnabled() error {
-	// Try JSON output first for reliable parsing
-	out, err := exec.Command("weka", "cloud", "status", "-J").Output()
-	if err == nil {
-		var status struct {
-			Enabled bool `json:"enabled"`
-		}
-		if jsonErr := json.Unmarshal(out, &status); jsonErr == nil {
-			if !status.Enabled {
-				return fmt.Errorf("weka cloud is not enabled — run 'weka cloud enable' first")
-			}
-			return nil
-		}
+	out, err := exec.Command("weka", "cloud", "status").Output()
+	if err != nil {
+		return fmt.Errorf("could not check cloud status: %v", err)
 	}
-	// Fallback: text parsing
-	out2, err2 := exec.Command("weka", "cloud", "status").Output()
-	if err2 != nil {
-		return fmt.Errorf("could not check cloud status: %v", err2)
-	}
-	for _, line := range strings.Split(string(out2), "\n") {
+	var hasURL, isRegistered bool
+	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(strings.ToLower(line))
-		if strings.Contains(line, "enabled") && strings.Contains(line, "true") {
-			return nil
+		if strings.HasPrefix(line, "url:") && len(strings.TrimSpace(strings.TrimPrefix(line, "url:"))) > 0 {
+			hasURL = true
+		}
+		if strings.HasPrefix(line, "registration:") && strings.Contains(line, "registered") {
+			isRegistered = true
 		}
 	}
-	return fmt.Errorf("weka cloud does not appear to be enabled — run 'weka cloud enable' first")
+	if !hasURL || !isRegistered {
+		return fmt.Errorf("weka cloud is not registered — run 'weka cloud enable' first (current status: url=%v registered=%v)", hasURL, isRegistered)
+	}
+	return nil
 }
 
 // findSupportDir returns the first writable /opt/weka/*/support directory.
