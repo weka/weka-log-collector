@@ -1094,6 +1094,152 @@ func getClusterName() string {
 	return sanitizeHostname(h)
 }
 
+// ── upload to Weka Home ───────────────────────────────────────────────────────
+
+// checkCloudEnabled verifies that weka cloud is enabled on this cluster.
+func checkCloudEnabled() error {
+	// Try JSON output first for reliable parsing
+	out, err := exec.Command("weka", "cloud", "status", "-J").Output()
+	if err == nil {
+		var status struct {
+			Enabled bool `json:"enabled"`
+		}
+		if jsonErr := json.Unmarshal(out, &status); jsonErr == nil {
+			if !status.Enabled {
+				return fmt.Errorf("weka cloud is not enabled — run 'weka cloud enable' first")
+			}
+			return nil
+		}
+	}
+	// Fallback: text parsing
+	out2, err2 := exec.Command("weka", "cloud", "status").Output()
+	if err2 != nil {
+		return fmt.Errorf("could not check cloud status: %v", err2)
+	}
+	for _, line := range strings.Split(string(out2), "\n") {
+		line = strings.TrimSpace(strings.ToLower(line))
+		if strings.Contains(line, "enabled") && strings.Contains(line, "true") {
+			return nil
+		}
+	}
+	return fmt.Errorf("weka cloud does not appear to be enabled — run 'weka cloud enable' first")
+}
+
+// findSupportDir returns the first writable /opt/weka/*/support directory.
+// Prefers known backend container names (drives0, compute0, frontend0).
+func findSupportDir() (string, error) {
+	preferred := []string{"drives0", "compute0", "frontend0"}
+	candidates := []string{}
+	for _, name := range preferred {
+		candidates = append(candidates, fmt.Sprintf("/opt/weka/%s/support", name))
+	}
+	// Also pick up any other containers not in the preferred list
+	if matches, _ := filepath.Glob("/opt/weka/*/support"); len(matches) > 0 {
+		known := map[string]bool{}
+		for _, c := range candidates {
+			known[c] = true
+		}
+		for _, m := range matches {
+			if !known[m] {
+				candidates = append(candidates, m)
+			}
+		}
+	}
+	for _, dir := range candidates {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		probe := filepath.Join(dir, ".wlc_probe")
+		f, err := os.Create(probe)
+		if err != nil {
+			continue
+		}
+		f.Close()
+		os.Remove(probe)
+		return dir, nil
+	}
+	return "", fmt.Errorf("no writable weka support directory found under /opt/weka/*/support — is this a backend node with weka running?")
+}
+
+// uploadBundle symlinks the archive into the weka support directory and
+// waits for the weka background uploader daemon to process it.
+// The weka uploader (running inside wekanode) watches that directory via
+// inotify, gzip-compresses each file, and POSTs it to Weka Home.
+// We use a distinct "wlc:" prefix so our files never collide with weka diags.
+func uploadBundle(archivePath string) error {
+	phase("Uploading to Weka Home")
+
+	if err := checkCloudEnabled(); err != nil {
+		return err
+	}
+
+	supportDir, err := findSupportDir()
+	if err != nil {
+		return err
+	}
+
+	hostname, _ := os.Hostname()
+	hostname = sanitizeHostname(hostname)
+	uploadID := fmt.Sprintf("%d", time.Now().UnixNano())
+	filename := filepath.Base(archivePath)
+	linkName := fmt.Sprintf("wlc:%s:%s:%s", uploadID, hostname, filename)
+	linkPath := filepath.Join(supportDir, linkName)
+	uploadedPath := filepath.Join(supportDir, ".uploaded", linkName)
+
+	absArchive, err := filepath.Abs(archivePath)
+	if err != nil {
+		return fmt.Errorf("resolve archive path: %w", err)
+	}
+	if err := os.Symlink(absArchive, linkPath); err != nil {
+		return fmt.Errorf("create upload symlink in %s: %w", supportDir, err)
+	}
+
+	info, _ := os.Stat(absArchive)
+	var sizeMB int64
+	if info != nil {
+		sizeMB = info.Size() / (1024 * 1024)
+	}
+	estMins := (sizeMB / 60) + 1
+	logf("Queued %s (%d MB) in %s", filename, sizeMB, supportDir)
+	logf("Waiting for weka uploader daemon (~1 MB/s, estimated ~%d min)...", estMins)
+
+	const uploadTimeout = 20 * time.Minute
+	deadline := time.Now().Add(uploadTimeout)
+	start := time.Now()
+	lastLog := start
+	warned := false
+
+	for time.Now().Before(deadline) {
+		time.Sleep(3 * time.Second)
+
+		// Done: uploader moved file to .uploaded/
+		if _, err := os.Stat(uploadedPath); err == nil {
+			logf("Upload complete (%.0fs)", time.Since(start).Seconds())
+			return nil
+		}
+		// Done: symlink gone from support dir (processed another way)
+		if _, err := os.Lstat(linkPath); os.IsNotExist(err) {
+			logf("Upload complete (%.0fs)", time.Since(start).Seconds())
+			return nil
+		}
+		// Progress log every 30s
+		if time.Since(lastLog) >= 30*time.Second {
+			logf("Still uploading... elapsed: %.0fs", time.Since(start).Seconds())
+			lastLog = time.Now()
+		}
+		// Warn at 10-minute mark
+		if !warned && time.Since(start) > 10*time.Minute {
+			warned = true
+			warnf("Upload is taking longer than expected — check 'weka cloud status' for connectivity issues")
+		}
+	}
+
+	// Timed out — clean up symlink so it doesn't linger
+	os.Remove(linkPath)
+	return fmt.Errorf("upload timed out after %v — check 'weka cloud status'", uploadTimeout)
+}
+
 // ── bash completion ───────────────────────────────────────────────────────────
 
 const bashCompletionScript = `# bash completion for weka-log-collector
@@ -1105,7 +1251,7 @@ _weka_log_collector() {
 
     profiles="default full perf nfs s3 smbw client all"
 
-    opts="--local --clients --dry-run --verbose --version
+    opts="--local --upload --clients --dry-run --verbose --version
           --from --to --profile --output --host --container-id
           --max-size --ssh-user --workers --cmd-timeout
           --no-self-deploy --remote-binary"
@@ -1220,6 +1366,7 @@ func main() {
 		outputPath   = flag.String("output", "", "Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.")
 		localOnly    = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
 		nodeOnly     = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
+		upload       = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
 		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
 		maxSizeMB    = flag.Uint64("max-size", 2048, "Abort if estimated collection size exceeds this value (MB)")
 		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
@@ -1361,6 +1508,11 @@ func main() {
 	if *localOnly {
 		phase("Local collection")
 		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, nil)
+		if *upload && !toStdout {
+			if err := uploadBundle(outPath); err != nil {
+				errorf("Upload failed: %v", err)
+			}
+		}
 		return
 	}
 
@@ -1373,6 +1525,11 @@ func main() {
 			warnf("Could not discover cluster hosts: %v", err)
 			warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
 			writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, nil)
+			if *upload && !toStdout {
+				if err := uploadBundle(outPath); err != nil {
+					errorf("Upload failed: %v", err)
+				}
+			}
 			return
 		}
 		if len(containerIDs) > 0 {
@@ -1411,6 +1568,11 @@ func main() {
 	// Write merged archive
 	phase("Writing archive")
 	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout)
+	if *upload && !toStdout {
+		if err := uploadBundle(outPath); err != nil {
+			errorf("Upload failed: %v", err)
+		}
+	}
 }
 
 // collectCluster fans out collection to all hosts in parallel.
@@ -1682,6 +1844,7 @@ OPTIONS
   --container-id N     Collect from this container ID only (repeatable; e.g. --container-id 0 --container-id 2)
   --clients            Include client nodes in cluster collection (default: backends only)
   --local              Collect from local host only
+  --upload             Upload collected archive to Weka Home (requires weka cloud to be enabled)
   --dry-run            Show collection plan; do not collect
   --output PATH        Output archive path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz)
                        Use - to write to stdout (useful for piping over SSH)
