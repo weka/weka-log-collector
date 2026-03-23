@@ -1294,10 +1294,11 @@ func uploadBundle(archivePath string) error {
 	defer close(sigCh)
 
 	// A healthy uploader picks up inotify events nearly immediately and moves
-	// the symlink to .uploaded/ when done. If we see no activity for 90 s we
-	// assume the uploader for that container is broken (e.g. HostId FAILURE in
-	// 'weka cloud status') and try the next one.
-	perDirTimeout := time.Duration(max(90, sizeMB*2)) * time.Second
+	// the symlink to .uploaded/ when done. Allow at least 5 min per container
+	// (network to Weka Home can be slow); also scale by file size at ~0.5 MB/s
+	// to handle large archives. If nothing happens in that window the uploader
+	// for that container is likely broken (e.g. HostId FAILURE in cloud status).
+	perDirTimeout := time.Duration(max(300, sizeMB*2)) * time.Second
 
 	for i, supportDir := range supportDirs {
 		containerName := filepath.Base(filepath.Dir(supportDir))
