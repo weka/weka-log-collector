@@ -1186,11 +1186,10 @@ func uploadBundle(archivePath string) error {
 		return err
 	}
 
-	hostname, _ := os.Hostname()
-	hostname = sanitizeHostname(hostname)
-	uploadID := fmt.Sprintf("%d", time.Now().UnixNano())
 	filename := filepath.Base(archivePath)
-	linkName := fmt.Sprintf("wlc:%s:%s:%s", uploadID, hostname, filename)
+	// Use a clean "wlc-" prefix so it's identifiable on Weka Home but
+	// doesn't look noisy. The archive name already contains cluster + timestamp.
+	linkName := "wlc-" + filename
 	linkPath := filepath.Join(supportDir, linkName)
 	uploadedPath := filepath.Join(supportDir, ".uploaded", linkName)
 
