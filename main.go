@@ -1186,6 +1186,29 @@ func uploadBundle(archivePath string) error {
 		return err
 	}
 
+	// Clean up any stale wlc-* symlinks left from previous failed runs.
+	// The uploader processes its queue sequentially; a stale broken symlink
+	// blocks all subsequent uploads until it is removed.
+	if entries, err := os.ReadDir(supportDir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasPrefix(name, "wlc-") {
+				continue
+			}
+			stalePath := filepath.Join(supportDir, name)
+			target, err := os.Readlink(stalePath)
+			if err != nil {
+				continue // not a symlink
+			}
+			if _, err := os.Stat(target); err != nil {
+				// Target is missing — stale symlink
+				if removeErr := os.Remove(stalePath); removeErr == nil {
+					logf("Removed stale upload symlink: %s → %s", name, target)
+				}
+			}
+		}
+	}
+
 	filename := filepath.Base(archivePath)
 	// Use a clean "wlc-" prefix so it's identifiable on Weka Home but
 	// doesn't look noisy. The archive name already contains cluster + timestamp.
