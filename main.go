@@ -1132,15 +1132,14 @@ func checkCloudEnabled() error {
 	return nil
 }
 
-// findSupportDir returns the first writable /opt/weka/*/support directory.
+// findSupportDirs returns all writable /opt/weka/*/support directories.
 // Prefers known backend container names (drives0, compute0, frontend0).
-func findSupportDir() (string, error) {
+func findSupportDirs() ([]string, error) {
 	preferred := []string{"drives0", "compute0", "frontend0"}
 	candidates := []string{}
 	for _, name := range preferred {
 		candidates = append(candidates, fmt.Sprintf("/opt/weka/%s/support", name))
 	}
-	// Also pick up any other containers not in the preferred list
 	if matches, _ := filepath.Glob("/opt/weka/*/support"); len(matches) > 0 {
 		known := map[string]bool{}
 		for _, c := range candidates {
@@ -1152,6 +1151,7 @@ func findSupportDir() (string, error) {
 			}
 		}
 	}
+	var result []string
 	for _, dir := range candidates {
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
@@ -1164,16 +1164,46 @@ func findSupportDir() (string, error) {
 		}
 		f.Close()
 		os.Remove(probe)
-		return dir, nil
+		result = append(result, dir)
 	}
-	return "", fmt.Errorf("no writable weka support directory found under /opt/weka/*/support — is this a backend node with weka running?")
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no writable weka support directory found under /opt/weka/*/support — is this a backend node with weka running?")
+	}
+	return result, nil
 }
 
-// uploadBundle symlinks the archive into the weka support directory and
-// waits for the weka background uploader daemon to process it.
-// The weka uploader (running inside wekanode) watches that directory via
-// inotify, gzip-compresses each file, and POSTs it to Weka Home.
-// We use a distinct "wlc:" prefix so our files never collide with weka diags.
+// cleanStaleSymlinks removes broken wlc-* / wlc:* symlinks from supportDir.
+// The uploader queue is sequential; a stale broken symlink blocks all later uploads.
+func cleanStaleSymlinks(supportDir string) {
+	entries, err := os.ReadDir(supportDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "wlc-") && !strings.HasPrefix(name, "wlc:") {
+			continue
+		}
+		stalePath := filepath.Join(supportDir, name)
+		target, err := os.Readlink(stalePath)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(target); err != nil {
+			if removeErr := os.Remove(stalePath); removeErr == nil {
+				logf("Removed stale upload symlink: %s → %s", name, target)
+			}
+		}
+	}
+}
+
+// uploadBundle symlinks the archive into a weka support directory and waits
+// for the weka background uploader daemon to process it.
+//
+// The weka uploader (inside wekanode) watches support/ via inotify and uploads
+// each file to Weka Home. If a container's uploader is in FAILURE state (as
+// shown by 'weka cloud status') it will not respond; we try each available
+// container in sequence, moving on after a per-dir timeout.
 func uploadBundle(archivePath string) error {
 	phase("Uploading to Weka Home")
 
@@ -1181,67 +1211,32 @@ func uploadBundle(archivePath string) error {
 		return err
 	}
 
-	supportDir, err := findSupportDir()
+	supportDirs, err := findSupportDirs()
 	if err != nil {
 		return err
 	}
-
-	// Clean up any stale wlc-* symlinks left from previous failed runs.
-	// The uploader processes its queue sequentially; a stale broken symlink
-	// blocks all subsequent uploads until it is removed.
-	if entries, err := os.ReadDir(supportDir); err == nil {
-		for _, e := range entries {
-			name := e.Name()
-			if !strings.HasPrefix(name, "wlc-") && !strings.HasPrefix(name, "wlc:") {
-				continue
-			}
-			stalePath := filepath.Join(supportDir, name)
-			target, err := os.Readlink(stalePath)
-			if err != nil {
-				continue // not a symlink
-			}
-			if _, err := os.Stat(target); err != nil {
-				// Target is missing — stale symlink
-				if removeErr := os.Remove(stalePath); removeErr == nil {
-					logf("Removed stale upload symlink: %s → %s", name, target)
-				}
-			}
-		}
-	}
-
-	filename := filepath.Base(archivePath)
-	// Use a clean "wlc-" prefix so it's identifiable on Weka Home but
-	// doesn't look noisy. The archive name already contains cluster + timestamp.
-	linkName := "wlc-" + filename
-	linkPath := filepath.Join(supportDir, linkName)
-	uploadedPath := filepath.Join(supportDir, ".uploaded", linkName)
 
 	absArchive, err := filepath.Abs(archivePath)
 	if err != nil {
 		return fmt.Errorf("resolve archive path: %w", err)
 	}
 
-	// The weka uploader daemon runs inside the wekanode container process which
-	// has /opt/weka/ bind-mounted but NOT /tmp/ or other host paths. If the
-	// archive lives outside /opt/weka/ (e.g. /tmp/), the uploader cannot open
-	// the symlink target. Stage the file under the container's directory so it
-	// is always reachable. Try a hard-link first (same inode, instant, no extra
-	// disk space); fall back to a full copy if on a different filesystem (/tmp
-	// is typically tmpfs, /opt/weka is on a real disk).
-	stagedPath := filepath.Join(supportDir, "..", filename)
+	filename := filepath.Base(archivePath)
+	linkName := "wlc-" + filename
+
+	// Stage the file under /opt/weka/ so all container uploaders can reach it.
+	// Wekanode containers have /opt/weka/ bind-mounted but not /tmp/.
+	// Hard-link is instant; fall back to copy if cross-filesystem (tmpfs→ext4).
+	stagedPath := filepath.Join(supportDirs[0], "..", filename)
 	staged := false
 	if err := os.Link(absArchive, stagedPath); err == nil {
 		absArchive = stagedPath
 		staged = true
 		vlogf("Staged via hard-link: %s", stagedPath)
 	} else {
-		// Cross-device (e.g. /tmp → /opt/weka): do a full copy
-		logf("Hard-link not possible (cross-filesystem), copying %d MB to /opt/weka/...", func() int64 {
-			if i, e := os.Stat(absArchive); e == nil {
-				return i.Size() / (1024 * 1024)
-			}
-			return 0
-		}())
+		if i, e := os.Stat(absArchive); e == nil {
+			logf("Hard-link not possible (cross-filesystem), copying %d MB to /opt/weka/...", i.Size()/(1024*1024))
+		}
 		if copyErr := func() error {
 			src, err := os.Open(absArchive)
 			if err != nil {
@@ -1258,36 +1253,35 @@ func uploadBundle(archivePath string) error {
 		}(); copyErr == nil {
 			absArchive = stagedPath
 			staged = true
-			vlogf("Staged via copy: %s", stagedPath)
 		} else {
 			warnf("Could not stage archive under /opt/weka/ (%v); uploader may not be able to access it", copyErr)
 		}
 	}
-
-	if err := os.Symlink(absArchive, linkPath); err != nil {
-		if staged {
-			os.Remove(stagedPath)
-		}
-		return fmt.Errorf("create upload symlink in %s: %w", supportDir, err)
-	}
-
-	// Clean up symlink (and staged hard-link) on any return or signal (Ctrl+C).
-	// If upload succeeded the uploader already moved the symlink, so Remove is a no-op.
 	defer func() {
-		if _, err := os.Lstat(linkPath); err == nil {
-			os.Remove(linkPath)
-			vlogf("Cleaned up upload symlink: %s", linkPath)
-		}
 		if staged {
 			os.Remove(stagedPath)
 		}
 	}()
+
+	info, _ := os.Stat(absArchive)
+	var sizeMB int64
+	if info != nil {
+		sizeMB = info.Size() / (1024 * 1024)
+	}
+	estMins := (sizeMB / 60) + 1
+
+	// Track the currently active symlink for signal cleanup.
+	var mu sync.Mutex
+	var activeLinkPath string
+	setActive := func(p string) { mu.Lock(); activeLinkPath = p; mu.Unlock() }
+	getActive := func() string { mu.Lock(); defer mu.Unlock(); return activeLinkPath }
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		if _, ok := <-sigCh; ok {
-			if _, err := os.Lstat(linkPath); err == nil {
-				os.Remove(linkPath)
+			if lp := getActive(); lp != "" {
+				os.Remove(lp)
 			}
 			if staged {
 				os.Remove(stagedPath)
@@ -1299,58 +1293,87 @@ func uploadBundle(archivePath string) error {
 	defer signal.Stop(sigCh)
 	defer close(sigCh)
 
-	info, _ := os.Stat(absArchive)
-	var sizeMB int64
-	if info != nil {
-		sizeMB = info.Size() / (1024 * 1024)
-	}
-	estMins := (sizeMB / 60) + 1
-	logf("Queued %s (%d MB) in %s", filename, sizeMB, supportDir)
-	logf("Waiting for weka uploader daemon (~1 MB/s, estimated ~%d min)...", estMins)
+	// A healthy uploader picks up inotify events nearly immediately and moves
+	// the symlink to .uploaded/ when done. If we see no activity for 90 s we
+	// assume the uploader for that container is broken (e.g. HostId FAILURE in
+	// 'weka cloud status') and try the next one.
+	perDirTimeout := time.Duration(max(90, sizeMB*2)) * time.Second
 
-	const uploadTimeout = 20 * time.Minute
-	deadline := time.Now().Add(uploadTimeout)
-	start := time.Now()
-	lastLog := start
-	warned := false
-
-	for time.Now().Before(deadline) {
-		time.Sleep(3 * time.Second)
-
-		// Done: uploader moved file to .uploaded/
-		if _, err := os.Stat(uploadedPath); err == nil {
-			logf("Upload complete (%.0fs)", time.Since(start).Seconds())
-			return nil
+	for i, supportDir := range supportDirs {
+		containerName := filepath.Base(filepath.Dir(supportDir))
+		if len(supportDirs) > 1 {
+			logf("Trying uploader via container %s (%d/%d)...", containerName, i+1, len(supportDirs))
 		}
-		// Done: symlink gone from support dir (processed another way)
-		if _, err := os.Lstat(linkPath); os.IsNotExist(err) {
-			logf("Upload complete (%.0fs)", time.Since(start).Seconds())
-			return nil
+
+		cleanStaleSymlinks(supportDir)
+
+		linkPath := filepath.Join(supportDir, linkName)
+		uploadedPath := filepath.Join(supportDir, ".uploaded", linkName)
+
+		if err := os.Symlink(absArchive, linkPath); err != nil {
+			warnf("Could not create symlink in %s: %v", supportDir, err)
+			continue
 		}
-		// Progress log every 60s
-		if time.Since(lastLog) >= 60*time.Second {
-			elapsed := time.Since(start)
-			var pct int
-			if sizeMB > 0 {
-				uploadedMB := int64(elapsed.Seconds()) // ~1 MB/s estimate
-				pct = int(uploadedMB * 100 / sizeMB)
-				if pct > 99 {
-					pct = 99 // cap at 99% until uploader confirms completion
-				}
+		setActive(linkPath)
+
+		logf("Queued %s (%d MB) in %s", filename, sizeMB, supportDir)
+		if i == 0 {
+			logf("Waiting for weka uploader daemon (~1 MB/s, estimated ~%d min)...", estMins)
+		}
+
+		start := time.Now()
+		lastLog := start
+		perDirDeadline := start.Add(perDirTimeout)
+		overallDeadline := start.Add(20 * time.Minute)
+		success := false
+
+		for time.Now().Before(overallDeadline) {
+			time.Sleep(3 * time.Second)
+
+			if _, err := os.Stat(uploadedPath); err == nil {
+				logf("Upload complete (%.0fs)", time.Since(start).Seconds())
+				success = true
+				break
 			}
-			logf("Uploading... ~%d%% elapsed: %s", pct, elapsed.Round(time.Second))
-			lastLog = time.Now()
+			if _, err := os.Lstat(linkPath); os.IsNotExist(err) {
+				logf("Upload complete (%.0fs)", time.Since(start).Seconds())
+				success = true
+				break
+			}
+
+			// Per-dir timeout: uploader for this container is not responding
+			if time.Now().After(perDirDeadline) {
+				if i+1 < len(supportDirs) {
+					warnf("Uploader via %s did not respond within %v — trying next container...", containerName, perDirTimeout)
+				}
+				break
+			}
+
+			if time.Since(lastLog) >= 60*time.Second {
+				elapsed := time.Since(start)
+				var pct int
+				if sizeMB > 0 {
+					pct = int(elapsed.Seconds()) * 100 / int(sizeMB)
+					if pct > 99 {
+						pct = 99
+					}
+				}
+				logf("Uploading... ~%d%% elapsed: %s", pct, elapsed.Round(time.Second))
+				lastLog = time.Now()
+			}
 		}
-		// Warn at 10-minute mark
-		if !warned && time.Since(start) > 10*time.Minute {
-			warned = true
-			warnf("Upload is taking longer than expected — check 'weka cloud status' for connectivity issues")
+
+		setActive("")
+		if _, err := os.Lstat(linkPath); err == nil {
+			os.Remove(linkPath)
+		}
+
+		if success {
+			return nil
 		}
 	}
 
-	// Timed out — clean up symlink so it doesn't linger
-	os.Remove(linkPath)
-	return fmt.Errorf("upload timed out after %v — check 'weka cloud status'", uploadTimeout)
+	return fmt.Errorf("upload failed — no weka uploader processed the file; check 'weka cloud status'")
 }
 
 // ── bash completion ───────────────────────────────────────────────────────────
