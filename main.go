@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1200,6 +1201,28 @@ func uploadBundle(archivePath string) error {
 	if err := os.Symlink(absArchive, linkPath); err != nil {
 		return fmt.Errorf("create upload symlink in %s: %w", supportDir, err)
 	}
+
+	// Clean up symlink on any return (error, timeout) or signal (Ctrl+C).
+	// If upload succeeded the uploader already moved it, so Remove is a no-op.
+	defer func() {
+		if _, err := os.Lstat(linkPath); err == nil {
+			os.Remove(linkPath)
+			vlogf("Cleaned up upload symlink: %s", linkPath)
+		}
+	}()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-sigCh; ok {
+			if _, err := os.Lstat(linkPath); err == nil {
+				os.Remove(linkPath)
+				warnf("Upload interrupted — cleaned up %s", linkPath)
+			}
+			os.Exit(1)
+		}
+	}()
+	defer signal.Stop(sigCh)
+	defer close(sigCh)
 
 	info, _ := os.Stat(absArchive)
 	var sizeMB int64
