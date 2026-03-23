@@ -1202,17 +1202,45 @@ func uploadBundle(archivePath string) error {
 	// The weka uploader daemon runs inside the wekanode container process which
 	// has /opt/weka/ bind-mounted but NOT /tmp/ or other host paths. If the
 	// archive lives outside /opt/weka/ (e.g. /tmp/), the uploader cannot open
-	// the symlink target. Stage a hard-link (same inode, no extra disk space)
-	// under the container's directory so it is always reachable.
+	// the symlink target. Stage the file under the container's directory so it
+	// is always reachable. Try a hard-link first (same inode, instant, no extra
+	// disk space); fall back to a full copy if on a different filesystem (/tmp
+	// is typically tmpfs, /opt/weka is on a real disk).
 	stagedPath := filepath.Join(supportDir, "..", filename)
 	staged := false
 	if err := os.Link(absArchive, stagedPath); err == nil {
-		// Hard-link succeeded (same filesystem) — point symlink at staged copy
 		absArchive = stagedPath
 		staged = true
+		vlogf("Staged via hard-link: %s", stagedPath)
+	} else {
+		// Cross-device (e.g. /tmp → /opt/weka): do a full copy
+		logf("Hard-link not possible (cross-filesystem), copying %d MB to /opt/weka/...", func() int64 {
+			if i, e := os.Stat(absArchive); e == nil {
+				return i.Size() / (1024 * 1024)
+			}
+			return 0
+		}())
+		if copyErr := func() error {
+			src, err := os.Open(absArchive)
+			if err != nil {
+				return err
+			}
+			defer src.Close()
+			dst, err := os.Create(stagedPath)
+			if err != nil {
+				return err
+			}
+			defer dst.Close()
+			_, err = io.Copy(dst, src)
+			return err
+		}(); copyErr == nil {
+			absArchive = stagedPath
+			staged = true
+			vlogf("Staged via copy: %s", stagedPath)
+		} else {
+			warnf("Could not stage archive under /opt/weka/ (%v); uploader may not be able to access it", copyErr)
+		}
 	}
-	// If hard-link failed (cross-device) we fall back to the original path and
-	// hope it is accessible; the uploader will skip it silently if not.
 
 	if err := os.Symlink(absArchive, linkPath); err != nil {
 		if staged {
@@ -1255,9 +1283,6 @@ func uploadBundle(archivePath string) error {
 		sizeMB = info.Size() / (1024 * 1024)
 	}
 	estMins := (sizeMB / 60) + 1
-	if staged {
-		logf("Staged %s (%d MB) under /opt/weka/ for container access", filename, sizeMB)
-	}
 	logf("Queued %s (%d MB) in %s", filename, sizeMB, supportDir)
 	logf("Waiting for weka uploader daemon (~1 MB/s, estimated ~%d min)...", estMins)
 
