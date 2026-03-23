@@ -1096,26 +1096,37 @@ func getClusterName() string {
 
 // ── upload to Weka Home ───────────────────────────────────────────────────────
 
-// checkCloudEnabled verifies that weka cloud is registered on this cluster.
-// A cluster is upload-ready when it has a URL and registration status is "registered",
-// regardless of the health/monitoring status field.
+// checkCloudEnabled verifies that weka cloud is registered and the uploader
+// daemon is active on at least one host.
 func checkCloudEnabled() error {
 	out, err := exec.Command("weka", "cloud", "status").Output()
 	if err != nil {
 		return fmt.Errorf("could not check cloud status: %v", err)
 	}
 	var hasURL, isRegistered bool
+	totalHosts, disabledHosts := 0, 0
 	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(strings.ToLower(line))
-		if strings.HasPrefix(line, "url:") && len(strings.TrimSpace(strings.TrimPrefix(line, "url:"))) > 0 {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "url:") && len(strings.TrimSpace(strings.TrimPrefix(lower, "url:"))) > 0 {
 			hasURL = true
 		}
-		if strings.HasPrefix(line, "registration:") && strings.Contains(line, "registered") {
+		if strings.HasPrefix(lower, "registration:") && strings.Contains(lower, "registered") {
 			isRegistered = true
+		}
+		// Count per-host uploader status lines (e.g. "HostId<0>   DISABLED")
+		if strings.Contains(trimmed, "HostId<") {
+			totalHosts++
+			if strings.HasSuffix(strings.ToUpper(trimmed), "DISABLED") {
+				disabledHosts++
+			}
 		}
 	}
 	if !hasURL || !isRegistered {
-		return fmt.Errorf("weka cloud is not registered — run 'weka cloud enable' first (current status: url=%v registered=%v)", hasURL, isRegistered)
+		return fmt.Errorf("weka cloud is not registered — run 'weka cloud enable' first")
+	}
+	if totalHosts > 0 && totalHosts == disabledHosts {
+		return fmt.Errorf("weka uploader daemon is DISABLED on all hosts — check 'weka cloud status' and ensure the uploader is active before using --upload")
 	}
 	return nil
 }
