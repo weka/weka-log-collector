@@ -1192,7 +1192,7 @@ func uploadBundle(archivePath string) error {
 	if entries, err := os.ReadDir(supportDir); err == nil {
 		for _, e := range entries {
 			name := e.Name()
-			if !strings.HasPrefix(name, "wlc-") {
+			if !strings.HasPrefix(name, "wlc-") && !strings.HasPrefix(name, "wlc:") {
 				continue
 			}
 			stalePath := filepath.Join(supportDir, name)
