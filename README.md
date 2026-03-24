@@ -144,6 +144,26 @@ When run without `--local`, the tool:
 
 Use `--container-id` to scope to specific nodes, or `--clients` to include client nodes.
 
+### Large clusters (50+ nodes)
+
+The default settings are tuned for small-to-medium clusters. For large clusters:
+
+- **Always use `--from`** — without a time window, log collection per node can be very large. A 2–4 hour window is recommended for incident collection.
+- **Set `--output` to a filesystem with enough space** — the default `/tmp` is often small. Use `/opt/weka/` or a dedicated data volume. A 180-node cluster with a 2-hour window typically produces 5–15 GB.
+- **Raise `--max-size`** — the default 2048 MB limit will trigger on large clusters. Set it based on available space.
+- **Increase `--workers`** — default is 10 parallel SSH connections. For faster collection on large clusters, `--workers 30` is reasonable if the orchestrator node can handle it.
+- **Increase `--cmd-timeout`** — on busy large clusters, commands like `weka events` can take longer than the default 60s.
+
+```bash
+# Recommended for large clusters (100+ nodes)
+weka-log-collector \
+  --from -2h \
+  --output /opt/weka/weka-logs.tar.gz \
+  --max-size 20000 \
+  --workers 30 \
+  --cmd-timeout 120s
+```
+
 ---
 
 ## Tab completion
