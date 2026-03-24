@@ -10,7 +10,7 @@ Drop a single binary on any Weka node and collect a compressed archive of logs a
 
 For most support cases, `weka diags` is your starting point. This tool is a complement for situations where you need more targeted or flexible log collection.
 
-- **Profile-based collection** — gather only what's relevant: default, full, perf, NFS, S3, SMB-W, client, or all
+- **Profile-based collection** — gather only what's relevant: default, full, perf, NFS, S3, SMB-W, or all
 - **Time-windowed journalctl** — scope `journalctl` to an incident window with `--start-time`/`--end-time`; all log files always collected in full
 - **Full container log coverage** — all container log trees collected including rotated variants
 - **Cluster-wide in one shot** — auto-deploys itself to each node via SCP, collects in parallel, merges into a single archive
@@ -24,7 +24,7 @@ For most support cases, `weka diags` is your starting point. This tool is a comp
 ## Installation
 
 ```bash
-git clone https://github.com/manmeet-weka/weka-log-collector
+git clone https://github.com/weka/weka-log-collector
 scp weka-log-collector/weka-log-collector root@<node-ip>:/tmp/weka-log-collector
 ```
 
@@ -230,4 +230,4 @@ go install honnef.co/go/tools/cmd/staticcheck@latest
 
 ## License
 
-Internal tool — not for public distribution.
+GPL v3.0 — see [LICENSE](LICENSE).
