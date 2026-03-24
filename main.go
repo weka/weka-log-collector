@@ -197,8 +197,6 @@ func buildPerfCommands(from, to time.Time) []CommandSpec {
 		stats("weka_stats_ssd_write_latency", " --show-internal --stat SSD_WRITE_LATENCY --per-process"),
 		stats("weka_stats_drive_read_latency", " --show-internal --stat DRIVE_READ_LATENCY --per-process"),
 		stats("weka_stats_drive_write_latency", " --show-internal --stat DRIVE_WRITE_LATENCY --per-process"),
-		stats("weka_stats_disks_queue_length", " --show-internal --stat DISKS_QUEUE_LENGTH --per-process"),
-
 		// Client-visible I/O ops and latency.
 		stats("weka_stats_ops_driver", " --show-internal --category ops_driver --per-process"),
 		stats("weka_stats_ops", " --show-internal --category ops --per-process"),
