@@ -1172,8 +1172,10 @@ func findSupportDirs() ([]string, error) {
 	return result, nil
 }
 
-// cleanStaleSymlinks removes broken wlc-* / wlc:* symlinks from supportDir.
-// The uploader queue is sequential; a stale broken symlink blocks all later uploads.
+// cleanStaleSymlinks removes leftover wlc-* / wlc:* symlinks from supportDir.
+// Removes any symlink whose target is missing (broken), and any wlc- (dash)
+// format symlinks regardless — the uploader requires wlc:<id>:<host>:<file>
+// format and silently ignores the old dash format.
 func cleanStaleSymlinks(supportDir string) {
 	entries, err := os.ReadDir(supportDir)
 	if err != nil {
@@ -1189,9 +1191,12 @@ func cleanStaleSymlinks(supportDir string) {
 		if err != nil {
 			continue
 		}
-		if _, err := os.Stat(target); err != nil {
+		// Always remove old wlc- (dash) format: uploader won't process them.
+		// Also remove any symlink whose target no longer exists.
+		broken := func() bool { _, err := os.Stat(target); return err != nil }()
+		if strings.HasPrefix(name, "wlc-") || broken {
 			if removeErr := os.Remove(stalePath); removeErr == nil {
-				logf("Removed stale upload symlink: %s → %s", name, target)
+				logf("Removed leftover upload symlink: %s", name)
 			}
 		}
 	}
@@ -1222,7 +1227,10 @@ func uploadBundle(archivePath string) error {
 	}
 
 	filename := filepath.Base(archivePath)
-	linkName := "wlc-" + filename
+	// The weka uploader daemon requires the structured format wlc:<id>:<host>:<file>
+	// to recognize and process the file. A plain prefix like "wlc-" is ignored.
+	hostname, _ := os.Hostname()
+	linkName := fmt.Sprintf("wlc:%d:%s:%s", time.Now().UnixNano(), hostname, filename)
 
 	// Stage the file under /opt/weka/ so all container uploaders can reach it.
 	// Wekanode containers have /opt/weka/ bind-mounted but not /tmp/.
