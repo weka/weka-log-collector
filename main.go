@@ -950,7 +950,9 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 	// ── auto-deploy: scp binary to /tmp on the remote host ────────────────
 	remoteBin := binaryPath
 	if selfDeploy {
-		remoteBin = "/tmp/weka-log-collector"
+		// Use a PID-suffixed name so the orchestrator never overwrites its own
+		// running binary when it is also a member of the cluster being collected.
+		remoteBin = fmt.Sprintf("/tmp/weka-log-collector-%d", os.Getpid())
 		logf("  [%s] deploying binary via scp...", host)
 		scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
 		scpCmd := exec.Command("scp", scpArgs...)
@@ -1783,7 +1785,7 @@ func main() {
 			warnf("Could not determine executable path (%v); falling back to --remote-binary mode", err)
 			selfDeploy = false
 		} else {
-			logf("Auto-deploying binary from %s to /tmp/weka-log-collector on each host", selfPath)
+			logf("Auto-deploying binary from %s to /tmp/weka-log-collector-<pid> on each host", selfPath)
 			logf("(use --no-self-deploy to skip auto-deployment and use --remote-binary instead)")
 		}
 	}
