@@ -68,8 +68,8 @@ Flags:
   --remote-binary      Path to binary on remote hosts when using --no-self-deploy (default: /usr/local/bin/weka-log-collector)
   --ssh-user           SSH user for remote collection (default: root)
   --workers            Max parallel SSH workers (default: 10)
-  --max-size           Abort if estimated size exceeds this MB (default: 2048)
-  --cmd-timeout        Timeout per command (default: 60s)
+  --max-size           Abort if estimated size exceeds this MB (default: 10000)
+  --cmd-timeout        Timeout per command (default: 120s)
   --dry-run            Show what would be collected without collecting
   --verbose            Print detailed progress for every file and command
   --version            Print version and exit

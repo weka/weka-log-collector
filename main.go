@@ -379,8 +379,10 @@ func checkDiskSpace(path string) (diskInfo, error) {
 }
 
 // estimateCollectionMB returns a rough upper-bound estimate of how much disk
-// space the collection will use (before compression).
-func estimateCollectionMB(profile string, logSpecs []LogFileSpec) uint64 {
+// space the collection will use after compression.
+// nodeCount should be 1 for local collection, or the number of remote hosts
+// for cluster collection — log files scale linearly with node count.
+func estimateCollectionMB(profile string, logSpecs []LogFileSpec, nodeCount int) uint64 {
 	var totalBytes int64
 	for _, spec := range logSpecs {
 		if spec.Profile != "" && spec.Profile != profile && profile != ProfileAll {
@@ -398,9 +400,16 @@ func estimateCollectionMB(profile string, logSpecs []LogFileSpec) uint64 {
 			totalBytes += info.Size()
 		}
 	}
-	// Add ~10MB overhead for command outputs
-	totalBytes += 10 * 1024 * 1024
-	// Assume ~30% compression ratio for mixed content
+	// Scale log files by node count (cluster commands run once, not per node,
+	// so only multiply the per-node portion — approximated as 80% of total).
+	if nodeCount > 1 {
+		perNodeBytes := totalBytes * 80 / 100
+		clusterOnceBytes := totalBytes - perNodeBytes
+		totalBytes = perNodeBytes*int64(nodeCount) + clusterOnceBytes
+	}
+	// Add ~20MB overhead for command outputs per node
+	totalBytes += int64(max(1, nodeCount)) * 20 * 1024 * 1024
+	// Assume ~30% compression ratio for mixed log content
 	compressedMB := uint64(totalBytes/1024/1024) * 30 / 100
 	if compressedMB < 5 {
 		compressedMB = 5
@@ -1508,12 +1517,12 @@ func main() {
 		nodeOnly     = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		upload       = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
 		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
-		maxSizeMB    = flag.Uint64("max-size", 2048, "Abort if estimated collection size exceeds this value (MB)")
+		maxSizeMB    = flag.Uint64("max-size", 10000, "Abort if estimated collection size exceeds this value (MB)")
 		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
 		remoteBinary = flag.String("remote-binary", "/usr/local/bin/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
 		noSelfDeploy = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
 		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
-		cmdTimeout   = flag.Duration("cmd-timeout", 60*time.Second, "Timeout per command")
+		cmdTimeout   = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
 		ver          = flag.Bool("version", false, "Print version and exit")
 	)
 	var hosts multiStringFlag
@@ -1597,6 +1606,28 @@ func main() {
 		logf("Output:   <stdout>")
 	}
 
+	// ── pre-discover node count for accurate space estimation ────────────
+	// For cluster mode we need to know how many nodes we're collecting from
+	// before the space check. Discover early and reuse the result later.
+	// For --local or explicit --host flags we already know the count.
+	var preDiscoveredHosts []string
+	spaceCheckNodeCount := 1
+	if !*localOnly && !toStdout {
+		if len(hosts) > 0 {
+			spaceCheckNodeCount = len(hosts)
+		} else {
+			if nodes, err := discoverClusterNodes(*withClients); err == nil {
+				if len(containerIDs) > 0 {
+					nodes = filterNodesByContainerID(nodes, []int(containerIDs))
+				}
+				preDiscoveredHosts = nodeIPs(nodes)
+				spaceCheckNodeCount = len(preDiscoveredHosts)
+			}
+			// If discovery fails here we fall back to 1; the cluster section
+			// will retry and produce a proper error message if needed.
+		}
+	}
+
 	// ── space check (skip for stdout) ─────────────────────────────────────
 	if !toStdout && !*dryRun {
 		outputDir := filepath.Dir(outPath)
@@ -1606,7 +1637,7 @@ func main() {
 			errorf("Tip: use --output to write to a different location (e.g. --output /data/weka-logs.tar.gz)")
 			os.Exit(1)
 		}
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs)
+		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount)
 		logf("Disk:     %d MB available on %s (estimated collection: ~%d MB compressed)", di.AvailMB, di.Path, estimated)
 
 		if di.AvailMB < minFreeSpaceMB {
@@ -1625,6 +1656,7 @@ func main() {
 			errorf("Estimated collection size (~%d MB) exceeds limit (%d MB).", estimated, limit)
 			errorf("Tip: narrow the time window with --from -2h to reduce the amount collected.")
 			errorf("     Or increase the limit with --max-size <MB>.")
+			errorf("     Use --output to write to a larger filesystem (e.g. /opt/weka/).")
 			errorf("     Or use --dry-run to see exactly what would be collected.")
 			os.Exit(1)
 		}
@@ -1632,8 +1664,9 @@ func main() {
 
 	if *dryRun {
 		phase("DRY RUN — showing what would be collected")
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs)
+		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount)
 		logf("  Profile:   %s", *profileStr)
+		logf("  Nodes:     %d", spaceCheckNodeCount)
 		logf("  Estimated: ~%d MB compressed", estimated)
 		logf("  Commands:  %d weka + %d system", len(defaultCommands)+len(buildProfileCommands(*profileStr)), len(systemCommands))
 		logf("  Log specs: %d file patterns", len(logFileSpecs))
@@ -1660,28 +1693,37 @@ func main() {
 	phase("Discovering cluster hosts")
 	clusterHosts := []string(hosts)
 	if len(clusterHosts) == 0 {
-		nodes, err := discoverClusterNodes(*withClients)
-		if err != nil {
-			warnf("Could not discover cluster hosts: %v", err)
-			warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
-			writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, nil)
-			if *upload && !toStdout {
-				if err := uploadBundle(outPath); err != nil {
-					errorf("Upload failed: %v", err)
+		if len(preDiscoveredHosts) > 0 {
+			// Reuse result from early discovery (already filtered by --container-id)
+			clusterHosts = preDiscoveredHosts
+			if len(containerIDs) > 0 {
+				logf("Filtered to %d node(s) matching --container-id %v", len(clusterHosts), []int(containerIDs))
+			}
+			logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
+		} else {
+			nodes, err := discoverClusterNodes(*withClients)
+			if err != nil {
+				warnf("Could not discover cluster hosts: %v", err)
+				warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
+				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, nil)
+				if *upload && !toStdout {
+					if err := uploadBundle(outPath); err != nil {
+						errorf("Upload failed: %v", err)
+					}
 				}
+				return
 			}
-			return
-		}
-		if len(containerIDs) > 0 {
-			nodes = filterNodesByContainerID(nodes, []int(containerIDs))
-			if len(nodes) == 0 {
-				errorf("No nodes found matching --container-id %v", []int(containerIDs))
-				os.Exit(1)
+			if len(containerIDs) > 0 {
+				nodes = filterNodesByContainerID(nodes, []int(containerIDs))
+				if len(nodes) == 0 {
+					errorf("No nodes found matching --container-id %v", []int(containerIDs))
+					os.Exit(1)
+				}
+				logf("Filtered to %d node(s) matching --container-id %v", len(nodes), []int(containerIDs))
 			}
-			logf("Filtered to %d node(s) matching --container-id %v", len(nodes), []int(containerIDs))
+			clusterHosts = nodeIPs(nodes)
+			logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 		}
-		clusterHosts = nodeIPs(nodes)
-		logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 	} else {
 		logf("Collecting from %d specified host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 	}
