@@ -11,7 +11,7 @@ Drop a single binary on any Weka node and collect a compressed archive of logs a
 For most support cases, `weka diags` is your starting point. This tool is a complement for situations where you need more targeted or flexible log collection.
 
 - **Profile-based collection** — gather only what's relevant: default, full, perf, NFS, S3, SMB-W, client, or all
-- **Time-windowed journalctl** — scope `journalctl` to an incident window with `--from`/`--to`; all log files always collected in full
+- **Time-windowed journalctl** — scope `journalctl` to an incident window with `--start-time`/`--end-time`; all log files always collected in full
 - **Full container log coverage** — all container log trees collected including rotated variants
 - **Cluster-wide in one shot** — auto-deploys itself to each node via SCP, collects in parallel, merges into a single archive
 - **Container-scoped collection** — target specific nodes by their Weka container ID (`--container-id`)
@@ -25,7 +25,7 @@ For most support cases, `weka diags` is your starting point. This tool is a comp
 
 ```bash
 git clone https://github.com/manmeet-weka/weka-log-collector
-scp weka-log-collector/weka-log-collector root@<node-ip>:/usr/local/bin/weka-log-collector
+scp weka-log-collector/weka-log-collector root@<node-ip>:/tmp/weka-log-collector
 ```
 
 The binary is a static Linux amd64 build — no dependencies, works on any Weka node.
@@ -42,10 +42,10 @@ weka-log-collector --local
 weka-log-collector
 
 # Last 2 hours of journalctl, default profile
-weka-log-collector --from -2h
+weka-log-collector --start-time -2h
 
 # Specific incident window, full profile
-weka-log-collector --profile full --from 2026-03-20T14:00 --to 2026-03-20T16:00
+weka-log-collector --profile full --start-time 2026-03-20T14:00 --end-time 2026-03-20T16:00
 ```
 
 ---
@@ -58,14 +58,14 @@ Usage: weka-log-collector [flags]
 Flags:
   --local              Collect from local host only (no SSH, no cluster discovery)
   --profile            Collection profile: default|full|perf|nfs|s3|smbw|client|all  (default: default)
-  --from               Start of time window for journalctl (e.g. -2h, -30m, -1d, 2026-03-20T14:00)
-  --to                 End of time window for journalctl (default: now)
+  --start-time         Start of time window (e.g. -2h, -30m, -1d, 2026-03-20T14:00)
+  --end-time           End of time window (default: now)
   --output             Output .tar.gz path (default: /tmp/<cluster>-weka-logs-<ts>.tar.gz). Use - for stdout.
   --host               Collect from this host by IP (repeatable; default: all cluster backends)
   --container-id       Collect from this container ID only (repeatable; e.g. --container-id 0 --container-id 2)
   --clients            Include client nodes in cluster collection (default: backends only)
   --no-self-deploy     Skip auto-deployment; use --remote-binary path on remote hosts instead
-  --remote-binary      Path to binary on remote hosts when using --no-self-deploy (default: /usr/local/bin/weka-log-collector)
+  --remote-binary      Path to binary on remote hosts when using --no-self-deploy (default: /tmp/weka-log-collector)
   --ssh-user           SSH user for remote collection (default: root)
   --workers            Max parallel SSH workers (default: 10)
   --max-size           Abort if estimated size exceeds this MB (default: 10000)
@@ -79,16 +79,16 @@ Flags:
 
 ```bash
 # Local only, S3 profile, last 4 hours
-weka-log-collector --local --profile s3 --from -4h
+weka-log-collector --local --profile s3 --start-time -4h
 
 # Entire cluster, full profile
 weka-log-collector --profile full
 
 # Specific container IDs (as shown in 'weka cluster container')
-weka-log-collector --container-id 0 --container-id 1 --from -2h
+weka-log-collector --container-id 0 --container-id 1 --start-time -2h
 
 # Backends and clients
-weka-log-collector --clients --from -2h
+weka-log-collector --clients --start-time -2h
 
 # Specific hosts by IP
 weka-log-collector --host 10.0.0.1 --host 10.0.0.2
@@ -148,7 +148,7 @@ Use `--container-id` to scope to specific nodes, or `--clients` to include clien
 
 The default settings are tuned for small-to-medium clusters. For large clusters:
 
-- **Always use `--from`** — without a time window, log collection per node can be very large. A 2–4 hour window is recommended for incident collection.
+- **Always use `--start-time`** — without a time window, log collection per node can be very large. A 2–4 hour window is recommended for incident collection.
 - **Set `--output` to a filesystem with enough space** — the default `/tmp` is often small. Use `/opt/weka/` or a dedicated data volume. A 180-node cluster with a 2-hour window typically produces 5–15 GB.
 - **Raise `--max-size`** — the default 2048 MB limit will trigger on large clusters. Set it based on available space.
 - **Increase `--workers`** — default is 10 parallel SSH connections. For faster collection on large clusters, `--workers 30` is reasonable if the orchestrator node can handle it.
@@ -157,7 +157,7 @@ The default settings are tuned for small-to-medium clusters. For large clusters:
 ```bash
 # Recommended for large clusters (100+ nodes)
 weka-log-collector \
-  --from -2h \
+  --start-time -2h \
   --output /opt/weka/weka-logs.tar.gz \
   --max-size 20000 \
   --workers 30 \

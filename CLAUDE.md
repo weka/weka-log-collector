@@ -37,7 +37,7 @@ Install staticcheck:
 
 Copy to a Weka node and run:
 
-    scp weka-log-collector_linux_amd64 root@<node>:/usr/local/bin/weka-log-collector
+    scp weka-log-collector_linux_amd64 root@<node>:/tmp/weka-log-collector
 
 ## Code Layout
 

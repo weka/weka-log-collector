@@ -164,26 +164,69 @@ var fullCommands = []CommandSpec{
 	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", Profile: ProfileFull, NodeLocal: true},
 }
 
-// perfCommands are added for profile "perf" or "all".
-var perfCommands = []CommandSpec{
-	{Name: "weka_stats_cpu", Cmd: "weka stats --show-internal --category cpu --per-process -s value -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_ssd", Cmd: "weka stats --show-internal --category ssd -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_ops_driver", Cmd: "weka stats --show-internal --category ops_driver -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_ops", Cmd: "weka stats --show-internal --category ops -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_network", Cmd: "weka stats --show-internal --category network -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_jrpc", Cmd: "weka stats --show-internal --category jrpc -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_rpc", Cmd: "weka stats --show-internal --category rpc -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_read_latency", Cmd: "weka stats --category ops --show-internal --stat READ_LATENCY -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_write_latency", Cmd: "weka stats --category ops --show-internal --stat WRITE_LATENCY -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_ssd_read_latency", Cmd: "weka stats --show-internal --stat SSD_READ_LATENCY -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_ssd_write_latency", Cmd: "weka stats --show-internal --stat SSD_WRITE_LATENCY -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_drive_read_latency", Cmd: "weka stats --show-internal --stat DRIVE_READ_LATENCY -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_drive_write_latency", Cmd: "weka stats --show-internal --stat DRIVE_WRITE_LATENCY -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_goodput_tx", Cmd: "weka stats --show-internal --stat GOODPUT_TX_RATIO -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_goodput_rx", Cmd: "weka stats --show-internal --stat GOODPUT_RX_RATIO -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_port_tx", Cmd: "weka stats --show-internal --stat PORT_TX_BYTES -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_port_rx", Cmd: "weka stats --show-internal --stat PORT_RX_BYTES -Z", Profile: ProfilePerf},
-	{Name: "weka_stats_realtime", Cmd: "weka stats realtime -s -cpu -o node,hostname,role,mode,writeps,writebps,wlatency,readps,readbps,rlatency,ops,cpu,l6recv,l6send,upload,download", Profile: ProfilePerf},
+// buildPerfCommands returns the perf-profile command list, translating the
+// --start-time/--end-time window into weka stats --start-time/--end-time flags.
+func buildPerfCommands(from, to time.Time) []CommandSpec {
+	// Build the time-window flags for weka stats.
+	// weka stats accepts relative values like "-2h" or absolute ISO timestamps.
+	timeFlags := ""
+	if !from.IsZero() {
+		timeFlags += fmt.Sprintf(" --start-time %s", from.Format("2006-01-02T15:04:05"))
+	}
+	if !to.IsZero() {
+		timeFlags += fmt.Sprintf(" --end-time %s", to.Format("2006-01-02T15:04:05"))
+	}
+
+	// qt adds --query-timeout to avoid the 5s default timing out on large clusters.
+	qt := " --query-timeout 30"
+
+	stats := func(name, flags string) CommandSpec {
+		return CommandSpec{
+			Name:    name,
+			Cmd:     "weka stats" + flags + timeFlags + qt,
+			Profile: ProfilePerf,
+		}
+	}
+
+	return []CommandSpec{
+		// CPU — per-process breakdown is critical for pinpointing hot nodes/roles.
+		stats("weka_stats_cpu_per_process", " --show-internal --category cpu --per-process -s value"),
+		stats("weka_stats_cpu_per_role", " --show-internal --category cpu --per-role -s value"),
+
+		// SSD / drive I/O throughput and latency.
+		stats("weka_stats_ssd", " --show-internal --category ssd --per-process"),
+		stats("weka_stats_ssd_read_latency", " --show-internal --stat SSD_READ_LATENCY --per-process"),
+		stats("weka_stats_ssd_write_latency", " --show-internal --stat SSD_WRITE_LATENCY --per-process"),
+		stats("weka_stats_drive_read_latency", " --show-internal --stat DRIVE_READ_LATENCY --per-process"),
+		stats("weka_stats_drive_write_latency", " --show-internal --stat DRIVE_WRITE_LATENCY --per-process"),
+		stats("weka_stats_disks_queue_length", " --show-internal --stat DISKS_QUEUE_LENGTH --per-process"),
+
+		// Client-visible I/O ops and latency.
+		stats("weka_stats_ops_driver", " --show-internal --category ops_driver --per-process"),
+		stats("weka_stats_ops", " --show-internal --category ops --per-process"),
+		stats("weka_stats_read_latency", " --category ops --show-internal --stat READ_LATENCY --per-process"),
+		stats("weka_stats_write_latency", " --category ops --show-internal --stat WRITE_LATENCY --per-process"),
+
+		// Network throughput, goodput, and packet errors.
+		stats("weka_stats_network", " --show-internal --category network --per-process"),
+		stats("weka_stats_goodput_tx", " --show-internal --stat GOODPUT_TX_RATIO --per-process"),
+		stats("weka_stats_goodput_rx", " --show-internal --stat GOODPUT_RX_RATIO --per-process"),
+		stats("weka_stats_port_tx", " --show-internal --stat PORT_TX_BYTES --per-process"),
+		stats("weka_stats_port_rx", " --show-internal --stat PORT_RX_BYTES --per-process"),
+		stats("weka_stats_dropped_packets", " --show-internal --stat DROPPED_PACKETS --per-process"),
+		stats("weka_stats_corrupt_packets", " --show-internal --stat CORRUPT_PACKETS --per-process"),
+
+		// RPC/JRPC internals.
+		stats("weka_stats_jrpc", " --show-internal --category jrpc --per-process"),
+		stats("weka_stats_rpc", " --show-internal --category rpc --per-process"),
+
+		// Realtime snapshot — always current 1s window, cannot take --start-time/--end-time.
+		{
+			Name:    "weka_stats_realtime",
+			Cmd:     "weka stats realtime -s -cpu -o node,hostname,role,mode,writeps,writebps,wlatency,readps,readbps,rlatency,ops,cpu,l6recv,l6send,upload,download",
+			Profile: ProfilePerf,
+		},
+	}
 }
 
 // nfsCommands are added for profile "nfs" or "all".
@@ -270,7 +313,7 @@ var systemCommands = []CommandSpec{
 
 // LogFileSpec describes a set of log files to collect.
 // All matched files are always collected in full — no time-window filtering.
-// The --from/--to window applies only to journalctl, not to file collection.
+// The --start-time/--end-time window applies only to journalctl, not to file collection.
 type LogFileSpec struct {
 	// SrcGlob is a shell glob pattern for source files
 	SrcGlob string
@@ -609,7 +652,7 @@ func globBase(pattern string) string {
 
 // collectLogFile adds a single log file to the tar writer.
 // destPath is the full path inside the archive (archiveRoot already included).
-// from is the --from time window: rotated log files (*.1, *.gz, -YYYYMMDD) whose
+// from is the --start-time window: rotated log files (*.1, *.gz, -YYYYMMDD) whose
 // mtime predates from are skipped and recorded in the manifest with a note.
 // Current active log files are always collected regardless of from.
 // Returns a FileResult describing success or failure.
@@ -639,7 +682,7 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string, from time.Time) Fi
 	// Current active log files are always collected (mtime doesn't reliably
 	// reflect their content range — they're still being written to).
 	if !from.IsZero() && isRotatedFile(filepath.Base(srcPath)) && info.ModTime().Before(from) {
-		note := fmt.Sprintf("rotated file mtime %s is before --from %s; skipped to reduce bundle size",
+		note := fmt.Sprintf("rotated file mtime %s is before --start-time %s; skipped to reduce bundle size",
 			info.ModTime().UTC().Format(time.RFC3339), from.UTC().Format(time.RFC3339))
 		result.Skipped = true
 		result.SkipNote = note
@@ -732,7 +775,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// ── phase: weka CLI commands (parallel) ───────────────────────────────
 	phase(fmt.Sprintf("[%s] Weka commands (profile: %s, %d parallel)", hostname, profile, cmdWorkers))
 
-	allWekaCmds := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile)...)
+	allWekaCmds := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile, from, to)...)
 
 	// Filter to the commands we'll actually run on this node before parallelising.
 	var wekaToRun []CommandSpec
@@ -837,7 +880,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 }
 
 // buildProfileCommands returns the additional commands for a given profile.
-func buildProfileCommands(profile string) []CommandSpec {
+func buildProfileCommands(profile string, from, to time.Time) []CommandSpec {
 	var cmds []CommandSpec
 	addIfProfile := func(list []CommandSpec, p string) {
 		if profileEnabled(profile, p) {
@@ -845,7 +888,9 @@ func buildProfileCommands(profile string) []CommandSpec {
 		}
 	}
 	addIfProfile(fullCommands, ProfileFull)
-	addIfProfile(perfCommands, ProfilePerf)
+	if profileEnabled(profile, ProfilePerf) {
+		cmds = append(cmds, buildPerfCommands(from, to)...)
+	}
 	addIfProfile(nfsCommands, ProfileNFS)
 	addIfProfile(s3Commands, ProfileS3)
 	addIfProfile(smbwCommands, ProfileSMBW)
@@ -856,8 +901,8 @@ func buildProfileCommands(profile string) []CommandSpec {
 // buildClusterWideCmds returns all commands (default + profile) that produce
 // identical output on every node and should be run exactly once by the orchestrator.
 // These are commands with NodeLocal==false.
-func buildClusterWideCmds(profile string) []CommandSpec {
-	all := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile)...)
+func buildClusterWideCmds(profile string, from, to time.Time) []CommandSpec {
+	all := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile, from, to)...)
 	var cmds []CommandSpec
 	for _, spec := range all {
 		if !spec.NodeLocal {
@@ -930,10 +975,10 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 	}, func() []string {
 		var extra []string
 		if !from.IsZero() {
-			extra = append(extra, "--from", from.Format("2006-01-02T15:04"))
+			extra = append(extra, "--start-time", from.Format("2006-01-02T15:04"))
 		}
 		if !to.IsZero() {
-			extra = append(extra, "--to", to.Format("2006-01-02T15:04"))
+			extra = append(extra, "--end-time", to.Format("2006-01-02T15:04"))
 		}
 		if verbose {
 			extra = append(extra, "--verbose")
@@ -1401,7 +1446,7 @@ _weka_log_collector() {
     profiles="default full perf nfs s3 smbw client all"
 
     opts="--local --upload --clients --dry-run --verbose --version
-          --from --to --profile --output --host --container-id
+          --start-time --end-time --profile --output --host --container-id
           --max-size --ssh-user --workers --cmd-timeout
           --no-self-deploy --remote-binary"
 
@@ -1414,7 +1459,7 @@ _weka_log_collector() {
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
-        --from|--to)
+        --start-time|--end-time)
             COMPREPLY=( $(compgen -W "-1h -2h -4h -8h -12h -24h -1d -2d" -- "$cur") )
             return 0
             ;;
@@ -1509,8 +1554,8 @@ func (f *multiIntFlag) Set(v string) error {
 
 func main() {
 	var (
-		fromStr      = flag.String("from", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
-		toStr        = flag.String("to", "", "End of time window (default: now)")
+		startTimeStr = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
+		endTimeStr   = flag.String("end-time", "", "End of time window (default: now)")
 		profileStr   = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
 		outputPath   = flag.String("output", "", "Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.")
 		localOnly    = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
@@ -1519,7 +1564,7 @@ func main() {
 		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
 		maxSizeMB    = flag.Uint64("max-size", 10000, "Abort if estimated collection size exceeds this value (MB)")
 		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
-		remoteBinary = flag.String("remote-binary", "/usr/local/bin/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
+		remoteBinary = flag.String("remote-binary", "/tmp/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
 		noSelfDeploy = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
 		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
 		cmdTimeout   = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
@@ -1557,24 +1602,24 @@ func main() {
 
 	// ── parse time window ─────────────────────────────────────────────────
 	var from, to time.Time
-	if *fromStr != "" {
-		t, err := parseInputTime(*fromStr)
+	if *startTimeStr != "" {
+		t, err := parseInputTime(*startTimeStr)
 		if err != nil {
-			errorf("--from: %v", err)
+			errorf("--start-time: %v", err)
 			os.Exit(1)
 		}
 		from = t
 	}
-	if *toStr != "" {
-		t, err := parseInputTime(*toStr)
+	if *endTimeStr != "" {
+		t, err := parseInputTime(*endTimeStr)
 		if err != nil {
-			errorf("--to: %v", err)
+			errorf("--end-time: %v", err)
 			os.Exit(1)
 		}
 		to = t
 	}
 	if !from.IsZero() && !to.IsZero() && to.Before(from) {
-		errorf("--to (%s) is before --from (%s)", to.Format(time.RFC3339), from.Format(time.RFC3339))
+		errorf("--end-time (%s) is before --start-time (%s)", to.Format(time.RFC3339), from.Format(time.RFC3339))
 		os.Exit(1)
 	}
 
@@ -1654,7 +1699,7 @@ func main() {
 				limit = maxAllowed
 			}
 			errorf("Estimated collection size (~%d MB) exceeds limit (%d MB).", estimated, limit)
-			errorf("Tip: narrow the time window with --from -2h to reduce the amount collected.")
+			errorf("Tip: narrow the time window with --start-time -2h to reduce the amount collected.")
 			errorf("     Or increase the limit with --max-size <MB>.")
 			errorf("     Use --output to write to a larger filesystem (e.g. /opt/weka/).")
 			errorf("     Or use --dry-run to see exactly what would be collected.")
@@ -1668,7 +1713,7 @@ func main() {
 		logf("  Profile:   %s", *profileStr)
 		logf("  Nodes:     %d", spaceCheckNodeCount)
 		logf("  Estimated: ~%d MB compressed", estimated)
-		logf("  Commands:  %d weka + %d system", len(defaultCommands)+len(buildProfileCommands(*profileStr)), len(systemCommands))
+		logf("  Commands:  %d weka + %d system", len(defaultCommands)+len(buildProfileCommands(*profileStr, from, to)), len(systemCommands))
 		logf("  Log specs: %d file patterns", len(logFileSpecs))
 		if !toStdout {
 			di, _ := checkDiskSpace(filepath.Dir(outPath))
@@ -1876,7 +1921,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	// ── run cluster-wide weka commands once on the orchestrator ───────────
 	// These commands produce identical output on every node; running them once
 	// avoids duplicating the same files N times (once per cluster host).
-	clusterCmds := buildClusterWideCmds(profile)
+	clusterCmds := buildClusterWideCmds(profile, from, to)
 	phase(fmt.Sprintf("Cluster-wide Weka commands (run once, %d parallel)", cmdWorkers))
 	logf("  [cluster] running %d cluster-wide commands", len(clusterCmds))
 	clusterOutputs := runCommandsParallel(clusterCmds, cmdTimeout)
@@ -1990,9 +2035,9 @@ func usageFunc() {
 	fmt.Fprint(os.Stderr, `weka-log-collector — collect logs and diagnostics from a Weka cluster
 
 USAGE
-  weka-log-collector [--from TIME] [--to TIME] [--profile PROFILE] [options]
-  weka-log-collector --local [--from TIME] [--profile PROFILE]
-  weka-log-collector --dry-run [--from TIME] [--profile PROFILE]
+  weka-log-collector [--start-time TIME] [--end-time TIME] [--profile PROFILE] [options]
+  weka-log-collector --local [--start-time TIME] [--profile PROFILE]
+  weka-log-collector --dry-run [--start-time TIME] [--profile PROFILE]
 
 COLLECTION MODES
   Default (no --local):  discover all cluster hosts via 'weka cluster container',
@@ -2001,20 +2046,20 @@ COLLECTION MODES
   --dry-run:             show what would be collected and estimated size.
 
 TIME WINDOW
-  --from TIME  Start time. Logs before this are excluded.
-               Relative: -2h, -30m, -1d
-               Absolute: 2026-03-04T10:30
-  --to   TIME  End time (default: now). Same formats.
+  --start-time TIME  Start time. Logs before this are excluded.
+                     Relative: -2h, -30m, -1d
+                     Absolute: 2026-03-04T10:30
+  --end-time   TIME  End time (default: now). Same formats.
 
   Examples:
-    --from -2h                    last 2 hours
-    --from -1d --to -12h          yesterday morning
-    --from 2026-03-04T10:00 --to 2026-03-04T12:00
+    --start-time -2h                              last 2 hours
+    --start-time -1d --end-time -12h              yesterday morning
+    --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
 
 PROFILES
   default   Core weka commands + key logs (~30MB/node compressed)
   full      + container logs, journalctl, events, core dumps
-  perf      + performance stats (use with --from/-to for the incident window)
+  perf      + performance stats (use with --start-time/--end-time for the incident window)
   nfs       + Ganesha logs and NFS commands
   s3        + S3/envoy logs and S3 commands
   smbw      + SMB-W logs and Pacemaker status
@@ -2039,28 +2084,28 @@ OPTIONS
 
 EXAMPLES
   # Collect last 2 hours from all cluster nodes (run on any backend)
-  weka-log-collector --from -2h
+  weka-log-collector --start-time -2h
 
   # Collect full profile for a specific incident window
-  weka-log-collector --profile full --from 2026-03-04T10:00 --to 2026-03-04T12:00
+  weka-log-collector --profile full --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
 
   # Collect S3-specific logs from this node only
-  weka-log-collector --local --profile s3 --from -4h
+  weka-log-collector --local --profile s3 --start-time -4h
 
   # Dry run: see what would be collected
-  weka-log-collector --profile full --from -2h --dry-run
+  weka-log-collector --profile full --start-time -2h --dry-run
 
   # Collect from specific container IDs (as shown in 'weka cluster container')
-  weka-log-collector --container-id 0 --container-id 1 --from -2h
+  weka-log-collector --container-id 0 --container-id 1 --start-time -2h
 
   # Collect from all backends and clients
-  weka-log-collector --clients --from -2h
+  weka-log-collector --clients --start-time -2h
 
   # Collect from specific hosts by IP
-  weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --from -1h
+  weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --start-time -1h
 
   # Stream to remote machine
-  weka-log-collector --local --from -1h --output - | ssh analyst@host 'cat > weka-logs.tar.gz'
+  weka-log-collector --local --start-time -1h --output - | ssh analyst@host 'cat > weka-logs.tar.gz'
 
 `)
 }
