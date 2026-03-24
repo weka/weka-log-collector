@@ -57,7 +57,7 @@ Usage: weka-log-collector [flags]
 
 Flags:
   --local              Collect from local host only (no SSH, no cluster discovery)
-  --profile            Collection profile: default|full|perf|nfs|s3|smbw|client|all  (default: default)
+  --profile            Collection profile: default|full|perf|nfs|s3|smbw|all  (default: default)
   --start-time         Start of time window (e.g. -2h, -30m, -1d, 2026-03-20T14:00)
   --end-time           End of time window (default: now)
   --output             Output .tar.gz path (default: /tmp/<cluster>-weka-logs-<ts>.tar.gz). Use - for stdout.
@@ -107,20 +107,21 @@ weka-log-collector --local --output - | ssh admin@bastion "cat > /data/weka-logs
 
 | Profile | What's included |
 |---------|----------------|
-| `default` | Weka CLI status commands + all system/container logs |
+| `default` | Weka CLI status commands + all system/container logs + NIC/OFED/routing info |
 | `full` | + extra weka commands (events, cfgdump, hw info) + full journalctl |
 | `perf` | + performance stats (CPU, SSD, ops, network, JRPC, latency) |
 | `nfs` | + NFS/Ganesha commands and ganesha container logs |
 | `s3` | + S3/envoy commands and S3 container logs |
 | `smbw` | + SMB-W commands and smbw/pacemaker/corosync logs |
-| `client` | + client NIC/OFED/routing info |
-| `all` | Everything from all profiles |
+| `all` | Everything from all profiles above |
+
+> NIC/OFED/routing info (`lshw`, `ofed_info`, `lsmod`, `modinfo`, `ip rule`, `ip neighbor`, `rp_filter`) is always collected on every node — backends and clients alike.
 
 ---
 
 ## What gets collected
 
-**System commands** — uname, os-release, uptime, free, lscpu, ip addr/route, netstat, ps, df, lspci, lsblk, sysctl.conf, dmesg, journalctl (weka-agent + time-windowed full journal)
+**System commands** — uname, os-release, uptime, free, lscpu, ip addr/route/rule/neighbor, netstat, ps, df, lspci, lsblk, sysctl.conf, dmesg, journalctl (weka-agent + time-windowed full journal), lshw (network), ofed_info, lsmod, modinfo (mlx5_core, ice), rp_filter
 
 **Weka CLI commands** — weka status, alerts, cluster topology, filesystems, snapshots, debug traces, local container resources, and profile-specific commands (events, cfgdump, perf stats, NFS/S3/SMB-W commands)
 

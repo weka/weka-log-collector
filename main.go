@@ -89,13 +89,12 @@ const (
 	ProfileNFS     = "nfs"     // + ganesha logs and NFS commands
 	ProfileS3      = "s3"      // + S3/envoy logs and S3 commands
 	ProfileSMBW    = "smbw"    // + SMB logs and pcs status
-	ProfileClient  = "client"  // + client NIC/OFED/routing info
 	ProfileAll     = "all"     // everything
 )
 
 var validProfiles = []string{
 	ProfileDefault, ProfileFull, ProfilePerf,
-	ProfileNFS, ProfileS3, ProfileSMBW, ProfileClient, ProfileAll,
+	ProfileNFS, ProfileS3, ProfileSMBW, ProfileAll,
 }
 
 func profileEnabled(selected, check string) bool {
@@ -155,6 +154,8 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_local_resources_drives0", Cmd: "weka local resources -C drives0", NodeLocal: true},
 	{Name: "weka_local_resources_compute0", Cmd: "weka local resources -C compute0", NodeLocal: true},
 	{Name: "weka_local_resources_frontend0", Cmd: "weka local resources -C frontend0", NodeLocal: true},
+	// ── host hw info (node-local: different per host) ──────────────────────
+	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", NodeLocal: true},
 }
 
 // fullCommands are added when profile is "full" or "all".
@@ -268,21 +269,6 @@ var smbwCommands = []CommandSpec{
 	{Name: "sssd_conf", Cmd: "cat /etc/sssd/sssd.conf", Profile: ProfileSMBW, NodeLocal: true},
 }
 
-// clientCommands are added for profile "client" or "all".
-var clientCommands = []CommandSpec{
-	{Name: "lshw_network", Cmd: "lshw -C network -businfo", Profile: ProfileClient, NodeLocal: true},
-	{Name: "ofed_info", Cmd: "ofed_info -s", Profile: ProfileClient, NodeLocal: true},
-	{Name: "lsmod", Cmd: "lsmod", Profile: ProfileClient, NodeLocal: true},
-	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core", Profile: ProfileClient, NodeLocal: true},
-	{Name: "modinfo_ice", Cmd: "modinfo ice", Profile: ProfileClient, NodeLocal: true},
-	{Name: "ip_rule", Cmd: "ip rule", Profile: ProfileClient, NodeLocal: true},
-	{Name: "ip_route", Cmd: "ip route show", Profile: ProfileClient, NodeLocal: true},
-	{Name: "ip_neighbor", Cmd: "ip neighbor", Profile: ProfileClient, NodeLocal: true},
-	{Name: "netstat", Cmd: "netstat -tunlp", Profile: ProfileClient, NodeLocal: true},
-	{Name: "rp_filter", Cmd: "sysctl -a | grep -w rp_filter", Profile: ProfileClient, NodeLocal: true},
-	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", Profile: ProfileClient},
-}
-
 // systemCommands run directly on the OS (not via weka CLI).
 // These are always collected regardless of profile.
 var systemCommands = []CommandSpec{
@@ -305,6 +291,15 @@ var systemCommands = []CommandSpec{
 	{Name: "journalctl_weka_agent_verbose", Cmd: "journalctl -xu weka-agent --no-pager -n 10000"},
 	// kernel ring buffer with timestamps
 	{Name: "dmesg", Cmd: "dmesg -T"},
+	// ── NIC / OFED / routing (always needed for both backends and clients) ──
+	{Name: "lshw_network", Cmd: "lshw -C network -businfo"},
+	{Name: "ofed_info", Cmd: "ofed_info -s"},
+	{Name: "lsmod", Cmd: "lsmod"},
+	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core"},
+	{Name: "modinfo_ice", Cmd: "modinfo ice"},
+	{Name: "ip_rule", Cmd: "ip rule"},
+	{Name: "ip_neighbor", Cmd: "ip neighbor"},
+	{Name: "rp_filter", Cmd: "sysctl -a | grep -w rp_filter"},
 }
 
 // LogFileSpec describes a set of log files to collect.
@@ -905,7 +900,6 @@ func buildProfileCommands(profile string, from, to time.Time) []CommandSpec {
 	addIfProfile(nfsCommands, ProfileNFS)
 	addIfProfile(s3Commands, ProfileS3)
 	addIfProfile(smbwCommands, ProfileSMBW)
-	addIfProfile(clientCommands, ProfileClient)
 	return cmds
 }
 
@@ -1467,7 +1461,7 @@ _weka_log_collector() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    profiles="default full perf nfs s3 smbw client all"
+    profiles="default full perf nfs s3 smbw all"
 
     opts="--local --upload --clients --clients-only --dry-run --verbose --version
           --start-time --end-time --profile --output --host --container-id
@@ -2111,8 +2105,7 @@ PROFILES
   nfs       + Ganesha logs and NFS commands
   s3        + S3/envoy logs and S3 commands
   smbw      + SMB-W logs and Pacemaker status
-  client    + client-side NIC/OFED/routing info
-  all       Everything
+  all       Everything from all profiles above
 
 OPTIONS
   --host HOST          Collect from this host by IP (repeatable; default: all cluster backends)
