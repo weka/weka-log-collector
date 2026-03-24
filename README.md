@@ -64,6 +64,7 @@ Flags:
   --host               Collect from this host by IP (repeatable; default: all cluster backends)
   --container-id       Collect from this container ID only (repeatable; e.g. --container-id 0 --container-id 2)
   --clients            Include client nodes in cluster collection (default: backends only)
+  --clients-only       Collect from client nodes only (skip backends)
   --no-self-deploy     Skip auto-deployment; use --remote-binary path on remote hosts instead
   --remote-binary      Path to binary on remote hosts when using --no-self-deploy (default: /tmp/weka-log-collector)
   --ssh-user           SSH user for remote collection (default: root)
@@ -142,9 +143,9 @@ When run without `--local`, the tool:
 4. Cleans up the temporary binary after collection
 5. Merges all host archives into a single `.tar.gz`
 
-Use `--container-id` to scope to specific nodes, or `--clients` to include client nodes.
+Use `--container-id` to scope to specific nodes, `--clients` to include client nodes alongside backends, or `--clients-only` to collect from client nodes only.
 
-> **Note:** `--clients` can significantly increase collection size — each client host adds roughly the same log volume as a backend. Only use it when investigating a client-side issue (e.g. Kubernetes/CSI clients, NFS/SMB clients). For most support cases, leave it off.
+> **Note:** `--clients` and `--clients-only` can significantly increase collection size — each client host adds roughly the same log volume as a backend. Only use it when investigating a client-side issue (e.g. Kubernetes/CSI clients, NFS/SMB clients). For most support cases, leave it off.
 
 ### Large clusters (50+ nodes)
 

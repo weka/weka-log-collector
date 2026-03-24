@@ -1125,6 +1125,17 @@ func filterNodesByContainerID(nodes []clusterNode, ids []int) []clusterNode {
 	return out
 }
 
+// filterClientNodes returns only nodes with mode "client".
+func filterClientNodes(nodes []clusterNode) []clusterNode {
+	var out []clusterNode
+	for _, n := range nodes {
+		if n.Mode == "client" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // nodeIPs extracts the IP from each clusterNode, preserving order.
 func nodeIPs(nodes []clusterNode) []string {
 	ips := make([]string, len(nodes))
@@ -1458,7 +1469,7 @@ _weka_log_collector() {
 
     profiles="default full perf nfs s3 smbw client all"
 
-    opts="--local --upload --clients --dry-run --verbose --version
+    opts="--local --upload --clients --clients-only --dry-run --verbose --version
           --start-time --end-time --profile --output --host --container-id
           --max-size --ssh-user --workers --cmd-timeout
           --no-self-deploy --remote-binary"
@@ -1588,6 +1599,7 @@ func main() {
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
 	withClients := flag.Bool("clients", false, "Include client nodes in cluster collection (default: backends only)")
+	clientsOnly := flag.Bool("clients-only", false, "Collect from client nodes only (skip backends)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
 	flag.Var(&hosts, "host", "Collect only from these hosts by IP (repeatable; default: all cluster backends)")
 	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (repeatable; e.g. --container-id 0 --container-id 2)")
@@ -1686,7 +1698,10 @@ func main() {
 		if len(hosts) > 0 {
 			spaceCheckNodeCount = len(hosts)
 		} else {
-			if nodes, err := discoverClusterNodes(*withClients); err == nil {
+			if nodes, err := discoverClusterNodes(*withClients || *clientsOnly); err == nil {
+				if *clientsOnly {
+					nodes = filterClientNodes(nodes)
+				}
 				if len(containerIDs) > 0 {
 					nodes = filterNodesByContainerID(nodes, []int(containerIDs))
 				}
@@ -1771,7 +1786,7 @@ func main() {
 			}
 			logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 		} else {
-			nodes, err := discoverClusterNodes(*withClients)
+			nodes, err := discoverClusterNodes(*withClients || *clientsOnly)
 			if err != nil {
 				warnf("Could not discover cluster hosts: %v", err)
 				warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
@@ -1782,6 +1797,14 @@ func main() {
 					}
 				}
 				return
+			}
+			if *clientsOnly {
+				nodes = filterClientNodes(nodes)
+				if len(nodes) == 0 {
+					errorf("No client nodes found in cluster. Are there any Weka client containers?")
+					os.Exit(1)
+				}
+				logf("Filtered to %d client node(s)", len(nodes))
 			}
 			if len(containerIDs) > 0 {
 				nodes = filterNodesByContainerID(nodes, []int(containerIDs))
@@ -2095,6 +2118,7 @@ OPTIONS
   --host HOST          Collect from this host by IP (repeatable; default: all cluster backends)
   --container-id N     Collect from this container ID only (repeatable; e.g. --container-id 0 --container-id 2)
   --clients            Include client nodes in cluster collection (default: backends only)
+  --clients-only       Collect from client nodes only (skip backends)
   --local              Collect from local host only
   --upload             Upload collected archive to Weka Home (requires weka cloud to be enabled)
   --dry-run            Show collection plan; do not collect
@@ -2125,6 +2149,9 @@ EXAMPLES
 
   # Collect from all backends and clients
   weka-log-collector --clients --start-time -2h
+
+  # Collect from client nodes only
+  weka-log-collector --clients-only --start-time -2h
 
   # Collect from specific hosts by IP
   weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --start-time -1h
