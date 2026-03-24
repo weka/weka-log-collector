@@ -70,12 +70,13 @@ func parseInputTime(s string) (time.Time, error) {
 		}
 		return time.Now().Add(-dur), nil
 	}
-	// Try absolute: YYYY-MM-DDTHH:MM
-	t, err := time.ParseInLocation("2006-01-02T15:04", s, time.Local)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("cannot parse time %q: use YYYY-MM-DDTHH:MM or relative like -2h, -30m, -1d", s)
+	// Try absolute formats: YYYY-MM-DDTHH:MM:SS then YYYY-MM-DDTHH:MM
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
 	}
-	return t, nil
+	return time.Time{}, fmt.Errorf("cannot parse time %q: use YYYY-MM-DDTHH:MM[:SS] or relative like -2h, -30m, -1d", s)
 }
 
 // ── collection profiles ───────────────────────────────────────────────────────
@@ -1462,7 +1463,9 @@ _weka_log_collector() {
             return 0
             ;;
         --start-time|--end-time)
-            COMPREPLY=( $(compgen -W "-1h -2h -4h -8h -12h -24h -1d -2d" -- "$cur") )
+            now=$(date +%Y-%m-%dT%H:%M)
+            today=$(date +%Y-%m-%d)
+            COMPREPLY=( $(compgen -W "-1h -2h -4h -8h -12h -24h -1d -2d ${now} ${today}T00:00 ${today}T06:00 ${today}T12:00 ${today}T18:00" -- "$cur") )
             return 0
             ;;
         --ssh-user)
@@ -2050,7 +2053,7 @@ COLLECTION MODES
 TIME WINDOW
   --start-time TIME  Start time. Logs before this are excluded.
                      Relative: -2h, -30m, -1d
-                     Absolute: 2026-03-04T10:30
+                     Absolute: 2026-03-04T10:30 or 2026-03-04T10:30:00
   --end-time   TIME  End time (default: now). Same formats.
 
   Examples:
