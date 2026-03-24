@@ -144,6 +144,8 @@ When run without `--local`, the tool:
 
 Use `--container-id` to scope to specific nodes, or `--clients` to include client nodes.
 
+> **Note:** `--clients` can significantly increase collection size — each client host adds roughly the same log volume as a backend. Only use it when investigating a client-side issue (e.g. Kubernetes/CSI clients, NFS/SMB clients). For most support cases, leave it off.
+
 ### Large clusters (50+ nodes)
 
 The default settings are tuned for small-to-medium clusters. For large clusters:
