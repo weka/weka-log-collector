@@ -634,7 +634,7 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string, from time.Time) Fi
 			info.ModTime().UTC().Format(time.RFC3339), from.UTC().Format(time.RFC3339))
 		result.Skipped = true
 		result.SkipNote = note
-		logf("  SKIP %s: %s", srcPath, note)
+		vlogf("  SKIP %s: %s", srcPath, note)
 		return result
 	}
 
@@ -792,7 +792,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				continue
 			}
 			seenSrcPaths[srcPath] = true
-			logf("  [%s] collecting: %s", hostname, srcPath)
+			vlogf("  [%s] collecting: %s", hostname, srcPath)
 			// Preserve directory structure relative to the glob base so that
 			// e.g. /opt/weka/logs/compute0/syslog.log ends up at
 			// hosts/<host>/weka/containers/compute0/syslog.log, not
@@ -1359,15 +1359,7 @@ func uploadBundle(archivePath string) error {
 			}
 
 			if time.Since(lastLog) >= 60*time.Second {
-				elapsed := time.Since(start)
-				var pct int
-				if sizeMB > 0 {
-					pct = int(elapsed.Seconds()) * 100 / int(sizeMB)
-					if pct > 99 {
-						pct = 99
-					}
-				}
-				logf("Uploading... ~%d%% elapsed: %s", pct, elapsed.Round(time.Second))
+				logf("Still uploading... elapsed: %s", time.Since(start).Round(time.Second))
 				lastLog = time.Now()
 			}
 		}
