@@ -178,13 +178,10 @@ func buildPerfCommands(from, to time.Time) []CommandSpec {
 		timeFlags += fmt.Sprintf(" --end-time %s", to.Format("2006-01-02T15:04:05"))
 	}
 
-	// qt adds --query-timeout to avoid the 5s default timing out on large clusters.
-	qt := " --query-timeout 30"
-
 	stats := func(name, flags string) CommandSpec {
 		return CommandSpec{
 			Name:    name,
-			Cmd:     "weka stats" + flags + timeFlags + qt,
+			Cmd:     "weka stats" + flags + timeFlags,
 			Profile: ProfilePerf,
 		}
 	}
