@@ -1368,6 +1368,9 @@ func uploadBundle(archivePath string) error {
 		if _, err := os.Lstat(linkPath); err == nil {
 			os.Remove(linkPath)
 		}
+		// Clean up the symlink the uploader moved to .uploaded/ — our staged
+		// file gets deleted by the defer below, which would leave it broken.
+		os.Remove(uploadedPath)
 
 		if success {
 			return nil
