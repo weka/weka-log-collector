@@ -509,29 +509,44 @@ type HostManifest struct {
 
 // ── progress output ───────────────────────────────────────────────────────────
 
-// verbose controls whether verbose output is printed to stderr
+// verbose controls whether verbose output is printed to stderr.
 var verbose bool
 
+// debugLog receives all log output (including verbose) regardless of the
+// --verbose flag. It is set to a real file early in main; until then it
+// discards writes so the functions are safe to call before main initialises it.
+var debugLog io.Writer = io.Discard
+
 func logf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	line := fmt.Sprintf(format+"\n", args...)
+	fmt.Fprint(os.Stderr, line)
+	fmt.Fprint(debugLog, line)
 }
 
 func vlogf(format string, args ...interface{}) {
+	line := fmt.Sprintf("[verbose] "+format+"\n", args...)
 	if verbose {
-		fmt.Fprintf(os.Stderr, "[verbose] "+format+"\n", args...)
+		fmt.Fprint(os.Stderr, line)
 	}
+	fmt.Fprint(debugLog, line) // always written to log file
 }
 
 func warnf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "[WARN]  "+format+"\n", args...)
+	line := fmt.Sprintf("[WARN]  "+format+"\n", args...)
+	fmt.Fprint(os.Stderr, line)
+	fmt.Fprint(debugLog, line)
 }
 
 func errorf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "[ERROR] "+format+"\n", args...)
+	line := fmt.Sprintf("[ERROR] "+format+"\n", args...)
+	fmt.Fprint(os.Stderr, line)
+	fmt.Fprint(debugLog, line)
 }
 
 func phase(name string) {
-	fmt.Fprintf(os.Stderr, "\n==> %s\n", name)
+	line := fmt.Sprintf("\n==> %s\n", name)
+	fmt.Fprint(os.Stderr, line)
+	fmt.Fprint(debugLog, line)
 }
 
 // ── command runner ────────────────────────────────────────────────────────────
@@ -1582,6 +1597,16 @@ func main() {
 	if *ver {
 		fmt.Printf("weka-log-collector %s\n", version)
 		return
+	}
+
+	// ── open debug log file ───────────────────────────────────────────────
+	logPath := fmt.Sprintf("/tmp/weka-log-collector-%s.log", time.Now().Format("2006-01-02T15-04-05"))
+	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+		debugLog = lf
+		defer lf.Close()
+		fmt.Fprintf(os.Stderr, "Debug log: %s\n", logPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "[WARN] could not open debug log %s: %v\n", logPath, err)
 	}
 
 	// Silently install bash completion on first run (best-effort, no noise on failure).

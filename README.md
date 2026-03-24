@@ -172,6 +172,18 @@ Tab completion is installed automatically the first time you run the binary (wri
 
 ---
 
+## Troubleshooting
+
+Every run writes a debug log to `/tmp/weka-log-collector-<timestamp>.log`. The path is printed at startup:
+
+```
+Debug log: /tmp/weka-log-collector-2026-03-24T11-05-00.log
+```
+
+The log always includes verbose output (commands run, files collected/skipped, warnings, errors) regardless of the `--verbose` flag — useful for diagnosing issues after the fact without re-running.
+
+---
+
 ## Space safety
 
 Before writing, the tool checks:
