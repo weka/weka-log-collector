@@ -2313,79 +2313,46 @@ func usageFunc() {
 	fmt.Fprint(os.Stderr, `weka-log-collector — collect logs and diagnostics from a Weka cluster
 
 USAGE
-  weka-log-collector [--start-time TIME] [--end-time TIME] [--profile PROFILE] [options]
-  weka-log-collector --local [--start-time TIME] [--profile PROFILE]
-  weka-log-collector --dry-run [--start-time TIME] [--profile PROFILE]
+  weka-log-collector [options]          cluster-wide (auto-discovers all backends via weka CLI)
+  weka-log-collector --local [options]  this host only
 
-COLLECTION MODES
-  Default (no --local):  discover all cluster hosts via 'weka cluster container',
-                         SSH to each, run collection, merge into one archive.
-  --local:               collect from this host only; stream to --output.
-  --dry-run:             show what would be collected and estimated size.
+TIME
+  --start-time TIME  Relative: -2h, -30m, -1d  |  Absolute: 2026-03-04T10:30[:00]
+  --end-time   TIME  Default: now
+  Default window: last 8h. Use --profile all for no time limit.
 
-TIME WINDOW
-  --start-time TIME  Start time. Logs before this are excluded.
-                     Relative: -2h, -30m, -1d
-                     Absolute: 2026-03-04T10:30 or 2026-03-04T10:30:00
-  --end-time   TIME  End time (default: now). Same formats.
-
-  Examples:
-    --start-time -2h                              last 2 hours
-    --start-time -1d --end-time -12h              yesterday morning
-    --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
-
-PROFILES
-  default   Weka CLI status, events, cfgdump, system info, NIC/OFED, all logs + journalctl
-            (automatically scoped to last 8h unless --start-time is given)
-  perf      + performance stats (scoped to --start-time/--end-time window)
-  nfs       + NFS/Ganesha commands and logs
-  s3        + S3/envoy commands and logs
-  smbw      + SMB-W/pacemaker/corosync commands and logs
-  all       Everything, no time limit (collects full log history)
+PROFILES  (--profile NAME)
+  default  status, events, cfgdump, system info, NIC/OFED, logs + journalctl  [default]
+  perf     + performance stats
+  nfs      + NFS/Ganesha commands and logs
+  s3       + S3/envoy commands and logs
+  smbw     + SMB-W/pacemaker/corosync commands and logs
+  all      everything, no time limit
 
 OPTIONS
-  --host HOST          Collect from this host by IP (repeatable; default: all cluster backends)
-  --container-id N     Collect from this container ID only (repeatable; e.g. --container-id 0 --container-id 2)
-  --clients            Include client nodes in cluster collection (default: backends only)
-  --clients-only       Collect from client nodes only (skip backends)
-  --local              Collect from local host only
-  --upload             Upload collected archive to Weka Home (requires weka cloud to be enabled)
-  --dry-run            Show collection plan; do not collect
-  --output PATH        Output archive path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz)
-                       Use - to write to stdout (useful for piping over SSH)
-  --max-size MB        Abort if estimated size exceeds this (default: 2048 MB)
-  --ssh-user USER      SSH username (default: root)
+  --host IP            Target specific host(s) by IP (repeatable)
+  --container-id N     Target specific container ID(s) (repeatable)
+  --clients            Include client nodes (default: backends only)
+  --clients-only       Client nodes only; skip backends
+  --local              This host only; no SSH
+  --dry-run            Show what would be collected; do not collect
+  --output PATH        Archive path (default: /tmp/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
+  --upload             Upload archive to Weka Home (requires weka cloud enabled)
+  --max-size MB        Abort if estimated size exceeds this (default: 2048)
+  --ssh-user USER      SSH user (default: root)
   --workers N          Parallel SSH workers (default: 10)
-  --cmd-timeout DUR    Per-command timeout, e.g. 60s, 2m (default: 60s)
-  --verbose            Print every file/command included or skipped and why
+  --cmd-timeout DUR    Per-command timeout (default: 60s)
+  --no-self-deploy     Skip auto-deploy; use --remote-binary instead
+  --remote-binary PATH Binary path on remote hosts (default: /opt/weka/tools/weka-log-collector)
+  --verbose            Detailed per-file/command progress
   --version            Print version and exit
 
 EXAMPLES
-  # Collect last 2 hours from all cluster nodes (run on any backend)
   weka-log-collector --start-time -2h
-
-  # Collect all logs for a specific incident window
   weka-log-collector --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
-
-  # Collect S3-specific logs from this node only
   weka-log-collector --local --profile s3 --start-time -4h
-
-  # Dry run: see what would be collected
-  weka-log-collector --start-time -2h --dry-run
-
-  # Collect from specific container IDs (as shown in 'weka cluster container')
-  weka-log-collector --container-id 0 --container-id 1 --start-time -2h
-
-  # Collect from all backends and clients
   weka-log-collector --clients --start-time -2h
-
-  # Collect from client nodes only
-  weka-log-collector --clients-only --start-time -2h
-
-  # Collect from specific hosts by IP
   weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --start-time -1h
-
-  # Stream to remote machine
   weka-log-collector --local --start-time -1h --output - | ssh analyst@host 'cat > weka-logs.tar.gz'
 
 `)
