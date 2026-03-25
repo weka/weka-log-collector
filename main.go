@@ -372,7 +372,7 @@ var systemCommands = []CommandSpec{
 	{Name: "df_h", Cmd: "df -h"},
 	{Name: "lspci", Cmd: "lspci"},
 	{Name: "lsblk", Cmd: "lsblk -d"},
-	{Name: "sysctl_conf", Cmd: "cat /etc/sysctl.conf"},
+	{Name: "sysctl_all", Cmd: "sysctl -a"},
 	// weka-agent service journal (last 50k lines; full journal captured via journalctlWithWindow)
 	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager -n 50000"},
 	{Name: "journalctl_weka_agent_verbose", Cmd: "journalctl -xu weka-agent --no-pager -n 10000"},
