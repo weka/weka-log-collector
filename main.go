@@ -412,9 +412,8 @@ var systemCommands = []CommandSpec{
 	// fails gracefully on Intel/other NIC nodes
 	{Name: "mst_status", Cmd: "mst status -v"},
 	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
-	// weka-agent service journal (last 50k lines; full journal captured via journalctlWithWindow)
-	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager -n 50000"},
-	{Name: "journalctl_weka_agent_verbose", Cmd: "journalctl -xu weka-agent --no-pager -n 10000"},
+	// weka-agent service journal — full history, no line cap
+	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager"},
 }
 
 // LogFileSpec describes a set of log files to collect.
