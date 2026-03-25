@@ -2363,8 +2363,5 @@ EXAMPLES
   # Specific hosts by IP
   weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --start-time -1h
 
-  # Stream to another machine
-  weka-log-collector --local --start-time -1h --output - | ssh analyst@host 'cat > weka-logs.tar.gz'
-
 `)
 }
