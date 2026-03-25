@@ -202,54 +202,55 @@ type CommandSpec struct {
 	Profile   string // which profile this belongs to (empty = always run)
 	Fatal     bool   // if true, collection fails if this command fails; default non-fatal
 	NodeLocal bool   // if true, output varies per node (weka local *); otherwise cluster-wide
+	JSON      bool   // if true, command outputs JSON; archive entry uses .json extension
 }
 
 // defaultCommands are run on every node that has the weka CLI available.
 // These are always included in every profile.
 var defaultCommands = []CommandSpec{
 	// ── identity & status ──────────────────────────────────────────
-	{Name: "weka_version", Cmd: "weka version"},
-	{Name: "weka_status", Cmd: "weka status"},
-	{Name: "weka_status_rebuild", Cmd: "weka status rebuild"},
-	{Name: "weka_alerts", Cmd: "weka alerts"},
-	{Name: "weka_user", Cmd: "weka user"},
-	{Name: "weka_cloud_status", Cmd: "weka cloud status"},
+	{Name: "weka_version", Cmd: "weka version -J", JSON: true},
+	{Name: "weka_status", Cmd: "weka status -J", JSON: true},
+	{Name: "weka_status_rebuild", Cmd: "weka status rebuild -J", JSON: true},
+	{Name: "weka_alerts", Cmd: "weka alerts -J", JSON: true},
+	{Name: "weka_user", Cmd: "weka user -J", JSON: true},
+	{Name: "weka_cloud_status", Cmd: "weka cloud status -J", JSON: true},
 	// ── cluster topology ──────────────────────────────────────────
-	{Name: "weka_cluster_servers", Cmd: "weka cluster servers list"},
-	{Name: "weka_cluster_container", Cmd: "weka cluster container -l"},
-	{Name: "weka_cluster_container_net", Cmd: "weka cluster container net"},
-	{Name: "weka_cluster_process", Cmd: "weka cluster process"},
-	{Name: "weka_cluster_drive", Cmd: "weka cluster drive"},
-	{Name: "weka_cluster_bucket", Cmd: "weka cluster bucket"},
-	{Name: "weka_cluster_failure_domain", Cmd: "weka cluster failure-domain"},
-	{Name: "weka_cluster_task", Cmd: "weka cluster task"},
-	{Name: "weka_cluster_resources", Cmd: "weka cluster container resources 0"},
+	{Name: "weka_cluster_servers", Cmd: "weka cluster servers list -J", JSON: true},
+	{Name: "weka_cluster_container", Cmd: "weka cluster container -l -J", JSON: true},
+	{Name: "weka_cluster_container_net", Cmd: "weka cluster container net -J", JSON: true},
+	{Name: "weka_cluster_process", Cmd: "weka cluster process -J", JSON: true},
+	{Name: "weka_cluster_drive", Cmd: "weka cluster drive -J", JSON: true},
+	{Name: "weka_cluster_bucket", Cmd: "weka cluster bucket -J", JSON: true},
+	{Name: "weka_cluster_failure_domain", Cmd: "weka cluster failure-domain -J", JSON: true},
+	{Name: "weka_cluster_task", Cmd: "weka cluster task -J", JSON: true},
+	{Name: "weka_cluster_resources", Cmd: "weka cluster container resources 0 -J", JSON: true},
 	// ── filesystems & snapshots ────────────────────────────────────
-	{Name: "weka_fs", Cmd: "weka fs -v"},
-	{Name: "weka_fs_group", Cmd: "weka fs group"},
-	{Name: "weka_fs_snapshot", Cmd: "weka fs snapshot -v"},
-	{Name: "weka_fs_tier_s3", Cmd: "weka fs tier s3 -v"},
+	{Name: "weka_fs", Cmd: "weka fs -v -J", JSON: true},
+	{Name: "weka_fs_group", Cmd: "weka fs group -J", JSON: true},
+	{Name: "weka_fs_snapshot", Cmd: "weka fs snapshot -v -J", JSON: true},
+	{Name: "weka_fs_tier_s3", Cmd: "weka fs tier s3 -v -J", JSON: true},
 	// ── debug & traces ─────────────────────────────────────────────
-	{Name: "weka_debug_traces_status", Cmd: "weka debug traces status"},
-	{Name: "weka_debug_traces_freeze", Cmd: "weka debug traces freeze show"},
-	{Name: "weka_debug_net_links", Cmd: "weka debug net links"},
-	{Name: "weka_debug_override_list", Cmd: "weka debug override list"},
-	{Name: "weka_debug_blacklist", Cmd: "weka debug blacklist list"},
-	{Name: "weka_debug_buckets_dist", Cmd: "weka debug buckets dist"},
+	{Name: "weka_debug_traces_status", Cmd: "weka debug traces status -J", JSON: true},
+	{Name: "weka_debug_traces_freeze", Cmd: "weka debug traces freeze show -J", JSON: true},
+	{Name: "weka_debug_net_links", Cmd: "weka debug net links -J", JSON: true},
+	{Name: "weka_debug_override_list", Cmd: "weka debug override list -J", JSON: true},
+	{Name: "weka_debug_blacklist", Cmd: "weka debug blacklist list -J", JSON: true},
+	{Name: "weka_debug_buckets_dist", Cmd: "weka debug buckets dist -J", JSON: true},
 	// ── security ───────────────────────────────────────────────────
-	{Name: "weka_security_kms", Cmd: "weka security kms"},
+	{Name: "weka_security_kms", Cmd: "weka security kms -J", JSON: true},
 	// ── local container info (node-local: different per host) ─────────────
-	{Name: "weka_local_ps", Cmd: "weka local ps -v", NodeLocal: true},
-	{Name: "weka_local_resources_drives0", Cmd: "weka local resources -C drives0", NodeLocal: true},
-	{Name: "weka_local_resources_compute0", Cmd: "weka local resources -C compute0", NodeLocal: true},
-	{Name: "weka_local_resources_frontend0", Cmd: "weka local resources -C frontend0", NodeLocal: true},
+	{Name: "weka_local_ps", Cmd: "weka local ps -v -J", NodeLocal: true, JSON: true},
+	{Name: "weka_local_resources_drives0", Cmd: "weka local resources -C drives0 -J", NodeLocal: true, JSON: true},
+	{Name: "weka_local_resources_compute0", Cmd: "weka local resources -C compute0 -J", NodeLocal: true, JSON: true},
+	{Name: "weka_local_resources_frontend0", Cmd: "weka local resources -C frontend0 -J", NodeLocal: true, JSON: true},
 	// ── host hw info (node-local: different per host) ──────────────────────
-	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", NodeLocal: true},
+	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", NodeLocal: true, JSON: true},
 	// ── events, config dump, network peers (merged from former "full" profile) ──
-	{Name: "weka_events_major", Cmd: "weka events --severity major"},
-	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1"},
-	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw"},
-	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", NodeLocal: true},
+	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
+	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1 -J", JSON: true},
+	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J", JSON: true},
+	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", NodeLocal: true}, // raw exec, no -J
 }
 
 // buildPerfCommands returns the perf-profile command list, translating the
@@ -314,13 +315,13 @@ func buildPerfCommands(from, to time.Time) []CommandSpec {
 
 // nfsCommands are added for profile "nfs" or "all".
 var nfsCommands = []CommandSpec{
-	{Name: "weka_nfs_client_group", Cmd: "weka nfs client-group", Profile: ProfileNFS},
-	{Name: "weka_nfs_interface_group", Cmd: "weka nfs interface-group", Profile: ProfileNFS},
-	{Name: "weka_nfs_permission", Cmd: "weka nfs permission", Profile: ProfileNFS},
-	{Name: "weka_nfs_global_config", Cmd: "weka nfs global-config show", Profile: ProfileNFS},
-	{Name: "weka_nfs_custom_options", Cmd: "weka nfs custom-options", Profile: ProfileNFS},
+	{Name: "weka_nfs_client_group", Cmd: "weka nfs client-group -J", Profile: ProfileNFS, JSON: true},
+	{Name: "weka_nfs_interface_group", Cmd: "weka nfs interface-group -J", Profile: ProfileNFS, JSON: true},
+	{Name: "weka_nfs_permission", Cmd: "weka nfs permission -J", Profile: ProfileNFS, JSON: true},
+	{Name: "weka_nfs_global_config", Cmd: "weka nfs global-config show -J", Profile: ProfileNFS, JSON: true},
+	{Name: "weka_nfs_custom_options", Cmd: "weka nfs custom-options -J", Profile: ProfileNFS, JSON: true},
 	{Name: "showmount", Cmd: "showmount -e", Profile: ProfileNFS},
-	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS, NodeLocal: true},
+	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS, NodeLocal: true, JSON: true},
 	{Name: "nfs_ganesha_config", Cmd: "weka local run /weka/cfgdump --container frontend0 | grep -i nfsGaneshaConfig -A 20", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "nfs_ganesha_queue", Cmd: "weka local exec --container ganesha cat /proc/wekafs/frontend0/queue", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "weka_stats_ops_nfsw", Cmd: "weka stats --category ops_nfsw --per-node -Z", Profile: ProfileNFS},
@@ -329,13 +330,13 @@ var nfsCommands = []CommandSpec{
 
 // s3Commands are added for profile "s3" or "all".
 var s3Commands = []CommandSpec{
-	{Name: "weka_s3_cluster", Cmd: "weka s3 cluster -v", Profile: ProfileS3},
-	{Name: "weka_s3_cluster_status", Cmd: "weka s3 cluster status", Profile: ProfileS3},
-	{Name: "weka_s3_bucket_list", Cmd: "weka s3 bucket list -v", Profile: ProfileS3},
-	{Name: "weka_s3_bucket_lifecycle", Cmd: "weka s3 bucket lifecycle-rule list", Profile: ProfileS3},
-	{Name: "weka_s3_policy_list", Cmd: "weka s3 policy list", Profile: ProfileS3},
-	{Name: "weka_s3_service_account", Cmd: "weka s3 service-account list", Profile: ProfileS3},
-	{Name: "weka_s3_containers_list", Cmd: "weka s3 cluster containers list", Profile: ProfileS3},
+	{Name: "weka_s3_cluster", Cmd: "weka s3 cluster -v -J", Profile: ProfileS3, JSON: true},
+	{Name: "weka_s3_cluster_status", Cmd: "weka s3 cluster status -J", Profile: ProfileS3, JSON: true},
+	{Name: "weka_s3_bucket_list", Cmd: "weka s3 bucket list -v -J", Profile: ProfileS3, JSON: true},
+	{Name: "weka_s3_bucket_lifecycle", Cmd: "weka s3 bucket lifecycle-rule list -J", Profile: ProfileS3, JSON: true},
+	{Name: "weka_s3_policy_list", Cmd: "weka s3 policy list -J", Profile: ProfileS3, JSON: true},
+	{Name: "weka_s3_service_account", Cmd: "weka s3 service-account list -J", Profile: ProfileS3, JSON: true},
+	{Name: "weka_s3_containers_list", Cmd: "weka s3 cluster containers list -J", Profile: ProfileS3, JSON: true},
 	{Name: "weka_stats_ops_s3", Cmd: "weka stats --show-internal --category ops_s3 -Z", Profile: ProfileS3},
 	{Name: "s3_cgroup_memory", Cmd: "cat /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes && cat /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes", Profile: ProfileS3, NodeLocal: true},
 	{Name: "netstat_s3", Cmd: "netstat -tuln | grep 9001", Profile: ProfileS3, NodeLocal: true},
@@ -343,11 +344,11 @@ var s3Commands = []CommandSpec{
 
 // smbwCommands are added for profile "smbw" or "all".
 var smbwCommands = []CommandSpec{
-	{Name: "weka_smb_cluster", Cmd: "weka smb cluster", Profile: ProfileSMBW},
-	{Name: "weka_smb_cluster_status", Cmd: "weka smb cluster status", Profile: ProfileSMBW},
-	{Name: "weka_smb_domain", Cmd: "weka smb domain", Profile: ProfileSMBW},
-	{Name: "weka_smb_share", Cmd: "weka smb share", Profile: ProfileSMBW},
-	{Name: "weka_smb_cluster_info", Cmd: "weka debug config show sambaClusterInfo", Profile: ProfileSMBW},
+	{Name: "weka_smb_cluster", Cmd: "weka smb cluster -J", Profile: ProfileSMBW, JSON: true},
+	{Name: "weka_smb_cluster_status", Cmd: "weka smb cluster status -J", Profile: ProfileSMBW, JSON: true},
+	{Name: "weka_smb_domain", Cmd: "weka smb domain -J", Profile: ProfileSMBW, JSON: true},
+	{Name: "weka_smb_share", Cmd: "weka smb share -J", Profile: ProfileSMBW, JSON: true},
+	{Name: "weka_smb_cluster_info", Cmd: "weka debug config show sambaClusterInfo -J", Profile: ProfileSMBW, JSON: true},
 	{Name: "pcs_cluster_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs cluster status", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "pcs_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs status", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "pcs_status_resources", Cmd: "weka local exec --container smbw /usr/sbin/pcs status resources", Profile: ProfileSMBW, NodeLocal: true},
@@ -846,7 +847,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		if co.result.Error != "" && len(co.out) == 0 {
 			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
 		}
-		dest := filepath.Join(hostRoot, "system", spec.Name+".txt")
+		ext := ".txt"
+		if spec.JSON {
+			ext = ".json"
+		}
+		dest := filepath.Join(hostRoot, "system", spec.Name+ext)
 		if err := addBytesToArchive(tw, dest, content); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
@@ -878,7 +883,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		if co.result.Error != "" && len(co.out) == 0 {
 			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
 		}
-		dest := filepath.Join(hostRoot, "weka", spec.Name+".txt")
+		ext := ".txt"
+		if spec.JSON {
+			ext = ".json"
+		}
+		dest := filepath.Join(hostRoot, "weka", spec.Name+ext)
 		if err := addBytesToArchive(tw, dest, content); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
@@ -2066,7 +2075,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		if co.result.Error != "" && len(co.out) == 0 {
 			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
 		}
-		dest := filepath.Join(archiveRoot, "cluster", "weka", spec.Name+".txt")
+		ext := ".txt"
+		if spec.JSON {
+			ext = ".json"
+		}
+		dest := filepath.Join(archiveRoot, "cluster", "weka", spec.Name+ext)
 		if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
 			warnf("[cluster] could not add %s to archive: %v", spec.Name, addErr)
 		}
