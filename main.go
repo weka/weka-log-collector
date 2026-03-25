@@ -1012,7 +1012,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		if spec.JSON {
 			ext = ".json"
 		}
-		dest := filepath.Join(hostRoot, "weka", spec.Name+ext)
+		wekaSubdir := "weka"
+		if spec.Profile == ProfilePerf {
+			wekaSubdir = "weka/perf"
+		}
+		dest := filepath.Join(hostRoot, wekaSubdir, spec.Name+ext)
 		if err := addBytesToArchive(tw, dest, content); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
@@ -2234,7 +2238,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		if spec.JSON {
 			ext = ".json"
 		}
-		dest := filepath.Join(archiveRoot, "cluster", "weka", spec.Name+ext)
+		wekaSubdir := "weka"
+		if spec.Profile == ProfilePerf {
+			wekaSubdir = "weka/perf"
+		}
+		dest := filepath.Join(archiveRoot, "cluster", wekaSubdir, spec.Name+ext)
 		if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
 			warnf("[cluster] could not add %s to archive: %v", spec.Name, addErr)
 		}
