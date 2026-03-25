@@ -2348,11 +2348,22 @@ OPTIONS
   --version            Print version and exit
 
 EXAMPLES
+  # Last 2 hours from all cluster nodes
   weka-log-collector --start-time -2h
+
+  # Specific incident window
   weka-log-collector --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
+
+  # S3 profile, this node only
   weka-log-collector --local --profile s3 --start-time -4h
+
+  # Backends and clients
   weka-log-collector --clients --start-time -2h
+
+  # Specific hosts by IP
   weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --start-time -1h
+
+  # Stream to another machine
   weka-log-collector --local --start-time -1h --output - | ssh analyst@host 'cat > weka-logs.tar.gz'
 
 `)
