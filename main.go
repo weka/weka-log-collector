@@ -52,6 +52,96 @@ func isRotatedFile(name string) bool {
 	return rotatedFileSuffixRe.MatchString(name)
 }
 
+// baseWithoutRotation strips the rotation suffix from a filename so that files
+// in the same rotation family share a common key.
+// e.g. "syslog.log.1" → "syslog.log", "messages-20260301.gz" → "messages"
+func baseWithoutRotation(name string) string {
+	return rotatedFileSuffixRe.ReplaceAllString(name, "")
+}
+
+// filterByTimeWindow filters file paths to those whose content likely overlaps
+// with [from, to]. Files are grouped by rotation family (same dir + base name
+// without rotation suffix). Within each family, files are sorted by mtime and
+// adjacent mtimes are used to approximate each file's content time range:
+//
+//	content_start = mtime of the next-older file in the family (zero for oldest)
+//	content_end   = mtime of this file
+//
+// A file is skipped when:
+//   - content_end < from  (file was rotated out before window started)
+//   - content_start > to  (file started accumulating after window ended)
+//
+// Active (non-rotated) files are always kept — their content range is unknown.
+func filterByTimeWindow(paths []string, from, to time.Time) []string {
+	if from.IsZero() && to.IsZero() {
+		return paths
+	}
+
+	type entry struct {
+		path    string
+		mtime   time.Time
+		rotated bool
+		statErr bool
+	}
+
+	// Group files into rotation families.
+	familyKey := func(p string) string {
+		return filepath.Dir(p) + "/" + baseWithoutRotation(filepath.Base(p))
+	}
+	order := []string{} // preserve insertion order for deterministic output
+	families := map[string][]entry{}
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		e := entry{path: p, rotated: isRotatedFile(filepath.Base(p))}
+		if err != nil {
+			e.statErr = true
+		} else {
+			e.mtime = info.ModTime()
+		}
+		k := familyKey(p)
+		if _, seen := families[k]; !seen {
+			order = append(order, k)
+		}
+		families[k] = append(families[k], e)
+	}
+
+	var result []string
+	for _, k := range order {
+		files := families[k]
+		// Sort oldest-first by mtime so adjacent pairs give content ranges.
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].mtime.Before(files[j].mtime)
+		})
+		for i, f := range files {
+			// Can't stat or not rotated → always include.
+			if f.statErr || !f.rotated {
+				result = append(result, f.path)
+				continue
+			}
+			contentEnd := f.mtime
+			// Content start = mtime of the next-older sibling (zero for oldest).
+			var contentStart time.Time
+			if i > 0 {
+				contentStart = files[i-1].mtime
+			}
+			// Skip: content ended before our window started.
+			if !from.IsZero() && contentEnd.Before(from) {
+				vlogf("  time-filter SKIP %s: content ends %s before window start %s",
+					f.path, contentEnd.Format(time.RFC3339), from.Format(time.RFC3339))
+				continue
+			}
+			// Skip: content started after our window ended.
+			if !to.IsZero() && !contentStart.IsZero() && contentStart.After(to) {
+				vlogf("  time-filter SKIP %s: content starts %s after window end %s",
+					f.path, contentStart.Format(time.RFC3339), to.Format(time.RFC3339))
+				continue
+			}
+			result = append(result, f.path)
+		}
+	}
+	return result
+}
+
 func parseInputTime(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	if m := relativeTimeRe.FindStringSubmatch(strings.ToLower(s)); m != nil {
@@ -658,7 +748,7 @@ func globBase(pattern string) string {
 // mtime predates from are skipped and recorded in the manifest with a note.
 // Current active log files are always collected regardless of from.
 // Returns a FileResult describing success or failure.
-func collectLogFile(tw *tar.Writer, srcPath, destPath string, from time.Time) FileResult {
+func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 	result := FileResult{
 		SrcPath:  srcPath,
 		DestPath: destPath,
@@ -677,18 +767,6 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string, from time.Time) Fi
 	if err != nil {
 		result.Error = fmt.Sprintf("stat: %v", err)
 		result.Skipped = true
-		return result
-	}
-
-	// Time-window filtering: only apply to rotated/archived files.
-	// Current active log files are always collected (mtime doesn't reliably
-	// reflect their content range — they're still being written to).
-	if !from.IsZero() && isRotatedFile(filepath.Base(srcPath)) && info.ModTime().Before(from) {
-		note := fmt.Sprintf("rotated file mtime %s is before --start-time %s; skipped to reduce bundle size",
-			info.ModTime().UTC().Format(time.RFC3339), from.UTC().Format(time.RFC3339))
-		result.Skipped = true
-		result.SkipNote = note
-		vlogf("  SKIP %s: %s", srcPath, note)
 		return result
 	}
 
@@ -840,6 +918,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			vlogf("[%s] no files match %s", hostname, spec.SrcGlob)
 			continue
 		}
+		matches = filterByTimeWindow(matches, from, to)
+		if len(matches) == 0 {
+			vlogf("[%s] no files in time window for %s", hostname, spec.SrcGlob)
+			continue
+		}
 		for _, srcPath := range matches {
 			if seenSrcPaths[srcPath] {
 				vlogf("[%s] skip duplicate %s", hostname, srcPath)
@@ -855,7 +938,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			base := globBase(spec.SrcGlob)
 			relPath := strings.TrimPrefix(srcPath, base)
 			destPath := filepath.Join(archiveRoot, "hosts", hostname, spec.DestDir, relPath)
-			fr := collectLogFile(tw, srcPath, destPath, from)
+			fr := collectLogFile(tw, srcPath, destPath)
 			manifest.Files = append(manifest.Files, fr)
 			if fr.Error != "" {
 				warnf("[%s] file %s: %s", hostname, srcPath, fr.Error)
