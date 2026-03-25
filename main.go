@@ -256,12 +256,25 @@ var defaultCommands = []CommandSpec{
 // buildPerfCommands returns the perf-profile command list, translating the
 // --start-time/--end-time window into weka stats --start-time/--end-time flags.
 func buildPerfCommands(from, to time.Time) []CommandSpec {
-	// Build the time-window flags for weka stats.
-	// weka stats accepts relative values like "-2h" or absolute ISO timestamps.
-	timeFlags := ""
-	if !from.IsZero() {
-		timeFlags += fmt.Sprintf(" --start-time %s", from.Format("2006-01-02T15:04:05"))
+	// Two collection modes depending on whether the user gave an explicit time window:
+	//
+	// No explicit --start-time (from.IsZero):
+	//   Collect cluster-averaged stats for the last 4h. No --per-process or --per-role.
+	//   Rationale: weka stats without --start-time returns only ~1min of data (misleading).
+	//   --per-process over an implicit long window produces excessive data. 4h cluster
+	//   average gives a useful health overview without the noise.
+	//
+	// Explicit --start-time given:
+	//   Use the user's window with full --per-process breakdown — ideal for incident analysis.
+
+	explicitWindow := !from.IsZero()
+
+	effectiveFrom := from
+	if !explicitWindow {
+		effectiveFrom = time.Now().Add(-4 * time.Hour)
 	}
+
+	timeFlags := fmt.Sprintf(" --start-time %s", effectiveFrom.Format("2006-01-02T15:04:05"))
 	if !to.IsZero() {
 		timeFlags += fmt.Sprintf(" --end-time %s", to.Format("2006-01-02T15:04:05"))
 	}
@@ -274,42 +287,55 @@ func buildPerfCommands(from, to time.Time) []CommandSpec {
 		}
 	}
 
+	if explicitWindow {
+		// Full per-process/per-role breakdown for incident analysis.
+		return []CommandSpec{
+			stats("weka_stats_cpu_per_process", " --show-internal --category cpu --per-process -s value"),
+			stats("weka_stats_cpu_per_role", " --show-internal --category cpu --per-role -s value"),
+			stats("weka_stats_ssd", " --show-internal --category ssd --per-process"),
+			stats("weka_stats_ssd_read_latency", " --show-internal --stat SSD_READ_LATENCY --per-process"),
+			stats("weka_stats_ssd_write_latency", " --show-internal --stat SSD_WRITE_LATENCY --per-process"),
+			stats("weka_stats_drive_read_latency", " --show-internal --stat DRIVE_READ_LATENCY --per-process"),
+			stats("weka_stats_drive_write_latency", " --show-internal --stat DRIVE_WRITE_LATENCY --per-process"),
+			stats("weka_stats_ops_driver", " --show-internal --category ops_driver --per-process"),
+			stats("weka_stats_ops", " --show-internal --category ops --per-process"),
+			stats("weka_stats_read_latency", " --category ops --show-internal --stat READ_LATENCY --per-process"),
+			stats("weka_stats_write_latency", " --category ops --show-internal --stat WRITE_LATENCY --per-process"),
+			stats("weka_stats_network", " --show-internal --category network --per-process"),
+			stats("weka_stats_goodput_tx", " --show-internal --stat GOODPUT_TX_RATIO --per-process"),
+			stats("weka_stats_goodput_rx", " --show-internal --stat GOODPUT_RX_RATIO --per-process"),
+			stats("weka_stats_port_tx", " --show-internal --stat PORT_TX_BYTES --per-process"),
+			stats("weka_stats_port_rx", " --show-internal --stat PORT_RX_BYTES --per-process"),
+			stats("weka_stats_dropped_packets", " --show-internal --stat DROPPED_PACKETS --per-process"),
+			stats("weka_stats_corrupt_packets", " --show-internal --stat CORRUPT_PACKETS --per-process"),
+			stats("weka_stats_jrpc", " --show-internal --category jrpc --per-process"),
+			stats("weka_stats_rpc", " --show-internal --category rpc --per-process"),
+			{Name: "weka_stats_realtime", Cmd: "weka stats realtime -s -cpu -o node,hostname,role,mode,writeps,writebps,wlatency,readps,readbps,rlatency,ops,cpu,l6recv,l6send,upload,download", Profile: ProfilePerf},
+		}
+	}
+
+	// Cluster-averaged overview for last 4h (no explicit window given).
 	return []CommandSpec{
-		// CPU — per-process breakdown is critical for pinpointing hot nodes/roles.
-		stats("weka_stats_cpu_per_process", " --show-internal --category cpu --per-process -s value"),
-		stats("weka_stats_cpu_per_role", " --show-internal --category cpu --per-role -s value"),
-
-		// SSD / drive I/O throughput and latency.
-		stats("weka_stats_ssd", " --show-internal --category ssd --per-process"),
-		stats("weka_stats_ssd_read_latency", " --show-internal --stat SSD_READ_LATENCY --per-process"),
-		stats("weka_stats_ssd_write_latency", " --show-internal --stat SSD_WRITE_LATENCY --per-process"),
-		stats("weka_stats_drive_read_latency", " --show-internal --stat DRIVE_READ_LATENCY --per-process"),
-		stats("weka_stats_drive_write_latency", " --show-internal --stat DRIVE_WRITE_LATENCY --per-process"),
-		// Client-visible I/O ops and latency.
-		stats("weka_stats_ops_driver", " --show-internal --category ops_driver --per-process"),
-		stats("weka_stats_ops", " --show-internal --category ops --per-process"),
-		stats("weka_stats_read_latency", " --category ops --show-internal --stat READ_LATENCY --per-process"),
-		stats("weka_stats_write_latency", " --category ops --show-internal --stat WRITE_LATENCY --per-process"),
-
-		// Network throughput, goodput, and packet errors.
-		stats("weka_stats_network", " --show-internal --category network --per-process"),
-		stats("weka_stats_goodput_tx", " --show-internal --stat GOODPUT_TX_RATIO --per-process"),
-		stats("weka_stats_goodput_rx", " --show-internal --stat GOODPUT_RX_RATIO --per-process"),
-		stats("weka_stats_port_tx", " --show-internal --stat PORT_TX_BYTES --per-process"),
-		stats("weka_stats_port_rx", " --show-internal --stat PORT_RX_BYTES --per-process"),
-		stats("weka_stats_dropped_packets", " --show-internal --stat DROPPED_PACKETS --per-process"),
-		stats("weka_stats_corrupt_packets", " --show-internal --stat CORRUPT_PACKETS --per-process"),
-
-		// RPC/JRPC internals.
-		stats("weka_stats_jrpc", " --show-internal --category jrpc --per-process"),
-		stats("weka_stats_rpc", " --show-internal --category rpc --per-process"),
-
-		// Realtime snapshot — always current 1s window, cannot take --start-time/--end-time.
-		{
-			Name:    "weka_stats_realtime",
-			Cmd:     "weka stats realtime -s -cpu -o node,hostname,role,mode,writeps,writebps,wlatency,readps,readbps,rlatency,ops,cpu,l6recv,l6send,upload,download",
-			Profile: ProfilePerf,
-		},
+		stats("weka_stats_cpu", " --show-internal --category cpu -s value"),
+		stats("weka_stats_ssd", " --show-internal --category ssd"),
+		stats("weka_stats_ssd_read_latency", " --show-internal --stat SSD_READ_LATENCY"),
+		stats("weka_stats_ssd_write_latency", " --show-internal --stat SSD_WRITE_LATENCY"),
+		stats("weka_stats_drive_read_latency", " --show-internal --stat DRIVE_READ_LATENCY"),
+		stats("weka_stats_drive_write_latency", " --show-internal --stat DRIVE_WRITE_LATENCY"),
+		stats("weka_stats_ops_driver", " --show-internal --category ops_driver"),
+		stats("weka_stats_ops", " --show-internal --category ops"),
+		stats("weka_stats_read_latency", " --category ops --show-internal --stat READ_LATENCY"),
+		stats("weka_stats_write_latency", " --category ops --show-internal --stat WRITE_LATENCY"),
+		stats("weka_stats_network", " --show-internal --category network"),
+		stats("weka_stats_goodput_tx", " --show-internal --stat GOODPUT_TX_RATIO"),
+		stats("weka_stats_goodput_rx", " --show-internal --stat GOODPUT_RX_RATIO"),
+		stats("weka_stats_port_tx", " --show-internal --stat PORT_TX_BYTES"),
+		stats("weka_stats_port_rx", " --show-internal --stat PORT_RX_BYTES"),
+		stats("weka_stats_dropped_packets", " --show-internal --stat DROPPED_PACKETS"),
+		stats("weka_stats_corrupt_packets", " --show-internal --stat CORRUPT_PACKETS"),
+		stats("weka_stats_jrpc", " --show-internal --category jrpc"),
+		stats("weka_stats_rpc", " --show-internal --category rpc"),
+		{Name: "weka_stats_realtime", Cmd: "weka stats realtime -s -cpu -o node,hostname,role,mode,writeps,writebps,wlatency,readps,readbps,rlatency,ops,cpu,l6recv,l6send,upload,download", Profile: ProfilePerf},
 	}
 }
 
