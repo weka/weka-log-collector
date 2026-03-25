@@ -1826,7 +1826,8 @@ func main() {
 	}
 
 	// ── open debug log file ───────────────────────────────────────────────
-	logPath := fmt.Sprintf("/tmp/weka-log-collector-%s.log", time.Now().Format("2006-01-02T15-04-05"))
+	_ = os.MkdirAll("/opt/weka/tools", 0755)
+	logPath := fmt.Sprintf("/opt/weka/tools/weka-log-collector-%s.log", time.Now().Format("2006-01-02T15-04-05"))
 	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
 		debugLog = lf
 		defer lf.Close()
