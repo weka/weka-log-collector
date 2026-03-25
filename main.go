@@ -1831,14 +1831,20 @@ func main() {
 	}
 
 	// ── open debug log file ───────────────────────────────────────────────
-	_ = os.MkdirAll("/opt/weka/tools", 0755)
-	logPath := fmt.Sprintf("/opt/weka/tools/weka-log-collector-%s.log", time.Now().Format("2006-01-02T15-04-05"))
-	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
-		debugLog = lf
-		defer lf.Close()
-		fmt.Fprintf(os.Stderr, "Debug log: %s\n", logPath)
-	} else {
-		fmt.Fprintf(os.Stderr, "[WARN] could not open debug log %s: %v\n", logPath, err)
+	// Skip when output is stdout (--output -): this is a remote node collection
+	// invoked by the orchestrator via SSH. The orchestrator has its own debug log;
+	// creating one on the remote node too would leave stale files and confuse users
+	// on nodes that are also the orchestrator.
+	if *outputPath != "-" {
+		_ = os.MkdirAll("/opt/weka/tools", 0755)
+		logPath := fmt.Sprintf("/opt/weka/tools/weka-log-collector-%s.log", time.Now().Format("2006-01-02T15-04-05"))
+		if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			debugLog = lf
+			defer lf.Close()
+			fmt.Fprintf(os.Stderr, "Debug log: %s\n", logPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "[WARN] could not open debug log %s: %v\n", logPath, err)
+		}
 	}
 
 	// Silently install bash completion on first run (best-effort, no noise on failure).
