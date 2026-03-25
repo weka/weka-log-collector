@@ -359,34 +359,62 @@ var smbwCommands = []CommandSpec{
 // systemCommands run directly on the OS (not via weka CLI).
 // These are always collected regardless of profile.
 var systemCommands = []CommandSpec{
+	// ── identity & hardware ───────────────────────────────────────────────
 	{Name: "uname", Cmd: "uname -a"},
 	{Name: "os_release", Cmd: "cat /etc/*release*"},
 	{Name: "hostname", Cmd: "hostname -f"},
 	{Name: "uptime", Cmd: "uptime"},
 	{Name: "free_mem", Cmd: "free -h"},
 	{Name: "lscpu", Cmd: "lscpu"},
-	{Name: "ip_addr", Cmd: "ip addr show"},
-	{Name: "ip_route", Cmd: "ip route"},
-	{Name: "netstat_all", Cmd: "netstat -nap"},
-	{Name: "ps_elf", Cmd: "ps -elf"},
-	{Name: "df_h", Cmd: "df -h"},
 	{Name: "lspci", Cmd: "lspci"},
 	{Name: "lsblk", Cmd: "lsblk -d"},
+	{Name: "numactl_hardware", Cmd: "numactl -H"},
+	// ── processes & disk ─────────────────────────────────────────────────
+	{Name: "ps_elf", Cmd: "ps -elf"},
+	{Name: "df_h", Cmd: "df -h"},
+	{Name: "netstat_all", Cmd: "netstat -nap"},
+	// ── services ─────────────────────────────────────────────────────────
+	{Name: "systemctl_failed", Cmd: "systemctl list-units --failed --no-pager"},
+	// ── swap (must be disabled on Weka backends) ──────────────────────────
+	{Name: "swapon", Cmd: "swapon --show"},
+	// ── clock synchronization (critical for Weka cluster consistency) ─────
+	// timedatectl works on all systemd distros
+	{Name: "timedatectl", Cmd: "timedatectl status"},
+	// chrony (RHEL 8+, Rocky, Ubuntu 20.04+)
+	{Name: "chronyc_tracking", Cmd: "chronyc tracking"},
+	{Name: "chronyc_sources", Cmd: "chronyc sources -v"},
+	{Name: "chronyd_status", Cmd: "systemctl status chronyd --no-pager"},
+	// ntpd fallback (older distros)
+	{Name: "ntpd_status", Cmd: "systemctl status ntpd --no-pager"},
+	// ── kernel parameters ─────────────────────────────────────────────────
+	// sysctl -a captures all live values including numa_balancing, kernel.panic, etc.
 	{Name: "sysctl_all", Cmd: "sysctl -a"},
-	// weka-agent service journal (last 50k lines; full journal captured via journalctlWithWindow)
-	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager -n 50000"},
-	{Name: "journalctl_weka_agent_verbose", Cmd: "journalctl -xu weka-agent --no-pager -n 10000"},
 	// kernel ring buffer with timestamps
 	{Name: "dmesg", Cmd: "dmesg -T"},
-	// ── NIC / OFED / routing (always needed for both backends and clients) ──
+	// ── kdump (should be enabled for crash diagnostics) ───────────────────
+	{Name: "kdump_status", Cmd: "systemctl status kdump --no-pager"},
+	// Ubuntu uses kdump-tools instead
+	{Name: "kdump_tools_status", Cmd: "systemctl status kdump-tools --no-pager"},
+	// ── NIC / OFED / routing ──────────────────────────────────────────────
 	{Name: "lshw_network", Cmd: "lshw -C network -businfo"},
 	{Name: "ofed_info", Cmd: "ofed_info -s"},
 	{Name: "lsmod", Cmd: "lsmod"},
 	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core"},
 	{Name: "modinfo_ice", Cmd: "modinfo ice"},
+	// ethtool per interface: link speed, duplex, driver, MTU validation
+	{Name: "ethtool_all", Cmd: `for iface in $(ls /sys/class/net/); do echo "=== $iface ==="; ethtool "$iface" 2>&1; ethtool -i "$iface" 2>&1; done`},
 	{Name: "ip_rule", Cmd: "ip rule"},
 	{Name: "ip_neighbor", Cmd: "ip neighbor"},
+	{Name: "ip_route_all_tables", Cmd: "ip route show table all"},
 	{Name: "rp_filter", Cmd: "sysctl -a | grep -w rp_filter"},
+	// ── Mellanox firmware settings (ADVANCED_PCI_SETTINGS, PCI_WR_ORDERING) ─
+	// mst/mlxconfig only present on nodes with ConnectX NICs + MFT package;
+	// fails gracefully on Intel/other NIC nodes
+	{Name: "mst_status", Cmd: "mst status -v"},
+	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
+	// weka-agent service journal (last 50k lines; full journal captured via journalctlWithWindow)
+	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager -n 50000"},
+	{Name: "journalctl_weka_agent_verbose", Cmd: "journalctl -xu weka-agent --no-pager -n 10000"},
 }
 
 // LogFileSpec describes a set of log files to collect.
@@ -432,6 +460,14 @@ var logFileSpecs = []LogFileSpec{
 	{SrcGlob: "/var/log/dnf.log-*", DestDir: "system"},
 	{SrcGlob: "/var/log/yum.log", DestDir: "system"},
 	{SrcGlob: "/var/log/yum.log-*", DestDir: "system"},
+	// Kernel parameter config files (Weka best-practice settings live in 99-weka.conf)
+	{SrcGlob: "/etc/sysctl.conf", DestDir: "system/sysctl.d"},
+	{SrcGlob: "/etc/sysctl.d/*.conf", DestDir: "system/sysctl.d"},
+	{SrcGlob: "/usr/lib/sysctl.d/*.conf", DestDir: "system/sysctl.d"},
+	{SrcGlob: "/run/sysctl.d/*.conf", DestDir: "system/sysctl.d"},
+	// kdump config (RHEL/Rocky path; Ubuntu uses /etc/default/kdump-tools)
+	{SrcGlob: "/etc/kdump.conf", DestDir: "system"},
+	{SrcGlob: "/etc/default/kdump-tools", DestDir: "system"},
 
 	// ── weka container logs — broad catch-alls cover the full tree ────────
 	//
