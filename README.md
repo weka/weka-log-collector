@@ -107,12 +107,12 @@ weka-log-collector --local --output - | ssh admin@bastion "cat > /data/weka-logs
 
 | Profile | What's included |
 |---------|----------------|
-| `default` | Weka CLI status, events, cfgdump, hw info, system info, NIC/OFED/routing, all logs + journalctl |
-| `perf` | + performance stats (CPU, SSD, ops, network, JRPC, latency) |
+| `default` | Weka CLI status, events, cfgdump, hw info, system info, NIC/OFED/routing, all logs + journalctl — **scoped to last 8h by default** |
+| `perf` | + performance stats (CPU, SSD, ops, network, JRPC, latency) — scoped to `--start-time`/`--end-time` |
 | `nfs` | + NFS/Ganesha commands and ganesha container logs |
 | `s3` | + S3/envoy commands and S3 container logs |
 | `smbw` | + SMB-W commands and smbw/pacemaker/corosync logs |
-| `all` | Everything from all profiles above |
+| `all` | Everything from all profiles, **no time limit** — collects full log history |
 
 > NIC/OFED/routing info (`lshw`, `ofed_info`, `lsmod`, `modinfo`, `ip rule`, `ip neighbor`, `rp_filter`) is always collected on every node — backends and clients alike.
 

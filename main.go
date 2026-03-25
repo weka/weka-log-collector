@@ -1732,6 +1732,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ── default time window ───────────────────────────────────────────────
+	// Unless --profile all is given (which means "collect everything"),
+	// default to the last 8 hours when no --start-time was specified.
+	defaultWindow := from.IsZero() && *profileStr != ProfileAll
+	if defaultWindow {
+		from = time.Now().Add(-8 * time.Hour)
+	}
+
 	// ── determine output path ─────────────────────────────────────────────
 	toStdout := *outputPath == "-"
 	outPath := *outputPath
@@ -1745,7 +1753,11 @@ func main() {
 	logf("weka-log-collector %s", version)
 	logf("Profile:  %s", *profileStr)
 	if !from.IsZero() {
-		logf("From:     %s", from.Format(time.RFC3339))
+		if defaultWindow {
+			logf("From:     %s  (default: last 8h — use --profile all for no limit)", from.Format(time.RFC3339))
+		} else {
+			logf("From:     %s", from.Format(time.RFC3339))
+		}
 	} else {
 		logf("From:     (no lower bound)")
 	}
@@ -2178,7 +2190,12 @@ TIME WINDOW
 
 PROFILES
   default   Weka CLI status, events, cfgdump, system info, NIC/OFED, all logs + journalctl
-  perf      + performance stats (use with --start-time/--end-time for the incident window)
+            (automatically scoped to last 8h unless --start-time is given)
+  perf      + performance stats (scoped to --start-time/--end-time window)
+  nfs       + NFS/Ganesha commands and logs
+  s3        + S3/envoy commands and logs
+  smbw      + SMB-W/pacemaker/corosync commands and logs
+  all       Everything, no time limit (collects full log history)
   nfs       + Ganesha logs and NFS commands
   s3        + S3/envoy logs and S3 commands
   smbw      + SMB-W logs and Pacemaker status
