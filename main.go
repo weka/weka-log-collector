@@ -320,7 +320,7 @@ var nfsCommands = []CommandSpec{
 	{Name: "weka_nfs_permission", Cmd: "weka nfs permission -J", Profile: ProfileNFS, JSON: true},
 	{Name: "weka_nfs_global_config", Cmd: "weka nfs global-config show -J", Profile: ProfileNFS, JSON: true},
 	{Name: "weka_nfs_custom_options", Cmd: "weka nfs custom-options -J", Profile: ProfileNFS, JSON: true},
-	{Name: "showmount", Cmd: "showmount -e", Profile: ProfileNFS},
+	{Name: "showmount", Cmd: "showmount -e", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS, NodeLocal: true, JSON: true},
 	{Name: "nfs_ganesha_config", Cmd: "weka local run /weka/cfgdump --container frontend0 | grep -i nfsGaneshaConfig -A 20", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "nfs_ganesha_queue", Cmd: "weka local exec --container ganesha cat /proc/wekafs/frontend0/queue", Profile: ProfileNFS, NodeLocal: true},
@@ -996,7 +996,13 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		co := wekaOutputs[i]
 		manifest.Commands = append(manifest.Commands, co.result)
 		if co.result.Error != "" {
-			warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+			if spec.Profile != "" {
+				// Protocol-specific command — failure is expected when the protocol
+				// is not deployed on this cluster. Log to verbose/debug only.
+				vlogf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+			} else {
+				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+			}
 		}
 		content := co.out
 		if co.result.Error != "" && len(co.out) == 0 {
@@ -2214,7 +2220,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	for i, spec := range clusterCmds {
 		co := clusterOutputs[i]
 		if co.result.Error != "" {
-			warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
+			if spec.Profile != "" {
+				vlogf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
+			} else {
+				warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
+			}
 		}
 		content := co.out
 		if co.result.Error != "" && len(co.out) == 0 {
