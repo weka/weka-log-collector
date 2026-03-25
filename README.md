@@ -57,7 +57,7 @@ Usage: weka-log-collector [flags]
 
 Flags:
   --local              Collect from local host only (no SSH, no cluster discovery)
-  --profile            Collection profile: default|full|perf|nfs|s3|smbw|all  (default: default)
+  --profile            Collection profile: default|perf|nfs|s3|smbw|all  (default: default)
   --start-time         Start of time window (e.g. -2h, -30m, -1d, 2026-03-20T14:00)
   --end-time           End of time window (default: now)
   --output             Output .tar.gz path (default: /tmp/<cluster>-weka-logs-<ts>.tar.gz). Use - for stdout.
@@ -107,8 +107,7 @@ weka-log-collector --local --output - | ssh admin@bastion "cat > /data/weka-logs
 
 | Profile | What's included |
 |---------|----------------|
-| `default` | Weka CLI status commands + all system/container logs + NIC/OFED/routing info |
-| `full` | + extra weka commands (events, cfgdump, hw info) + full journalctl |
+| `default` | Weka CLI status, events, cfgdump, hw info, system info, NIC/OFED/routing, all logs + journalctl |
 | `perf` | + performance stats (CPU, SSD, ops, network, JRPC, latency) |
 | `nfs` | + NFS/Ganesha commands and ganesha container logs |
 | `s3` | + S3/envoy commands and S3 container logs |

@@ -83,8 +83,7 @@ func parseInputTime(s string) (time.Time, error) {
 
 // Profile names
 const (
-	ProfileDefault = "default" // core weka commands + logs
-	ProfileFull    = "full"    // + container logs, journalctl, events, core dumps
+	ProfileDefault = "default" // core weka commands + logs, events, cfgdump, journalctl
 	ProfilePerf    = "perf"    // + performance stats
 	ProfileNFS     = "nfs"     // + ganesha logs and NFS commands
 	ProfileS3      = "s3"      // + S3/envoy logs and S3 commands
@@ -93,7 +92,7 @@ const (
 )
 
 var validProfiles = []string{
-	ProfileDefault, ProfileFull, ProfilePerf,
+	ProfileDefault, ProfilePerf,
 	ProfileNFS, ProfileS3, ProfileSMBW, ProfileAll,
 }
 
@@ -156,14 +155,11 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_local_resources_frontend0", Cmd: "weka local resources -C frontend0", NodeLocal: true},
 	// ── host hw info (node-local: different per host) ──────────────────────
 	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", NodeLocal: true},
-}
-
-// fullCommands are added when profile is "full" or "all".
-var fullCommands = []CommandSpec{
-	{Name: "weka_events_major", Cmd: "weka events --severity major", Profile: ProfileFull},
-	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1", Profile: ProfileFull},
-	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw", Profile: ProfileFull},
-	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", Profile: ProfileFull, NodeLocal: true},
+	// ── events, config dump, network peers (merged from former "full" profile) ──
+	{Name: "weka_events_major", Cmd: "weka events --severity major"},
+	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1"},
+	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw"},
+	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", NodeLocal: true},
 }
 
 // buildPerfCommands returns the perf-profile command list, translating the
@@ -813,8 +809,8 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		}
 	}
 
-	// ── phase: journalctl (full/all only, or if time window specified) ─────
-	if profileEnabled(profile, ProfileFull) || profileEnabled(profile, ProfileAll) || !from.IsZero() {
+	// ── phase: journalctl ────────────────────────────────────────────────
+	if true {
 		phase(fmt.Sprintf("[%s] Journalctl (time-windowed)", hostname))
 		result, out := journalctlWithWindow(from, to, 2*cmdTimeout)
 		manifest.Commands = append(manifest.Commands, result)
@@ -893,7 +889,6 @@ func buildProfileCommands(profile string, from, to time.Time) []CommandSpec {
 			cmds = append(cmds, list...)
 		}
 	}
-	addIfProfile(fullCommands, ProfileFull)
 	if profileEnabled(profile, ProfilePerf) {
 		cmds = append(cmds, buildPerfCommands(from, to)...)
 	}
@@ -1461,7 +1456,7 @@ _weka_log_collector() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    profiles="default full perf nfs s3 smbw all"
+    profiles="default perf nfs s3 smbw all"
 
     opts="--local --upload --clients --clients-only --dry-run --verbose --version
           --start-time --end-time --profile --output --host --container-id
@@ -2099,8 +2094,7 @@ TIME WINDOW
     --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
 
 PROFILES
-  default   Core weka commands + key logs (~30MB/node compressed)
-  full      + container logs, journalctl, events, core dumps
+  default   Weka CLI status, events, cfgdump, system info, NIC/OFED, all logs + journalctl
   perf      + performance stats (use with --start-time/--end-time for the incident window)
   nfs       + Ganesha logs and NFS commands
   s3        + S3/envoy logs and S3 commands
