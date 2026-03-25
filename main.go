@@ -1819,6 +1819,12 @@ func main() {
 	flag.Usage = usageFunc
 	flag.Parse()
 
+	if args := flag.Args(); len(args) > 0 {
+		fmt.Fprintf(os.Stderr, "error: unexpected argument(s): %s\n", strings.Join(args, ", "))
+		fmt.Fprintf(os.Stderr, "       (flags require -- prefix, e.g. --profile %s)\n", args[0])
+		os.Exit(1)
+	}
+
 	if *ver {
 		fmt.Printf("weka-log-collector %s\n", version)
 		return
