@@ -805,11 +805,66 @@ func globBase(pattern string) string {
 	return filepath.Dir(pattern[:idx]) + "/"
 }
 
+// prepareFileReader returns the reader, size, and archive destination name to
+// use when adding srcPath to the tar archive.
+//
+// For .gz rotated log files the file is decompressed into a temp file so that
+// the outer gzip archive can compress the plaintext data — individually
+// pre-compressed chunks inside a tar.gz are opaque to the outer compressor and
+// produce no savings. Decompressing first lets gzip work across all log content
+// together, significantly improving the overall compression ratio.
+//
+// On any decompression error the function falls back to the original compressed
+// file so collection always succeeds. The returned cleanup func (if non-nil)
+// must be called after the caller is done reading.
+func prepareFileReader(f *os.File, info os.FileInfo, srcPath, destPath string) (reader io.Reader, size int64, archiveDest string, cleanup func()) {
+	if !strings.HasSuffix(srcPath, ".gz") {
+		// Not gzip — use LimitReader to guard against live-growing files.
+		return io.LimitReader(f, info.Size()), info.Size(), destPath, nil
+	}
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		// Not a valid gzip stream — fall back to raw copy.
+		_, _ = f.Seek(0, 0)
+		return io.LimitReader(f, info.Size()), info.Size(), destPath, nil
+	}
+
+	tmp, err := os.CreateTemp("", "wlc-decomp-*")
+	if err != nil {
+		gz.Close()
+		_, _ = f.Seek(0, 0)
+		return io.LimitReader(f, info.Size()), info.Size(), destPath, nil
+	}
+
+	if _, err := io.Copy(tmp, gz); err != nil {
+		gz.Close()
+		tmp.Close()
+		os.Remove(tmp.Name())
+		_, _ = f.Seek(0, 0)
+		return io.LimitReader(f, info.Size()), info.Size(), destPath, nil
+	}
+	gz.Close()
+
+	tmpInfo, err := tmp.Stat()
+	if err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		_, _ = f.Seek(0, 0)
+		return io.LimitReader(f, info.Size()), info.Size(), destPath, nil
+	}
+	_, _ = tmp.Seek(0, 0)
+
+	return tmp, tmpInfo.Size(), strings.TrimSuffix(destPath, ".gz"), func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}
+}
+
 // collectLogFile adds a single log file to the tar writer.
 // destPath is the full path inside the archive (archiveRoot already included).
-// from is the --start-time window: rotated log files (*.1, *.gz, -YYYYMMDD) whose
-// mtime predates from are skipped and recorded in the manifest with a note.
-// Current active log files are always collected regardless of from.
+// .gz rotated files are transparently decompressed before archiving so the
+// outer gzip can compress all log content together for a better overall ratio.
 // Returns a FileResult describing success or failure.
 func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 	result := FileResult{
@@ -833,25 +888,28 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 		return result
 	}
 
-	result.SizeBytes = info.Size()
+	reader, size, archiveDest, cleanup := prepareFileReader(f, info, srcPath, destPath)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	result.DestPath = archiveDest
+	result.SizeBytes = size
+
 	hdr := &tar.Header{
-		Name:    result.DestPath,
+		Name:    archiveDest,
 		Mode:    0644,
-		Size:    info.Size(),
+		Size:    size,
 		ModTime: info.ModTime(),
 	}
 	if err := tw.WriteHeader(hdr); err != nil {
 		result.Error = fmt.Sprintf("tar header: %v", err)
 		return result
 	}
-	// Use LimitReader to cap at the stat'd size: live log files can grow
-	// between Stat() and Copy(), which causes "write too long" in the tar
-	// writer. We only write what we promised in the header.
-	if _, err := io.Copy(tw, io.LimitReader(f, info.Size())); err != nil {
+	if _, err := io.Copy(tw, reader); err != nil {
 		result.Error = fmt.Sprintf("tar copy: %v", err)
 		return result
 	}
-	vlogf("  file %s: OK (%d bytes)", srcPath, info.Size())
+	vlogf("  file %s: OK (%d bytes)", srcPath, size)
 	return result
 }
 
