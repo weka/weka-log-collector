@@ -2209,10 +2209,6 @@ PROFILES
   s3        + S3/envoy commands and logs
   smbw      + SMB-W/pacemaker/corosync commands and logs
   all       Everything, no time limit (collects full log history)
-  nfs       + Ganesha logs and NFS commands
-  s3        + S3/envoy logs and S3 commands
-  smbw      + SMB-W logs and Pacemaker status
-  all       Everything from all profiles above
 
 OPTIONS
   --host HOST          Collect from this host by IP (repeatable; default: all cluster backends)
@@ -2235,14 +2231,14 @@ EXAMPLES
   # Collect last 2 hours from all cluster nodes (run on any backend)
   weka-log-collector --start-time -2h
 
-  # Collect full profile for a specific incident window
-  weka-log-collector --profile full --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
+  # Collect all logs for a specific incident window
+  weka-log-collector --start-time 2026-03-04T10:00 --end-time 2026-03-04T12:00
 
   # Collect S3-specific logs from this node only
   weka-log-collector --local --profile s3 --start-time -4h
 
   # Dry run: see what would be collected
-  weka-log-collector --profile full --start-time -2h --dry-run
+  weka-log-collector --start-time -2h --dry-run
 
   # Collect from specific container IDs (as shown in 'weka cluster container')
   weka-log-collector --container-id 0 --container-id 1 --start-time -2h
