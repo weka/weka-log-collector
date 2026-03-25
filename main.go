@@ -1146,9 +1146,10 @@ func sshArgs() []string {
 // collectFromHost SSHs into a host, runs weka-log-collector --local, and
 // streams the tar.gz back.
 //
-// When selfDeploy is true (the default), it first scps the running binary to
-// /tmp/weka-log-collector on the remote host, runs it there, then removes it
-// on exit — so no manual pre-deployment is required.
+// When selfDeploy is true (the default), it first creates /opt/weka/tools/ on
+// the remote host, scps the running binary there, runs it, then removes it on
+// exit — so no manual pre-deployment is required. /opt/weka/tools/ is used
+// instead of /tmp to avoid noexec mount issues common on hardened systems.
 //
 // When selfDeploy is false, binaryPath must already exist on the remote host.
 func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration) HostResult {
@@ -1164,7 +1165,19 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 	if selfDeploy {
 		// Use a PID-suffixed name so the orchestrator never overwrites its own
 		// running binary when it is also a member of the cluster being collected.
-		remoteBin = fmt.Sprintf("/tmp/weka-log-collector-%d", os.Getpid())
+		// /opt/weka/tools/ is always present and executable on Weka nodes;
+		// /tmp is often mounted noexec on hardened systems.
+		remoteBin = fmt.Sprintf("/opt/weka/tools/weka-log-collector-%d", os.Getpid())
+
+		// Ensure the tools directory exists on the remote host.
+		mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p /opt/weka/tools")
+		mkdirCmd := exec.Command("ssh", mkdirArgs...)
+		if out, err := mkdirCmd.CombinedOutput(); err != nil {
+			result.Err = fmt.Errorf("mkdir /opt/weka/tools failed: %v: %s", err, strings.TrimSpace(string(out)))
+			errorf("[%s] collection failed: %v", host, result.Err)
+			return result
+		}
+
 		logf("  [%s] deploying binary via scp...", host)
 		scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
 		scpCmd := exec.Command("scp", scpArgs...)
@@ -1791,7 +1804,7 @@ func main() {
 		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
 		maxSizeMB    = flag.Uint64("max-size", 10000, "Abort if estimated collection size exceeds this value (MB)")
 		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
-		remoteBinary = flag.String("remote-binary", "/tmp/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
+		remoteBinary = flag.String("remote-binary", "/opt/weka/tools/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
 		noSelfDeploy = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
 		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
 		cmdTimeout   = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
@@ -2044,7 +2057,7 @@ func main() {
 			warnf("Could not determine executable path (%v); falling back to --remote-binary mode", err)
 			selfDeploy = false
 		} else {
-			logf("Auto-deploying binary from %s to /tmp/weka-log-collector-<pid> on each host", selfPath)
+			logf("Auto-deploying binary from %s to /opt/weka/tools/weka-log-collector-<pid> on each host", selfPath)
 			logf("(use --no-self-deploy to skip auto-deployment and use --remote-binary instead)")
 		}
 	}

@@ -25,10 +25,12 @@ For most support cases, `weka diags` is your starting point. This tool is a comp
 
 ```bash
 git clone https://github.com/weka/weka-log-collector
-scp weka-log-collector/weka-log-collector root@<node-ip>:/tmp/weka-log-collector
+scp weka-log-collector/weka-log-collector root@<node-ip>:/opt/weka/tools/weka-log-collector
 ```
 
 The binary is a static Linux amd64 build — no dependencies, works on any Weka node.
+
+> `/opt/weka/tools/` is used instead of `/tmp` to avoid `noexec` mount restrictions common on hardened systems. The directory is created automatically on remote nodes during cluster-wide collection.
 
 ---
 
