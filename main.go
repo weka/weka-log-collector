@@ -261,9 +261,7 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_security_kms", Cmd: "weka security kms -J", JSON: true},
 	// ── local container info (node-local: different per host) ─────────────
 	{Name: "weka_local_ps", Cmd: "weka local ps -v -J", NodeLocal: true, JSON: true},
-	{Name: "weka_local_resources_drives0", Cmd: "weka local resources -C drives0 -J", NodeLocal: true, JSON: true},
-	{Name: "weka_local_resources_compute0", Cmd: "weka local resources -C compute0 -J", NodeLocal: true, JSON: true},
-	{Name: "weka_local_resources_frontend0", Cmd: "weka local resources -C frontend0 -J", NodeLocal: true, JSON: true},
+	// weka local resources collected dynamically per container in CollectLocal
 	// ── host hw info (node-local: different per host) ──────────────────────
 	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", NodeLocal: true, JSON: true},
 	// ── events, config dump, network peers (merged from former "full" profile) ──
@@ -526,13 +524,15 @@ var logFileSpecs = []LogFileSpec{
 	//
 	// Two depth levels cover everything. seenSrcPaths deduplicates overlaps.
 	//
-	// Core containers (drives*, compute*, frontend*) are always collected.
+	// Core containers (drives*, compute*, frontend*, client*) are always collected.
 	// Protocol containers (ganesha*, s3*, envoy*, smbw*) are only collected
 	// when the matching profile is active — their log directories only exist
 	// on nodes where the protocol is actually running, so on non-protocol
 	// nodes the globs simply match nothing.
 
 	// ── core containers (always collected) ───────────────────────────────
+	// Covers backends (drives*/compute*/frontend*) and clients (client*).
+	// Globs that match nothing on a given node are silently skipped.
 	{SrcGlob: "/opt/weka/logs/drives*/*.log*", DestDir: "weka/containers"},
 	{SrcGlob: "/opt/weka/logs/drives*/*.json", DestDir: "weka/containers"},
 	{SrcGlob: "/opt/weka/logs/drives*/*/*.log*", DestDir: "weka/containers"},
@@ -542,6 +542,9 @@ var logFileSpecs = []LogFileSpec{
 	{SrcGlob: "/opt/weka/logs/frontend*/*.log*", DestDir: "weka/containers"},
 	{SrcGlob: "/opt/weka/logs/frontend*/*.json", DestDir: "weka/containers"},
 	{SrcGlob: "/opt/weka/logs/frontend*/*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/client*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/client*/*.json", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/client*/*/*.log*", DestDir: "weka/containers"},
 
 	// ── NFS / Ganesha container logs (profile: nfs) ───────────────────────
 	{SrcGlob: "/opt/weka/logs/ganesha*/*.log*", DestDir: "weka/containers", Profile: ProfileNFS},
@@ -1067,6 +1070,48 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		}
 		if spec.Name == "weka_version" && len(co.out) > 0 {
 			manifest.WekaVersion = strings.TrimSpace(string(co.out))
+		}
+	}
+
+	// ── phase: weka local resources (dynamic, per container) ─────────────
+	// Parse weka local ps output to discover which containers exist on this
+	// node (differs between backends: drives0/compute0/frontend0, and clients:
+	// client), then collect resources for each.
+	{
+		var localPSOut []byte
+		for i, spec := range wekaToRun {
+			if spec.Name == "weka_local_ps" {
+				localPSOut = wekaOutputs[i].out
+				break
+			}
+		}
+		var containers []struct {
+			Name string `json:"name"`
+		}
+		if len(localPSOut) > 0 {
+			_ = json.Unmarshal(localPSOut, &containers)
+		}
+		for _, c := range containers {
+			name := c.Name
+			spec := CommandSpec{
+				Name:      "weka_local_resources_" + name,
+				Cmd:       "weka local resources -C " + name + " -J",
+				NodeLocal: true,
+				JSON:      true,
+			}
+			result, out := runCommand(spec, cmdTimeout)
+			manifest.Commands = append(manifest.Commands, result)
+			if result.Error != "" {
+				warnf("[%s] weka local resources -C %s failed: %s", hostname, name, result.Error)
+			}
+			content := out
+			if result.Error != "" && len(out) == 0 {
+				content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, result.Error))
+			}
+			dest := filepath.Join(hostRoot, "weka", spec.Name+".json")
+			if err := addBytesToArchive(tw, dest, content); err != nil {
+				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
+			}
 		}
 	}
 
