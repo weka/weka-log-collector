@@ -1281,8 +1281,13 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 	if runErr != nil {
 		os.Remove(tmpPath)
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			result.Err = fmt.Errorf("SSH command failed (exit %d): %s",
-				exitErr.ExitCode(), strings.TrimSpace(stderrBuf.String()))
+			exitCode := exitErr.ExitCode()
+			errMsg := strings.TrimSpace(stderrBuf.String())
+			if exitCode == 137 {
+				result.Err = fmt.Errorf("process killed (OOM) on remote host — try --start-time to reduce collection size: %s", errMsg)
+			} else {
+				result.Err = fmt.Errorf("SSH command failed (exit %d): %s", exitCode, errMsg)
+			}
 		} else {
 			result.Err = fmt.Errorf("SSH error: %v", runErr)
 		}
