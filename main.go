@@ -34,7 +34,7 @@ import (
 
 const version = "0.1.0"
 
-// ── time parsing (same approach as trace_extractor by Baruch) ─────────────────
+// ── time parsing ─────────────────────────────────────────────────────────────
 
 var relativeTimeRe = regexp.MustCompile(
 	`^-(\d+)\s*(d|day|days|h|hr|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)$`,
