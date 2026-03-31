@@ -1978,10 +1978,16 @@ func main() {
 	// ── determine output path ─────────────────────────────────────────────
 	toStdout := *outputPath == "-"
 	outPath := *outputPath
-	if !toStdout && outPath == "" {
+	if !toStdout {
 		clusterName := getClusterName()
 		ts := time.Now().Format("2006-01-02T15-04-05")
-		outPath = fmt.Sprintf("/tmp/%s-weka-logs-%s.tar.gz", clusterName, ts)
+		archiveName := fmt.Sprintf("%s-weka-logs-%s.tar.gz", clusterName, ts)
+		if outPath == "" {
+			outPath = "/tmp/" + archiveName
+		} else if info, err := os.Stat(outPath); err == nil && info.IsDir() {
+			// User gave a directory — place the archive inside it
+			outPath = filepath.Join(outPath, archiveName)
+		}
 	}
 
 	// ── print collection plan ─────────────────────────────────────────────
