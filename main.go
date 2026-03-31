@@ -142,6 +142,26 @@ func filterByTimeWindow(paths []string, from, to time.Time) []string {
 	return result
 }
 
+// parseSize parses a size string into MB. Accepts plain numbers (MB),
+// or values with MB/GB suffix (case-insensitive). Examples:
+//
+//	"2048"   → 2048 MB
+//	"2048MB" → 2048 MB
+//	"5GB"    → 5120 MB
+func parseSize(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	upper := strings.ToUpper(s)
+	switch {
+	case strings.HasSuffix(upper, "GB"):
+		n, err := strconv.ParseUint(strings.TrimSuffix(upper, "GB"), 10, 64)
+		return n * 1024, err
+	case strings.HasSuffix(upper, "MB"):
+		return strconv.ParseUint(strings.TrimSuffix(upper, "MB"), 10, 64)
+	default:
+		return strconv.ParseUint(s, 10, 64)
+	}
+}
+
 func parseInputTime(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	if m := relativeTimeRe.FindStringSubmatch(strings.ToLower(s)); m != nil {
@@ -1862,7 +1882,7 @@ func main() {
 		nodeOnly     = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		upload       = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
 		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
-		maxSizeMB    = flag.Uint64("max-size", 10000, "Abort if estimated collection size exceeds this value (MB)")
+		maxSizeStr   = flag.String("max-size", "5GB", "Abort if estimated collection size exceeds this (e.g. 2048, 2048MB, 10GB)")
 		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
 		remoteBinary = flag.String("remote-binary", "/opt/weka/tools/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
 		noSelfDeploy = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
@@ -2031,15 +2051,20 @@ func main() {
 			errorf("     Or free up space on %s first.", di.Path)
 			os.Exit(1)
 		}
+		maxSizeMB, err := parseSize(*maxSizeStr)
+		if err != nil {
+			errorf("Invalid --max-size value %q: use a number in MB or with suffix, e.g. 2048, 2048MB, 10GB", *maxSizeStr)
+			os.Exit(1)
+		}
 		maxAllowed := uint64(float64(di.AvailMB) * safetyMarginFraction)
-		if estimated > *maxSizeMB || estimated > maxAllowed {
-			limit := *maxSizeMB
+		if estimated > maxSizeMB || estimated > maxAllowed {
+			limit := maxSizeMB
 			if maxAllowed < limit {
 				limit = maxAllowed
 			}
 			errorf("Estimated collection size (~%d MB) exceeds limit (%d MB).", estimated, limit)
 			errorf("Tip: narrow the time window with --start-time -2h to reduce the amount collected.")
-			errorf("     Or increase the limit with --max-size <MB>.")
+			errorf("     Or increase the limit with --max-size <MB|GB> (e.g. --max-size 10GB).")
 			errorf("     Use --output to write to a larger filesystem (e.g. /opt/weka/).")
 			errorf("     Or use --dry-run to see exactly what would be collected.")
 			os.Exit(1)
@@ -2419,7 +2444,7 @@ OPTIONS
   --dry-run            Show what would be collected; do not collect
   --output PATH        Archive path (default: /tmp/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
-  --max-size MB        Abort if estimated size exceeds this (default: 2048)
+  --max-size SIZE      Abort if estimated size exceeds this (default: 5GB; accepts MB/GB e.g. 2048, 10GB)
   --ssh-user USER      SSH user (default: root)
   --workers N          Parallel SSH workers (default: 10)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
