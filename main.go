@@ -438,8 +438,7 @@ var systemCommands = []CommandSpec{
 	// fails gracefully on Intel/other NIC nodes
 	{Name: "mst_status", Cmd: "mst status -v"},
 	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
-	// weka-agent service journal — full history, no line cap
-	{Name: "journalctl_weka_agent", Cmd: "journalctl -u weka-agent --no-pager"},
+	// weka-agent journal — collected separately in CollectLocal with time window support
 }
 
 // LogFileSpec describes a set of log files to collect.
@@ -1052,14 +1051,35 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	}
 
 	// ── phase: journalctl ────────────────────────────────────────────────
-	if true {
-		phase(fmt.Sprintf("[%s] Journalctl (time-windowed)", hostname))
-		result, out := journalctlWithWindow(from, to, 2*cmdTimeout)
-		manifest.Commands = append(manifest.Commands, result)
-		if result.Error != "" {
-			warnf("[%s] journalctl failed: %s", hostname, result.Error)
+	phase(fmt.Sprintf("[%s] Journalctl (time-windowed)", hostname))
+	result, out := journalctlWithWindow(from, to, 2*cmdTimeout)
+	manifest.Commands = append(manifest.Commands, result)
+	if result.Error != "" {
+		warnf("[%s] journalctl failed: %s", hostname, result.Error)
+	}
+	_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl.txt"), out)
+
+	// weka-agent journal: scoped to time window when given, capped at 50k lines
+	// otherwise. No-cap collection caused OOM on memory-constrained nodes when
+	// running --profile all with no time window.
+	{
+		var agentCmd string
+		switch {
+		case !from.IsZero() && !to.IsZero():
+			agentCmd = fmt.Sprintf("journalctl -u weka-agent --no-pager -S '%s' -U '%s'",
+				from.Format("2006-01-02 15:04:05"), to.Format("2006-01-02 15:04:05"))
+		case !from.IsZero():
+			agentCmd = fmt.Sprintf("journalctl -u weka-agent --no-pager -S '%s'",
+				from.Format("2006-01-02 15:04:05"))
+		default:
+			agentCmd = "journalctl -u weka-agent --no-pager -n 50000"
 		}
-		_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl.txt"), out)
+		agentResult, agentOut := runCommand(CommandSpec{Name: "journalctl_weka_agent", Cmd: agentCmd}, 2*cmdTimeout)
+		manifest.Commands = append(manifest.Commands, agentResult)
+		if agentResult.Error != "" {
+			warnf("[%s] journalctl weka-agent failed: %s", hostname, agentResult.Error)
+		}
+		_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl_weka_agent.txt"), agentOut)
 	}
 
 	// ── phase: log files ──────────────────────────────────────────────────
