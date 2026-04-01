@@ -612,7 +612,9 @@ func checkDiskSpace(path string) (diskInfo, error) {
 // space the collection will use after compression.
 // nodeCount should be 1 for local collection, or the number of remote hosts
 // for cluster collection — log files scale linearly with node count.
-func estimateCollectionMB(profile string, logSpecs []LogFileSpec, nodeCount int) uint64 {
+// from/to are applied to filter rotated files the same way actual collection
+// does, so the estimate reflects the time window rather than all log history.
+func estimateCollectionMB(profile string, logSpecs []LogFileSpec, nodeCount int, from, to time.Time) uint64 {
 	var totalBytes int64
 	for _, spec := range logSpecs {
 		if spec.Profile != "" && spec.Profile != profile && profile != ProfileAll {
@@ -621,6 +623,11 @@ func estimateCollectionMB(profile string, logSpecs []LogFileSpec, nodeCount int)
 		matches, err := filepath.Glob(spec.SrcGlob)
 		if err != nil || len(matches) == 0 {
 			continue
+		}
+		// Apply the same time-window filter that actual collection uses so that
+		// rotated files outside the window are not counted in the estimate.
+		if !from.IsZero() || !to.IsZero() {
+			matches = filterByTimeWindow(matches, from, to)
 		}
 		for _, f := range matches {
 			info, err := os.Stat(f)
@@ -2119,7 +2126,7 @@ func main() {
 			errorf("Tip: use --output to write to a different location (e.g. --output /data/weka-logs.tar.gz)")
 			os.Exit(1)
 		}
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount)
+		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount, from, to)
 		logf("Disk:     %d MB available on %s (estimated collection: ~%d MB compressed)", di.AvailMB, di.Path, estimated)
 
 		if di.AvailMB < minFreeSpaceMB {
@@ -2151,7 +2158,7 @@ func main() {
 
 	if *dryRun {
 		phase("DRY RUN — showing what would be collected")
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount)
+		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount, from, to)
 		logf("  Profile:   %s", *profileStr)
 		logf("  Nodes:     %d", spaceCheckNodeCount)
 		logf("  Estimated: ~%d MB compressed", estimated)
