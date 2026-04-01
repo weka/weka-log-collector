@@ -1658,17 +1658,7 @@ func uploadBundle(archivePath string) error {
 		return err
 	}
 
-	// Detect Local Weka Home vs Cloud Weka Home.
-	// CWH URL contains "home.weka.io"; anything else is treated as LWH.
-	isLWH := !strings.Contains(strings.ToLower(cloudURL), "home.weka.io")
-	if isLWH {
-		logf("Target: Local Weka Home (%s)", cloudURL)
-		logf("Note: this cluster is pointed at a Local Weka Home, not Cloud Weka Home directly.")
-		logf("      The bundle will be uploaded to LWH. Whether it is forwarded to Cloud Weka Home")
-		logf("      depends on LWH's 'enableDiagnostics' setting — verify with your LWH admin.")
-	} else {
-		logf("Target: Cloud Weka Home (%s)", cloudURL)
-	}
+	logf("Target: %s", cloudURL)
 
 	supportDirs, err := findSupportDirs()
 	if err != nil {
