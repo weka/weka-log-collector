@@ -1533,18 +1533,25 @@ func getClusterName() string {
 
 // checkCloudEnabled verifies that weka cloud is registered and the uploader
 // daemon is active on at least one host.
-func checkCloudEnabled() error {
-	out, err := exec.Command("weka", "cloud", "status").Output()
-	if err != nil {
-		return fmt.Errorf("could not check cloud status: %v", err)
+// checkCloudEnabled verifies that weka cloud is registered and the uploader
+// daemon is active on at least one host. Returns the configured cloud URL so
+// the caller can distinguish Local Weka Home from Cloud Weka Home.
+func checkCloudEnabled() (cloudURL string, err error) {
+	out, runErr := exec.Command("weka", "cloud", "status").Output()
+	if runErr != nil {
+		return "", fmt.Errorf("could not check cloud status: %v", runErr)
 	}
 	var hasURL, isRegistered bool
 	totalHosts, disabledHosts := 0, 0
 	for _, line := range strings.Split(string(out), "\n") {
 		trimmed := strings.TrimSpace(line)
 		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "url:") && len(strings.TrimSpace(strings.TrimPrefix(lower, "url:"))) > 0 {
-			hasURL = true
+		if strings.HasPrefix(lower, "url:") {
+			u := strings.TrimSpace(strings.TrimPrefix(trimmed, strings.SplitN(trimmed, ":", 2)[0]+":"))
+			if u != "" {
+				hasURL = true
+				cloudURL = u
+			}
 		}
 		if strings.HasPrefix(lower, "registration:") && strings.Contains(lower, "registered") {
 			isRegistered = true
@@ -1558,12 +1565,12 @@ func checkCloudEnabled() error {
 		}
 	}
 	if !hasURL || !isRegistered {
-		return fmt.Errorf("weka cloud is not registered — run 'weka cloud enable' first")
+		return "", fmt.Errorf("weka cloud is not registered — run 'weka cloud enable' first")
 	}
 	if totalHosts > 0 && totalHosts == disabledHosts {
-		return fmt.Errorf("weka uploader daemon is DISABLED on all hosts — check 'weka cloud status' and ensure the uploader is active before using --upload")
+		return "", fmt.Errorf("weka uploader daemon is DISABLED on all hosts — check 'weka cloud status' and ensure the uploader is active before using --upload")
 	}
-	return nil
+	return cloudURL, nil
 }
 
 // findSupportDirs returns all writable /opt/weka/*/support directories.
@@ -1646,8 +1653,21 @@ func cleanStaleSymlinks(supportDir string) {
 func uploadBundle(archivePath string) error {
 	phase("Uploading to Weka Home")
 
-	if err := checkCloudEnabled(); err != nil {
+	cloudURL, err := checkCloudEnabled()
+	if err != nil {
 		return err
+	}
+
+	// Detect Local Weka Home vs Cloud Weka Home.
+	// CWH URL contains "home.weka.io"; anything else is treated as LWH.
+	isLWH := !strings.Contains(strings.ToLower(cloudURL), "home.weka.io")
+	if isLWH {
+		logf("Target: Local Weka Home (%s)", cloudURL)
+		logf("Note: this cluster is pointed at a Local Weka Home, not Cloud Weka Home directly.")
+		logf("      The bundle will be uploaded to LWH. Whether it is forwarded to Cloud Weka Home")
+		logf("      depends on LWH's 'enableDiagnostics' setting — verify with your LWH admin.")
+	} else {
+		logf("Target: Cloud Weka Home (%s)", cloudURL)
 	}
 
 	supportDirs, err := findSupportDirs()
