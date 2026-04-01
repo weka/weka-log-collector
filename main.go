@@ -1027,18 +1027,35 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// ── phase: weka CLI commands (parallel) ───────────────────────────────
 	phase(fmt.Sprintf("[%s] Weka commands (profile: %s, %d parallel)", hostname, profile, cmdWorkers))
 
+	// Auth probe: run weka status first. Exit 41 = authentication required.
+	// If auth fails, skip all Weka CLI commands to avoid 30+ identical warnings.
+	wekaAvailable := true
+	{
+		probe := CommandSpec{Name: "weka_auth_probe", Cmd: "weka status"}
+		probeResult, _ := runCommand(probe, cmdTimeout)
+		if probeResult.ExitCode == 41 {
+			wekaAvailable = false
+			warnf("[%s] Weka authentication required — run 'weka user login' first. Skipping all Weka CLI commands.", hostname)
+		}
+	}
+
 	allWekaCmds := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile, from, to)...)
 
 	// Filter to the commands we'll actually run on this node before parallelising.
 	var wekaToRun []CommandSpec
 	for _, spec := range allWekaCmds {
+		if !wekaAvailable {
+			break
+		}
 		if nodeOnly && !spec.NodeLocal {
 			vlogf("  [%s] skipping cluster-wide command %s (--node-only)", hostname, spec.Name)
 			continue
 		}
 		wekaToRun = append(wekaToRun, spec)
 	}
-	logf("  [%s] running %d weka commands", hostname, len(wekaToRun))
+	if wekaAvailable {
+		logf("  [%s] running %d weka commands", hostname, len(wekaToRun))
+	}
 	wekaOutputs := runCommandsParallel(wekaToRun, cmdTimeout)
 	for i, spec := range wekaToRun {
 		co := wekaOutputs[i]
@@ -1077,7 +1094,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// Parse weka local ps output to discover which containers exist on this
 	// node (differs between backends: drives0/compute0/frontend0, and clients:
 	// client), then collect resources for each.
-	{
+	if wekaAvailable {
 		var localPSOut []byte
 		for i, spec := range wekaToRun {
 			if spec.Name == "weka_local_ps" {
