@@ -1871,22 +1871,8 @@ _weka_log_collector() {
     COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
     return 0
 }
-complete -F _weka_log_collector weka-log-collector
+complete -F _weka_log_collector weka-log-collector ./weka-log-collector
 `
-
-const bashCompletionPath = "/etc/bash_completion.d/weka-log-collector"
-
-// installCompletion writes the bash completion script to /etc/bash_completion.d/.
-// Errors are silently ignored — this is best-effort.
-func installCompletion() {
-	// Skip if already installed with current content
-	existing, err := os.ReadFile(bashCompletionPath)
-	if err == nil && string(existing) == bashCompletionScript {
-		return
-	}
-	_ = os.MkdirAll("/etc/bash_completion.d", 0755)
-	_ = os.WriteFile(bashCompletionPath, []byte(bashCompletionScript), 0644)
-}
 
 // ── archive merging ───────────────────────────────────────────────────────────
 
@@ -1968,6 +1954,7 @@ func main() {
 		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
 		cmdTimeout   = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
 		ver          = flag.Bool("version", false, "Print version and exit")
+		completion   = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -1990,6 +1977,11 @@ func main() {
 		return
 	}
 
+	if *completion {
+		os.Stdout.WriteString(bashCompletionScript) //nolint
+		return
+	}
+
 	// ── open debug log file ───────────────────────────────────────────────
 	// Skip when output is stdout (--output -): this is a remote node collection
 	// invoked by the orchestrator via SSH. The orchestrator has its own debug log;
@@ -2006,9 +1998,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[WARN] could not open debug log %s: %v\n", logPath, err)
 		}
 	}
-
-	// Silently install bash completion on first run (best-effort, no noise on failure).
-	go installCompletion()
 
 	// ── validate profile ──────────────────────────────────────────────────
 	validProfile := false
