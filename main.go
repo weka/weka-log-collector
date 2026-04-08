@@ -1313,8 +1313,11 @@ func sshArgs() []string {
 // instead of /tmp to avoid noexec mount issues common on hardened systems.
 //
 // When selfDeploy is false, binaryPath must already exist on the remote host.
-func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string) HostResult {
+func collectFromHost(host, displayName, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string) HostResult {
 	result := HostResult{Host: host}
+	if displayName == "" {
+		displayName = host
+	}
 
 	sshTarget := host
 	if sshUser != "" {
@@ -1335,19 +1338,19 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 		mkdirCmd := exec.Command("ssh", mkdirArgs...)
 		if out, err := mkdirCmd.CombinedOutput(); err != nil {
 			result.Err = fmt.Errorf("mkdir /opt/weka/tools failed: %v: %s", err, strings.TrimSpace(string(out)))
-			errorf("[%s] collection failed: %v", host, result.Err)
+			errorf("[%s] collection failed: %v", displayName, result.Err)
 			return result
 		}
 
-		logf("  [%s] deploying binary via scp...", host)
+		logf("  [%s] deploying binary via scp...", displayName)
 		scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
 		scpCmd := exec.Command("scp", scpArgs...)
 		if out, err := scpCmd.CombinedOutput(); err != nil {
 			result.Err = fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
-			errorf("[%s] collection failed: %v", host, result.Err)
+			errorf("[%s] collection failed: %v", displayName, result.Err)
 			return result
 		}
-		vlogf("[%s] binary deployed to %s", host, remoteBin)
+		vlogf("[%s] binary deployed to %s", displayName, remoteBin)
 	}
 
 	// ── build the remote command ───────────────────────────────────────────
@@ -1391,11 +1394,11 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 	// ── run collection via SSH, streaming output to a temp file ──────────
 	// Streaming to disk (not RAM) prevents accumulating 200-400 MB per host
 	// in memory simultaneously when collecting a large cluster in parallel.
-	logf("  [%s] collecting...", host)
+	logf("  [%s] collecting...", displayName)
 	tmpFile, err := os.CreateTemp("", "wlc-host-*.tar.gz")
 	if err != nil {
 		result.Err = fmt.Errorf("create temp file: %w", err)
-		errorf("[%s] collection failed: %v", host, result.Err)
+		errorf("[%s] collection failed: %v", displayName, result.Err)
 		return result
 	}
 	tmpPath := tmpFile.Name()
@@ -1420,22 +1423,31 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 		} else {
 			result.Err = fmt.Errorf("SSH error: %v", runErr)
 		}
-		errorf("[%s] collection failed: %v", host, result.Err)
+		errorf("[%s] collection failed: %v", displayName, result.Err)
 		return result
 	}
 
 	if info, err := os.Stat(tmpPath); err == nil {
-		logf("  [%s] collected %d KB", host, info.Size()/1024)
+		logf("  [%s] collected %d KB", displayName, info.Size()/1024)
 	}
 	result.TempFile = tmpPath
 	return result
 }
 
-// clusterNode represents a Weka cluster container with its numeric ID, primary IP, and mode.
+// clusterNode represents a Weka cluster container with its numeric ID, primary IP, mode, and hostname.
 type clusterNode struct {
-	ID   int
-	IP   string
-	Mode string // "backend", "client", "nfs", "smb", "s3"
+	ID       int
+	IP       string
+	Mode     string // "backend", "client", "nfs", "smb", "s3"
+	Hostname string
+}
+
+// nodeDisplay returns "hostname (ip)" when a hostname is known, otherwise just the IP.
+func nodeDisplay(n clusterNode) string {
+	if n.Hostname != "" {
+		return fmt.Sprintf("%s (%s)", n.Hostname, n.IP)
+	}
+	return n.IP
 }
 
 // discoverClusterNodes returns cluster containers with their IDs, IPs, and modes.
@@ -1495,6 +1507,27 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 		nodes = append(nodes, clusterNode{ID: id, IP: ip, Mode: mode})
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].IP < nodes[j].IP })
+
+	// Enrich with hostnames via a separate clean 2-field query (best-effort).
+	if hout, err := exec.Command("weka", "cluster", "container",
+		"--no-header", "--output", "id,hostname").Output(); err == nil {
+		idToHost := map[int]string{}
+		for _, line := range strings.Split(string(hout), "\n") {
+			fields := strings.Fields(strings.TrimSpace(line))
+			if len(fields) < 2 {
+				continue
+			}
+			if id, err := strconv.Atoi(fields[0]); err == nil {
+				idToHost[id] = fields[1]
+			}
+		}
+		for i := range nodes {
+			if h, ok := idToHost[nodes[i].ID]; ok {
+				nodes[i].Hostname = h
+			}
+		}
+	}
+
 	return nodes, nil
 }
 
@@ -2260,6 +2293,7 @@ func main() {
 	// ── cluster collection ────────────────────────────────────────────────
 	phase("Discovering cluster hosts")
 	clusterHosts := []string(hosts)
+	nodeDisplayMap := map[string]string{} // ip → "hostname (ip)" for log output
 	if len(clusterHosts) == 0 {
 		if len(preDiscoveredHosts) > 0 {
 			// Reuse result from early discovery (already filtered by --container-id)
@@ -2298,7 +2332,12 @@ func main() {
 				logf("Filtered to %d node(s) matching --container-id %v", len(nodes), []int(containerIDs))
 			}
 			clusterHosts = nodeIPs(nodes)
-			logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
+			displays := make([]string, len(nodes))
+			for i, n := range nodes {
+				displays[i] = nodeDisplay(n)
+				nodeDisplayMap[n.IP] = nodeDisplay(n)
+			}
+			logf("Discovered %d cluster host(s): %s", len(nodes), strings.Join(displays, ", "))
 		}
 	} else {
 		logf("Collecting from %d specified host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
@@ -2321,7 +2360,7 @@ func main() {
 
 	// Collect from all hosts in parallel
 	phase("Collecting from cluster hosts")
-	results := collectCluster(clusterHosts, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames)
+	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames)
 
 	// Write merged archive
 	phase("Writing archive")
@@ -2334,7 +2373,7 @@ func main() {
 }
 
 // collectCluster fans out collection to all hosts in parallel.
-func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
+func collectCluster(hosts []string, displayNames map[string]string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
@@ -2347,7 +2386,7 @@ func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, 
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r := collectFromHost(host, selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 5*cmdTimeout, containerNames)
+			r := collectFromHost(host, displayNames[host], selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 5*cmdTimeout, containerNames)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
