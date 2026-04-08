@@ -267,7 +267,7 @@ var defaultCommands = []CommandSpec{
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
 	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1 -J", JSON: true},
-	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J", JSON: true},
+	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J", NodeLocal: true, JSON: true},
 	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", NodeLocal: true}, // raw exec, no -J
 }
 
@@ -1970,7 +1970,7 @@ func main() {
 	withClients := flag.Bool("clients", false, "Include client nodes in cluster collection (default: backends only)")
 	clientsOnly := flag.Bool("clients-only", false, "Collect from client nodes only (skip backends)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
-	flag.Var(&hosts, "host", "Collect only from these hosts by IP (repeatable; default: all cluster backends)")
+	flag.Var(&hosts, "host", "Collect only from these hosts (repeatable; accepts hostname or any IP; default: all cluster backends)")
 	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (repeatable; e.g. --container-id 0 --container-id 2)")
 	flag.Usage = usageFunc
 	flag.Parse()
