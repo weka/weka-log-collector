@@ -1448,14 +1448,23 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 		if err != nil {
 			continue // skip unparseable lines
 		}
-		// IPs column may be comma-separated; take the first one
-		ip := strings.SplitN(fields[1], ",", 2)[0]
+		// The IPs column may contain multiple comma-separated addresses. When
+		// Weka formats them with a space after the comma (e.g. "172.25.7.145,
+		// 172.25.8.145"), strings.Fields splits them across multiple fields.
+		// Detect the mode by checking whether the last field is a known mode
+		// keyword; everything between fields[1] and that boundary is IPs.
+		mode := "backend"
+		ipEnd := len(fields)
+		if last := strings.ToLower(fields[len(fields)-1]); last == "backend" || last == "client" {
+			mode = last
+			ipEnd = len(fields) - 1
+		}
+		// Join all IP fields (handles space-after-comma split) then take first IP.
+		ipStr := strings.Join(fields[1:ipEnd], "")
+		ip := strings.SplitN(ipStr, ",", 2)[0]
+		ip = strings.TrimRight(ip, ",")
 		if ip == "" || seenIP[ip] {
 			continue
-		}
-		mode := "backend"
-		if len(fields) >= 3 {
-			mode = strings.ToLower(fields[2])
 		}
 		isBackend := mode == "backend"
 		isClient := mode == "client"
