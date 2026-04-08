@@ -990,7 +990,7 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 // in defaultCommands and profile command slices) are skipped — they will be run
 // once by the cluster orchestrator instead.
 // Returns a HostManifest describing what was collected.
-func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool) HostManifest {
+func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string) HostManifest {
 	hostname, _ := os.Hostname()
 	manifest := HostManifest{
 		Hostname:    hostname,
@@ -1201,6 +1201,23 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				vlogf("[%s] skip duplicate %s", hostname, srcPath)
 				continue
 			}
+			// When --container-name is set, restrict /opt/weka/logs/ collection
+			// to only the named container directories; all other paths are unaffected.
+			if len(containerNames) > 0 && strings.HasPrefix(srcPath, "/opt/weka/logs/") {
+				rest := srcPath[len("/opt/weka/logs/"):]
+				containerDir := strings.SplitN(rest, "/", 2)[0]
+				allowed := false
+				for _, name := range containerNames {
+					if containerDir == name {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					vlogf("[%s] skipping container log (not in scope): %s", hostname, srcPath)
+					continue
+				}
+			}
 			seenSrcPaths[srcPath] = true
 			vlogf("  [%s] collecting: %s", hostname, srcPath)
 			// Preserve directory structure relative to the glob base so that
@@ -1296,7 +1313,7 @@ func sshArgs() []string {
 // instead of /tmp to avoid noexec mount issues common on hardened systems.
 //
 // When selfDeploy is false, binaryPath must already exist on the remote host.
-func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration) HostResult {
+func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string) HostResult {
 	result := HostResult{Host: host}
 
 	sshTarget := host
@@ -1353,6 +1370,9 @@ func collectFromHost(host, selfPath, binaryPath, profile string, from, to time.T
 		}
 		if verbose {
 			extra = append(extra, "--verbose")
+		}
+		if len(containerNames) > 0 {
+			extra = append(extra, "--container-name", strings.Join(containerNames, ","))
 		}
 		return extra
 	}()...), " ")
@@ -1495,6 +1515,36 @@ func filterNodesByContainerID(nodes []clusterNode, ids []int) []clusterNode {
 		}
 	}
 	return out
+}
+
+// resolveContainerNames maps container IDs to their names (e.g. 36 → "drives0").
+// Uses a separate --output id,container query — clean 2-field output, no parsing ambiguity.
+// Returns an empty map on failure; callers treat missing entries as "collect all".
+func resolveContainerNames(ids []int) map[int]string {
+	out, err := exec.Command("weka", "cluster", "container",
+		"--no-header", "--output", "id,container").Output()
+	if err != nil {
+		return nil
+	}
+	idSet := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+	result := make(map[int]string)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		id, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		if idSet[id] {
+			result[id] = fields[1]
+		}
+	}
+	return result
 }
 
 // filterClientNodes returns only nodes with mode "client".
@@ -1973,11 +2023,13 @@ func main() {
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
+	var containerNamesFlag multiStringFlag
 	withClients := flag.Bool("clients", false, "Include client nodes in cluster collection (default: backends only)")
 	clientsOnly := flag.Bool("clients-only", false, "Collect from client nodes only (skip backends)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
 	flag.Var(&hosts, "host", "Collect only from these hosts (repeatable; accepts hostname or any IP; default: all cluster backends)")
 	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)")
+	flag.Var(&containerNamesFlag, "container-name", "Internal: restrict /opt/weka/logs/ collection to these container names (set by orchestrator when --container-id is used)")
 	flag.Usage = usageFunc
 	flag.Parse()
 
@@ -2175,10 +2227,28 @@ func main() {
 		return
 	}
 
+	// ── resolve container names from IDs (for log scoping) ───────────────
+	// When --container-id is given, resolve IDs to names (e.g. 36 → drives0)
+	// so remote nodes only collect /opt/weka/logs/<name>/ for those containers.
+	// --container-name is an internal flag set by the orchestrator; honour it
+	// directly when running as a remote node (--local --node-only).
+	containerNames := []string(containerNamesFlag)
+	if len(containerNames) == 0 && len(containerIDs) > 0 {
+		nameMap := resolveContainerNames([]int(containerIDs))
+		for _, id := range containerIDs {
+			if name, ok := nameMap[id]; ok {
+				containerNames = append(containerNames, name)
+			}
+		}
+		if len(containerNames) > 0 {
+			logf("Container IDs %v resolve to: %s", []int(containerIDs), strings.Join(containerNames, ", "))
+		}
+	}
+
 	// ── single local collection ───────────────────────────────────────────
 	if *localOnly {
 		phase("Local collection")
-		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, nil)
+		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, containerNames, nil)
 		if *upload && !toStdout {
 			if err := uploadBundle(outPath); err != nil {
 				errorf("Upload failed: %v", err)
@@ -2203,7 +2273,7 @@ func main() {
 			if err != nil {
 				warnf("Could not discover cluster hosts: %v", err)
 				warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
-				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, nil)
+				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, containerNames, nil)
 				if *upload && !toStdout {
 					if err := uploadBundle(outPath); err != nil {
 						errorf("Upload failed: %v", err)
@@ -2251,7 +2321,7 @@ func main() {
 
 	// Collect from all hosts in parallel
 	phase("Collecting from cluster hosts")
-	results := collectCluster(clusterHosts, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount)
+	results := collectCluster(clusterHosts, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames)
 
 	// Write merged archive
 	phase("Writing archive")
@@ -2264,7 +2334,7 @@ func main() {
 }
 
 // collectCluster fans out collection to all hosts in parallel.
-func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int) []HostResult {
+func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
@@ -2277,7 +2347,7 @@ func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, 
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r := collectFromHost(host, selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 5*cmdTimeout)
+			r := collectFromHost(host, selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 5*cmdTimeout, containerNames)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
@@ -2288,7 +2358,7 @@ func collectCluster(hosts []string, selfPath, binaryPath, profile string, from, 
 }
 
 // writeArchive performs a local collection and writes to outPath (or stdout).
-func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, extraManifests []HostManifest) {
+func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraManifests []HostManifest) {
 	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
@@ -2318,7 +2388,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	}
 	tw := tar.NewWriter(gz)
 
-	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, nodeOnly)
+	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, nodeOnly, containerNames)
 
 	// Write manifest
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
