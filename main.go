@@ -2186,6 +2186,7 @@ func main() {
 	// before the space check. Discover early and reuse the result later.
 	// For --local or explicit --host flags we already know the count.
 	var preDiscoveredHosts []string
+	var preDiscoveredDisplayMap map[string]string // ip → display name, cached from pre-discovery
 	spaceCheckNodeCount := 1
 	if !*localOnly && !toStdout {
 		if len(hosts) > 0 {
@@ -2200,6 +2201,10 @@ func main() {
 				}
 				preDiscoveredHosts = nodeIPs(nodes)
 				spaceCheckNodeCount = len(preDiscoveredHosts)
+				preDiscoveredDisplayMap = make(map[string]string, len(nodes))
+				for _, n := range nodes {
+					preDiscoveredDisplayMap[n.IP] = nodeDisplay(n)
+				}
 			}
 			// If discovery fails here we fall back to 1; the cluster section
 			// will retry and produce a proper error message if needed.
@@ -2304,10 +2309,19 @@ func main() {
 		if len(preDiscoveredHosts) > 0 {
 			// Reuse result from early discovery (already filtered by --container-id)
 			clusterHosts = preDiscoveredHosts
+			nodeDisplayMap = preDiscoveredDisplayMap
 			if len(containerIDs) > 0 {
 				logf("Filtered to %d node(s) matching --container-id %v", len(clusterHosts), []int(containerIDs))
 			}
-			logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
+			displays := make([]string, len(clusterHosts))
+			for i, ip := range clusterHosts {
+				if d := nodeDisplayMap[ip]; d != "" {
+					displays[i] = d
+				} else {
+					displays[i] = ip
+				}
+			}
+			logf("Discovered %d cluster host(s): %s", len(clusterHosts), strings.Join(displays, ", "))
 		} else {
 			nodes, err := discoverClusterNodes(*withClients || *clientsOnly)
 			if err != nil {
