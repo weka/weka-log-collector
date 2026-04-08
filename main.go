@@ -2280,8 +2280,13 @@ func main() {
 
 	// ── single local collection ───────────────────────────────────────────
 	if *localOnly {
+		localStart := time.Now()
 		phase("Local collection")
 		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, containerNames, nil)
+		if !toStdout {
+			elapsed := time.Since(localStart).Round(time.Second)
+			logf("Collection complete → %s  (took %s)", outPath, elapsed)
+		}
 		if *upload && !toStdout {
 			if err := uploadBundle(outPath); err != nil {
 				errorf("Upload failed: %v", err)
@@ -2291,6 +2296,7 @@ func main() {
 	}
 
 	// ── cluster collection ────────────────────────────────────────────────
+	collectionStart := time.Now()
 	phase("Discovering cluster hosts")
 	clusterHosts := []string(hosts)
 	nodeDisplayMap := map[string]string{} // ip → "hostname (ip)" for log output
@@ -2364,7 +2370,7 @@ func main() {
 
 	// Write merged archive
 	phase("Writing archive")
-	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout)
+	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart)
 	if *upload && !toStdout {
 		if err := uploadBundle(outPath); err != nil {
 			errorf("Upload failed: %v", err)
@@ -2454,7 +2460,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 }
 
 // writeMergedArchive merges results from all cluster hosts into a single archive.
-func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration) {
+func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration, collectionStart time.Time) {
 	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
@@ -2595,6 +2601,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		errorf("Finalizing gzip: %v", err)
 	}
 
+	elapsed := time.Since(collectionStart).Round(time.Second)
 	logf("\nCluster collection complete → %s", outDesc)
 	logf("  Hosts:    %d total, %d succeeded, %d failed", len(results), succeeded, failed)
 	if len(failedHosts) > 0 {
@@ -2606,6 +2613,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			logf("  Size:     %d KB", info.Size()/1024)
 		}
 	}
+	logf("  Duration: %s", elapsed)
 }
 
 func sanitizeHostname(h string) string {
