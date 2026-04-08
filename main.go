@@ -1938,11 +1938,17 @@ func (f *multiIntFlag) String() string {
 	return strings.Join(s, ",")
 }
 func (f *multiIntFlag) Set(v string) error {
-	n, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil {
-		return fmt.Errorf("invalid container ID %q: must be an integer", v)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return fmt.Errorf("invalid container ID %q: must be an integer", part)
+		}
+		*f = append(*f, n)
 	}
-	*f = append(*f, n)
 	return nil
 }
 
@@ -1971,7 +1977,7 @@ func main() {
 	clientsOnly := flag.Bool("clients-only", false, "Collect from client nodes only (skip backends)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
 	flag.Var(&hosts, "host", "Collect only from these hosts (repeatable; accepts hostname or any IP; default: all cluster backends)")
-	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (repeatable; e.g. --container-id 0 --container-id 2)")
+	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)")
 	flag.Usage = usageFunc
 	flag.Parse()
 
