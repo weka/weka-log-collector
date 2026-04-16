@@ -1,0 +1,13 @@
+# extra-commands — additional commands for weka-log-collector
+#
+# Add custom commands here, one per line.
+# Blank lines and lines starting with # are ignored.
+# Commands already collected by the active profile are skipped automatically.
+#
+# These commands run on the ORCHESTRATOR NODE ONLY when --extra-commands is passed.
+# Output is saved under extra/ in the archive.
+#
+# Examples:
+# /weka/reader/histogram --slot 0
+# weka debug jrpc --op getFSInfo
+# cat /proc/meminfo

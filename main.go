@@ -638,6 +638,54 @@ func checkRemoteDiskSpace(sshTarget, path string) (diskInfo, error) {
 	return diskInfo{AvailMB: avail, Path: fields[1]}, nil
 }
 
+// ── extra commands ────────────────────────────────────────────────────────────
+
+// extraCommandsFile is the template file shipped with the repo. Users add
+// custom commands here; they are collected from the orchestrator node only.
+const extraCommandsFile = wlcBaseDir + "/extra-commands"
+
+// loadExtraCommands reads extraCommandsFile, strips blank lines and # comments,
+// deduplicates against the built-in command set, and returns CommandSpecs ready
+// to run. Each spec gets a stable archive name: NN_<binary>.txt.
+func loadExtraCommands(builtinCmds []CommandSpec) []CommandSpec {
+	data, err := os.ReadFile(extraCommandsFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			warnf("Could not read %s: %v", extraCommandsFile, err)
+		}
+		return nil
+	}
+
+	builtinSet := make(map[string]bool, len(builtinCmds))
+	for _, c := range builtinCmds {
+		builtinSet[strings.TrimSpace(c.Cmd)] = true
+	}
+
+	var cmds []CommandSpec
+	seen := make(map[string]bool)
+	idx := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		if builtinSet[line] {
+			logf("  extra-commands: skipping %q (already in built-in collection)", line)
+			continue
+		}
+		idx++
+		// Use the binary name (last path component of first word) for readability.
+		binName := filepath.Base(strings.Fields(line)[0])
+		name := fmt.Sprintf("%02d_%s", idx, binName)
+		cmds = append(cmds, CommandSpec{Name: name, Cmd: line})
+	}
+	return cmds
+}
+
 // ── collection result tracking ────────────────────────────────────────────────
 
 // CollectionStatus records what happened during collection.
@@ -974,7 +1022,7 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 // in defaultCommands and profile command slices) are skipped — they will be run
 // once by the cluster orchestrator instead.
 // Returns a HostManifest describing what was collected.
-func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string) HostManifest {
+func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraCmds []CommandSpec) HostManifest {
 	hostname, _ := os.Hostname()
 	manifest := HostManifest{
 		Hostname:    hostname,
@@ -1216,6 +1264,28 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			manifest.Files = append(manifest.Files, fr)
 			if fr.Error != "" {
 				warnf("[%s] file %s: %s", hostname, srcPath, fr.Error)
+			}
+		}
+	}
+
+	// ── phase: extra commands (orchestrator only, never on remote nodes) ──
+	if !nodeOnly && len(extraCmds) > 0 {
+		hostRoot := filepath.Join(archiveRoot, "hosts", hostname)
+		phase(fmt.Sprintf("[%s] Extra commands (%d)", hostname, len(extraCmds)))
+		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
+		for i, spec := range extraCmds {
+			co := extraOutputs[i]
+			manifest.Commands = append(manifest.Commands, co.result)
+			content := co.out
+			if co.result.Error != "" {
+				if len(co.out) == 0 {
+					content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
+				}
+				warnf("[%s] extra command %q failed (exit %d): %s", hostname, spec.Cmd, co.result.ExitCode, co.result.Error)
+			}
+			dest := filepath.Join(hostRoot, "extra", spec.Name+".txt")
+			if err := addBytesToArchive(tw, dest, content); err != nil {
+				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 			}
 		}
 	}
@@ -1977,7 +2047,7 @@ _weka_log_collector() {
 
     opts="--local --upload --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --cmd-timeout
+          --extra-commands --cmd-timeout
           --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
@@ -2181,6 +2251,7 @@ func main() {
 		nodeOnly        = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		upload          = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
 		cmdTimeout      = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
+		extraCommands   = flag.Bool("extra-commands", false, fmt.Sprintf("Run extra commands from %s and include output in the archive", extraCommandsFile))
 		ver             = flag.Bool("version", false, "Print version and exit")
 		completion      = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
 		listBundles     = flag.Bool("list-bundles", false, fmt.Sprintf("List bundles in %s", wlcBundlesDir))
@@ -2398,11 +2469,23 @@ func main() {
 		}
 	}
 
+	// ── load extra commands (orchestrator only) ───────────────────────────
+	var extraCmds []CommandSpec
+	if *extraCommands {
+		allBuiltin := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(*profileStr, from, to)...)
+		extraCmds = loadExtraCommands(allBuiltin)
+		if len(extraCmds) > 0 {
+			logf("Extra commands: %d loaded from %s", len(extraCmds), extraCommandsFile)
+		} else {
+			logf("Extra commands: none to run (file empty or all duplicates)")
+		}
+	}
+
 	// ── single local collection ───────────────────────────────────────────
 	if *localOnly {
 		localStart := time.Now()
 		phase("Local collection")
-		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, containerNames, nil)
+		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, containerNames, nil, extraCmds)
 		if !toStdout {
 			elapsed := time.Since(localStart).Round(time.Second)
 			logf("Collection complete → %s  (took %s)", outPath, elapsed)
@@ -2444,7 +2527,7 @@ func main() {
 			if err != nil {
 				warnf("Could not discover cluster hosts: %v", err)
 				warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
-				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, containerNames, nil)
+				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, containerNames, nil, extraCmds)
 				if *upload && !toStdout {
 					if err := uploadBundle(outPath, 0); err != nil {
 						errorf("Upload failed: %v", err)
@@ -2596,7 +2679,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			logf("  [local] collecting (cluster-wide commands + node-local data)...")
-			writeArchive(outPath, false, *profileStr, from, to, *cmdTimeout, false, containerNames, nil)
+			writeArchive(outPath, false, *profileStr, from, to, *cmdTimeout, false, containerNames, nil, extraCmds)
 			logf("  [local] uploading to Weka Home...")
 			err := uploadBundle(outPath, sharedSessionID)
 			if err == nil {
@@ -2774,7 +2857,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 }
 
 // writeArchive performs a local collection and writes to outPath (or stdout).
-func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraManifests []HostManifest) {
+func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraManifests []HostManifest, extraCmds []CommandSpec) {
 	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
@@ -2804,7 +2887,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	}
 	tw := tar.NewWriter(gz)
 
-	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, nodeOnly, containerNames)
+	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, nodeOnly, containerNames, extraCmds)
 
 	// Write manifest
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
@@ -3018,9 +3101,9 @@ OPTIONS
   --clients            Include client nodes (default: backends only)
   --clients-only       Client nodes only; skip backends
   --local              This host only; no SSH
-  --dry-run            Show what would be collected; do not collect
   --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
+  --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
