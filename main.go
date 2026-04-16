@@ -42,6 +42,7 @@ const version = "0.1.0"
 const (
 	wlcBaseDir    = "/opt/weka/weka-log-collector"
 	wlcBundlesDir = wlcBaseDir + "/bundles"
+	wlcLogsDir    = wlcBaseDir + "/logs"
 )
 
 // ── time parsing ─────────────────────────────────────────────────────────────
@@ -2389,6 +2390,28 @@ func handleCleanBundles() {
 		} else {
 			fmt.Printf("  removed %s/ (%d MB)\n", de.Name(), sz/(1024*1024))
 		}
+	}
+
+	// Also clean debug log files from the logs/ directory.
+	logEntries, err := os.ReadDir(wlcLogsDir)
+	if err != nil && !os.IsNotExist(err) {
+		errorf("Cannot read %s: %v", wlcLogsDir, err)
+		return
+	}
+	var logCount int
+	for _, e := range logEntries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		path := filepath.Join(wlcLogsDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			errorf("  failed to remove log %s: %v", e.Name(), err)
+		} else {
+			logCount++
+		}
+	}
+	if logCount > 0 {
+		fmt.Printf("Removed %d debug log(s) from %s\n", logCount, wlcLogsDir)
 	}
 }
 
