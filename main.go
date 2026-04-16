@@ -1963,7 +1963,7 @@ func validateUploadFile(path string) (string, error) {
 	}
 	// Extension allowlist.
 	name := fi.Name()
-	allowed_exts := []string{".tar.gz", ".log", ".txt", ".json"}
+	allowed_exts := []string{".tar.gz", ".log", ".txt", ".json", ".out"}
 	ok := false
 	for _, ext := range allowed_exts {
 		if strings.HasSuffix(name, ext) {
@@ -2479,7 +2479,7 @@ func main() {
 		listBundles     = flag.Bool("list-bundles", false, fmt.Sprintf("List bundles in %s", wlcBundlesDir))
 		rmBundle        = flag.String("rm-bundle", "", fmt.Sprintf("Remove a specific bundle from %s (filename or full path)", wlcBundlesDir))
 		cleanBundles    = flag.Bool("clean-bundles", false, fmt.Sprintf("Remove all bundles from %s", wlcBundlesDir))
-		uploadFile      = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.log/.txt/.json)", wlcBaseDir))
+		uploadFile      = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.log/.txt/.json/.out)", wlcBaseDir))
 		uploadSessionID = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
 	)
 	var hosts multiStringFlag
@@ -3359,7 +3359,7 @@ OPTIONS
   --local              This host only; no SSH
   --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
-  --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.log/.txt/.json)
+  --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
   --verbose            Detailed per-file/command progress
