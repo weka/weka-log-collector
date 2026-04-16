@@ -2169,6 +2169,101 @@ func (f *multiIntFlag) Set(v string) error {
 	return nil
 }
 
+// ── bundle management ─────────────────────────────────────────────────────────
+
+func listBundleEntries() ([]os.FileInfo, error) {
+	entries, err := os.ReadDir(wlcBundlesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var infos []os.FileInfo
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
+			continue
+		}
+		info, err := e.Info()
+		if err == nil {
+			infos = append(infos, info)
+		}
+	}
+	return infos, nil
+}
+
+func handleListBundles() {
+	infos, err := listBundleEntries()
+	if err != nil {
+		errorf("Cannot read %s: %v", wlcBundlesDir, err)
+		os.Exit(1)
+	}
+	if len(infos) == 0 {
+		fmt.Printf("No bundles in %s\n", wlcBundlesDir)
+		return
+	}
+	var totalBytes int64
+	fmt.Printf("Bundles in %s:\n", wlcBundlesDir)
+	for _, fi := range infos {
+		totalBytes += fi.Size()
+		fmt.Printf("  %-60s  %6d MB   %s\n",
+			fi.Name(),
+			fi.Size()/(1024*1024),
+			fi.ModTime().Format("2006-01-02 15:04"),
+		)
+	}
+	fmt.Printf("  Total: %d bundle(s), %d MB\n", len(infos), totalBytes/(1024*1024))
+}
+
+func handleRmBundle(name string) {
+	// Accept bare filename or full path; always resolve under wlcBundlesDir.
+	target := name
+	if !strings.Contains(name, "/") {
+		target = filepath.Join(wlcBundlesDir, name)
+	}
+	// Safety: must be inside wlcBundlesDir.
+	if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(wlcBundlesDir)+"/") {
+		errorf("Path %s is outside %s — refusing to remove", target, wlcBundlesDir)
+		os.Exit(1)
+	}
+	fi, err := os.Stat(target)
+	if err != nil {
+		errorf("Bundle not found: %s", target)
+		os.Exit(1)
+	}
+	if err := os.Remove(target); err != nil {
+		errorf("Failed to remove %s: %v", target, err)
+		os.Exit(1)
+	}
+	fmt.Printf("Removed %s (%d MB)\n", filepath.Base(target), fi.Size()/(1024*1024))
+}
+
+func handleCleanBundles() {
+	infos, err := listBundleEntries()
+	if err != nil {
+		errorf("Cannot read %s: %v", wlcBundlesDir, err)
+		os.Exit(1)
+	}
+	if len(infos) == 0 {
+		fmt.Printf("No bundles in %s\n", wlcBundlesDir)
+		return
+	}
+	var totalBytes int64
+	for _, fi := range infos {
+		totalBytes += fi.Size()
+	}
+	fmt.Printf("Removing %d bundle(s) from %s (%d MB total)...\n",
+		len(infos), wlcBundlesDir, totalBytes/(1024*1024))
+	for _, fi := range infos {
+		path := filepath.Join(wlcBundlesDir, fi.Name())
+		if err := os.Remove(path); err != nil {
+			errorf("  failed to remove %s: %v", fi.Name(), err)
+		} else {
+			fmt.Printf("  removed %s (%d MB)\n", fi.Name(), fi.Size()/(1024*1024))
+		}
+	}
+}
+
 func main() {
 	var (
 		startTimeStr    = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
@@ -2187,6 +2282,9 @@ func main() {
 		cmdTimeout      = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
 		ver             = flag.Bool("version", false, "Print version and exit")
 		completion      = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
+		listBundles     = flag.Bool("list-bundles", false, fmt.Sprintf("List bundles in %s", wlcBundlesDir))
+		rmBundle        = flag.String("rm-bundle", "", fmt.Sprintf("Remove a specific bundle from %s (filename or full path)", wlcBundlesDir))
+		cleanBundles    = flag.Bool("clean-bundles", false, fmt.Sprintf("Remove all bundles from %s", wlcBundlesDir))
 		uploadSessionID = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
 	)
 	var hosts multiStringFlag
@@ -2221,6 +2319,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Completion installed to %s — active in new sessions\n", sysComp)
 			fmt.Fprintln(os.Stderr, "For this session: source <(./weka-log-collector --completion)")
 		}
+		return
+	}
+
+	if *listBundles {
+		handleListBundles()
+		return
+	}
+
+	if *rmBundle != "" {
+		handleRmBundle(*rmBundle)
+		return
+	}
+
+	if *cleanBundles {
+		handleCleanBundles()
 		return
 	}
 
