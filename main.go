@@ -2071,7 +2071,8 @@ _weka_log_collector() {
     opts="--local --upload --clients --clients-only --dry-run --verbose --version
           --start-time --end-time --profile --output --host --container-id
           --max-size --ssh-user --workers --cmd-timeout
-          --no-self-deploy --remote-binary"
+          --no-self-deploy --remote-binary
+          --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
         --profile)
@@ -3190,7 +3191,7 @@ OPTIONS
   --clients-only       Client nodes only; skip backends
   --local              This host only; no SSH
   --dry-run            Show what would be collected; do not collect
-  --output PATH        Archive path (default: /tmp/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
+  --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
   --max-size SIZE      Abort if estimated size exceeds this (default: 5GB; accepts MB/GB e.g. 2048, 10GB)
   --ssh-user USER      SSH user (default: root)
@@ -3200,6 +3201,11 @@ OPTIONS
   --remote-binary PATH Binary path on remote hosts (default: /opt/weka/weka-log-collector/weka-log-collector)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
+
+BUNDLE MANAGEMENT
+  --list-bundles       List bundles in /opt/weka/weka-log-collector/bundles
+  --rm-bundle NAME     Remove a specific bundle (filename or full path)
+  --clean-bundles      Remove all bundles
 
 EXAMPLES
   # Last 2 hours from all cluster nodes
