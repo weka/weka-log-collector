@@ -84,9 +84,9 @@ func baseWithoutRotation(name string) string {
 //   - content_start > to  (file started accumulating after window ended)
 //
 // Active (non-rotated) files are always kept — their content range is unknown.
-func filterByTimeWindow(paths []string, from, to time.Time) []string {
+func filterByTimeWindow(paths []string, from, to time.Time) ([]string, int) {
 	if from.IsZero() && to.IsZero() {
-		return paths
+		return paths, 0
 	}
 
 	type entry struct {
@@ -118,6 +118,7 @@ func filterByTimeWindow(paths []string, from, to time.Time) []string {
 	}
 
 	var result []string
+	var skipped int
 	for _, k := range order {
 		files := families[k]
 		// Sort oldest-first by mtime so adjacent pairs give content ranges.
@@ -137,8 +138,7 @@ func filterByTimeWindow(paths []string, from, to time.Time) []string {
 			// contain entries in our window — skip it.
 			if !f.rotated {
 				if !from.IsZero() && f.mtime.Before(from) {
-					vlogf("  time-filter SKIP %s: mtime %s before window start %s",
-						f.path, f.mtime.Format(time.RFC3339), from.Format(time.RFC3339))
+					skipped++
 					continue
 				}
 				result = append(result, f.path)
@@ -152,20 +152,18 @@ func filterByTimeWindow(paths []string, from, to time.Time) []string {
 			}
 			// Skip: content ended before our window started.
 			if !from.IsZero() && contentEnd.Before(from) {
-				vlogf("  time-filter SKIP %s: content ends %s before window start %s",
-					f.path, contentEnd.Format(time.RFC3339), from.Format(time.RFC3339))
+				skipped++
 				continue
 			}
 			// Skip: content started after our window ended.
 			if !to.IsZero() && !contentStart.IsZero() && contentStart.After(to) {
-				vlogf("  time-filter SKIP %s: content starts %s after window end %s",
-					f.path, contentStart.Format(time.RFC3339), to.Format(time.RFC3339))
+				skipped++
 				continue
 			}
 			result = append(result, f.path)
 		}
 	}
-	return result
+	return result, skipped
 }
 
 func parseInputTime(s string) (time.Time, error) {
@@ -1157,15 +1155,19 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 
 	// Filter to the commands we'll actually run on this node before parallelising.
 	var wekaToRun []CommandSpec
+	var skippedClusterCmds int
 	for _, spec := range allWekaCmds {
 		if !wekaAvailable {
 			break
 		}
 		if nodeOnly && !spec.NodeLocal {
-			vlogf("  [%s] skipping cluster-wide command %s (--node-only)", hostname, spec.Name)
+			skippedClusterCmds++
 			continue
 		}
 		wekaToRun = append(wekaToRun, spec)
+	}
+	if skippedClusterCmds > 0 {
+		vlogf("  [%s] skipping %d cluster-wide commands (--node-only)", hostname, skippedClusterCmds)
 	}
 	if wekaAvailable {
 		logf("  [%s] running %d weka commands", hostname, len(wekaToRun))
@@ -1298,10 +1300,14 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			vlogf("[%s] no files match %s", hostname, spec.SrcGlob)
 			continue
 		}
-		matches = filterByTimeWindow(matches, from, to)
+		var skipped int
+		matches, skipped = filterByTimeWindow(matches, from, to)
 		if len(matches) == 0 {
-			vlogf("[%s] no files in time window for %s", hostname, spec.SrcGlob)
+			vlogf("[%s] no files in time window for %s (%d skipped)", hostname, spec.SrcGlob, skipped)
 			continue
+		}
+		if skipped > 0 {
+			vlogf("[%s] %s: %d file(s) skipped (outside time window)", hostname, spec.SrcGlob, skipped)
 		}
 		for _, srcPath := range matches {
 			if seenSrcPaths[srcPath] {
