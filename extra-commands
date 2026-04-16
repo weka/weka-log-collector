@@ -8,14 +8,15 @@
 # Output is saved under cluster/extra/ in the archive.
 #
 # BLOCKED (skipped with a warning):
-#   System:  rm, rmdir, dd, mkfs, mkfs.*, shred, wipefs, fdisk, parted, gdisk,
-#            sgdisk, reboot, shutdown, halt, poweroff
-#   Weka:    weka cluster stop-io/start-io/update/reset,
-#            weka cluster container/host/drive stop/deactivate/restart/remove,
-#            weka local stop/restart/reset,
-#            weka container stop/deactivate/restart, weka host/drive deactivate,
-#            weka drive remove, weka fs/fs-group/org/user delete,
-#            weka security, weka smb cluster destroy
+#   System:    rm, rmdir, dd, mkfs, mkfs.*, shred, wipefs, fdisk, parted, gdisk,
+#              sgdisk, reboot, shutdown, halt, poweroff
+#   Weka:      weka cluster stop-io/start-io/update,
+#              weka cluster container deactivate/remove/requested-action,
+#              weka cluster drive deactivate/remove,
+#              weka local stop/restart/reset-data,
+#              weka fs remove, weka fs group remove,
+#              weka org remove, weka user remove,
+#              weka security, weka smb cluster destroy, weka agent uninstall
 #   systemctl: stop, start, restart, disable, enable, mask, daemon-reload
 #
 # Examples:
