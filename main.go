@@ -2151,6 +2151,13 @@ func main() {
 
 	if *completion {
 		os.Stdout.WriteString(bashCompletionScript) //nolint
+		// Also install to /etc/bash_completion.d/ so future sessions load it
+		// automatically without needing to re-source.
+		const sysComp = "/etc/bash_completion.d/weka-log-collector"
+		if err := os.WriteFile(sysComp, []byte(bashCompletionScript), 0644); err == nil {
+			fmt.Fprintf(os.Stderr, "Completion installed to %s — active in new sessions\n", sysComp)
+			fmt.Fprintln(os.Stderr, "For this session: source <(./weka-log-collector --completion)")
+		}
 		return
 	}
 
