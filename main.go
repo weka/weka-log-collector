@@ -114,8 +114,22 @@ func filterByTimeWindow(paths []string, from, to time.Time) []string {
 			return files[i].mtime.Before(files[j].mtime)
 		})
 		for i, f := range files {
-			// Can't stat or not rotated → always include.
-			if f.statErr || !f.rotated {
+			if f.statErr {
+				result = append(result, f.path)
+				continue
+			}
+			// Non-rotated files (active logs) are usually always included because
+			// their mtime is "now" and content range is unknown. However, some
+			// files embed a timestamp in their base name (e.g. build-20241220T234445.log)
+			// and are one-off historical files, not continuously-written active logs.
+			// If a non-rotated file's mtime is before the window start, it cannot
+			// contain entries in our window — skip it.
+			if !f.rotated {
+				if !from.IsZero() && f.mtime.Before(from) {
+					vlogf("  time-filter SKIP %s: mtime %s before window start %s",
+						f.path, f.mtime.Format(time.RFC3339), from.Format(time.RFC3339))
+					continue
+				}
 				result = append(result, f.path)
 				continue
 			}
