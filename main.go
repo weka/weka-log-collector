@@ -2536,7 +2536,10 @@ func main() {
 	// starts. Default path is wlcBundlesDir; if --output was explicitly set,
 	// check that path's filesystem (upload mode writes per-node bundles there).
 	{
-		remoteSpaceCheckPath := wlcBundlesDir
+		// Default: always check /opt/weka — present on every Weka node and the
+		// filesystem that matters for bundle storage. Custom --output: check
+		// the specified path's filesystem directly (walk up if not yet created).
+		remoteSpaceCheckPath := "/opt/weka"
 		if *outputPath != "" {
 			remoteSpaceCheckPath = filepath.Dir(outPath)
 		}
