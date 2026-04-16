@@ -40,9 +40,10 @@ const version = "0.1.0"
 //   - per-run debug logs  (logs/ subdirectory)
 //   - self-deployed binary
 const (
-	wlcBaseDir    = "/opt/weka/weka-log-collector"
-	wlcBundlesDir = wlcBaseDir + "/bundles"
-	wlcLogsDir    = wlcBaseDir + "/logs"
+	wlcBaseDir        = "/opt/weka/weka-log-collector"
+	wlcBundlesDir     = wlcBaseDir + "/bundles"
+	wlcLogsDir        = wlcBaseDir + "/logs"
+	uploadFileMaxSize = 50 * 1024 * 1024 // 50 MB
 )
 
 // ── time parsing ─────────────────────────────────────────────────────────────
@@ -1929,6 +1930,53 @@ func cleanStaleSymlinks(supportDir string) {
 // each file to Weka Home. If a container's uploader is in FAILURE state (as
 // shown by 'weka cloud status') it will not respond; we try each available
 // container in sequence, moving on after a per-dir timeout.
+// validateUploadFile checks that path is safe to upload:
+//   - resolves to an absolute path under wlcBaseDir
+//   - is a regular file (not a symlink or directory)
+//   - does not exceed uploadFileMaxSize (50 MB)
+//   - has an allowed extension (.tar.gz, .log, .txt, .json)
+func validateUploadFile(path string) (string, error) {
+	// Accept bare filename — resolve relative to wlcBaseDir.
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(wlcBaseDir, path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve path: %w", err)
+	}
+	// Hard path restriction: must be inside wlcBaseDir.
+	allowed := filepath.Clean(wlcBaseDir) + "/"
+	if !strings.HasPrefix(filepath.Clean(abs)+"/", allowed) {
+		return "", fmt.Errorf("file must be under %s (got %s)", wlcBaseDir, abs)
+	}
+	// Must be a regular file.
+	fi, err := os.Lstat(abs)
+	if err != nil {
+		return "", fmt.Errorf("file not found: %s", abs)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", abs)
+	}
+	// Size check.
+	if fi.Size() > uploadFileMaxSize {
+		return "", fmt.Errorf("file is %d MB, exceeds the %d MB limit", fi.Size()/(1024*1024), uploadFileMaxSize/(1024*1024))
+	}
+	// Extension allowlist.
+	name := fi.Name()
+	allowed_exts := []string{".tar.gz", ".log", ".txt", ".json"}
+	ok := false
+	for _, ext := range allowed_exts {
+		if strings.HasSuffix(name, ext) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return "", fmt.Errorf("file extension not allowed (must be one of: %s)", strings.Join(allowed_exts, ", "))
+	}
+	return abs, nil
+}
+
 func uploadBundle(archivePath string, sessionID int64) error {
 	phase("Uploading to Weka Home")
 
@@ -2119,7 +2167,7 @@ _weka_log_collector() {
 
     profiles="default perf nfs s3 smbw all"
 
-    opts="--local --upload --clients --clients-only --verbose --version
+    opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
           --extra-commands --cmd-timeout
           --list-bundles --rm-bundle --clean-bundles"
@@ -2431,6 +2479,7 @@ func main() {
 		listBundles     = flag.Bool("list-bundles", false, fmt.Sprintf("List bundles in %s", wlcBundlesDir))
 		rmBundle        = flag.String("rm-bundle", "", fmt.Sprintf("Remove a specific bundle from %s (filename or full path)", wlcBundlesDir))
 		cleanBundles    = flag.Bool("clean-bundles", false, fmt.Sprintf("Remove all bundles from %s", wlcBundlesDir))
+		uploadFile      = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.log/.txt/.json)", wlcBaseDir))
 		uploadSessionID = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
 	)
 	var hosts multiStringFlag
@@ -2480,6 +2529,19 @@ func main() {
 
 	if *cleanBundles {
 		handleCleanBundles()
+		return
+	}
+
+	if *uploadFile != "" {
+		abs, err := validateUploadFile(*uploadFile)
+		if err != nil {
+			errorf("--upload-file: %v", err)
+			os.Exit(1)
+		}
+		if err := uploadBundle(abs, 0); err != nil {
+			errorf("Upload failed: %v", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -3297,6 +3359,7 @@ OPTIONS
   --local              This host only; no SSH
   --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
+  --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.log/.txt/.json)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
   --verbose            Detailed per-file/command progress
