@@ -634,11 +634,15 @@ func checkDiskSpace(path string) (diskInfo, error) {
 
 // checkRemoteDiskSpace SSHes to sshTarget and returns available space on the
 // filesystem containing path, walking up to an existing ancestor if needed.
+// Path in the returned diskInfo is the ancestor that was actually checked
+// (not the df mount point), so the caller can display a meaningful location.
 func checkRemoteDiskSpace(sshTarget, path string) (diskInfo, error) {
-	// Walk up to an existing ancestor, then run df -m.
-	// awk 'END{...}' handles long filesystem names that wrap to a second df line.
+	// Walk up to an existing ancestor, run df -m, then echo available + the
+	// resolved path. Reporting the resolved path (not the df "Mounted on"
+	// column) keeps the display consistent whether or not the directory exists
+	// yet: it shows where we checked, not the underlying mount root.
 	cmd := fmt.Sprintf(
-		`p=%s; while [ ! -e "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done; df -m "$p" | awk 'END{print $(NF-2), $NF}'`,
+		`p=%s; while [ ! -e "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done; avail=$(df -m "$p" | awk 'END{print $(NF-2)}'); echo "$avail $p"`,
 		path,
 	)
 	args := append(sshArgs(), sshTarget, cmd)
