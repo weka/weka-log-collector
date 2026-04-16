@@ -1977,7 +1977,7 @@ _weka_log_collector() {
 
     opts="--local --upload --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --workers --cmd-timeout
+          --cmd-timeout
           --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
@@ -2180,7 +2180,6 @@ func main() {
 		localOnly       = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
 		nodeOnly        = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		upload          = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
-		workerCount     = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
 		cmdTimeout      = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
 		ver             = flag.Bool("version", false, "Print version and exit")
 		completion      = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
@@ -2622,7 +2621,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, *workerCount, containerNames, sharedSessionID)
+				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames, sharedSessionID)
 				mu.Lock()
 				for _, r := range remoteResults {
 					display := nodeDisplayMap[r.Host]
@@ -2659,7 +2658,7 @@ func main() {
 
 	// Non-upload path: collect all nodes, merge into single central archive.
 	phase("Collecting from cluster hosts")
-	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, *workerCount, containerNames)
+	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames)
 	phase("Writing archive")
 	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart)
 }
@@ -3022,7 +3021,6 @@ OPTIONS
   --dry-run            Show what would be collected; do not collect
   --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
-  --workers N          Parallel SSH workers (default: 10)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
