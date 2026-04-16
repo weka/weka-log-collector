@@ -9,5 +9,4 @@
 #
 # Examples:
 # /weka/reader/histogram --slot 0
-# weka debug jrpc --op getFSInfo
 # cat /proc/meminfo
