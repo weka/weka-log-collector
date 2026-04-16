@@ -1435,11 +1435,13 @@ func collectFromHost(host, displayName, selfPath, binaryPath, profile string, fr
 	return result
 }
 
-// clusterNode represents a Weka cluster container with its numeric ID, primary IP, mode, and hostname.
+// clusterNode represents a physical host in the Weka cluster.
+// IDs holds all container IDs running on this host; ID is the representative (lowest) one.
 type clusterNode struct {
 	ID       int
+	IDs      []int
 	IP       string
-	Mode     string // "backend", "client", "nfs", "smb", "s3"
+	Mode     string // "backend", "client"
 	Hostname string
 }
 
@@ -1451,88 +1453,125 @@ func nodeDisplay(n clusterNode) string {
 	return n.IP
 }
 
-// discoverClusterNodes returns cluster containers with their IDs, IPs, and modes.
-// Uses `weka cluster container --output id,ips,mode` — node IPs avoid hostname-resolution failures.
-// If includeClients is true, client-mode containers are included alongside backends.
+// discoverClusterNodes discovers Weka cluster hosts by issuing four separate
+// clean 2-field queries (id,ips  id,hostname  id,status  id,mode), joining
+// the results by container ID, aggregating containers per hostname, and
+// filtering to hosts that have at least one UP container.
+//
+// Using separate queries avoids the parsing ambiguity in --output id,ips,mode
+// where Weka formats multi-IP HA addresses as "172.x.x.x, 172.x.x.x" (space
+// after comma), causing fields to be misaligned.  It also avoids silently
+// dropping standard container modes (drives, compute, frontend) that the old
+// code did not recognise.
+//
+// If includeClients is true, client-mode hosts are included alongside backends.
 func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
-	out, err := exec.Command("weka", "cluster", "container",
-		"--no-header", "--output", "id,ips,mode").Output()
-	if err != nil {
-		// Fallback for older Weka versions without the mode column
-		out2, err2 := exec.Command("weka", "cluster", "container",
-			"--no-header", "--output", "id,ips").Output()
-		if err2 != nil {
-			return nil, fmt.Errorf("weka cluster container list failed: %v; fallback also failed: %v", err, err2)
-		}
-		out = out2
-	}
-	seenIP := map[string]bool{}
-	var nodes []clusterNode
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		id, err := strconv.Atoi(fields[0])
+	// Helper: run a 2-field query and return map[containerID]value.
+	query2 := func(col string) (map[int]string, error) {
+		out, err := exec.Command("weka", "cluster", "container",
+			"--no-header", "--output", "id,"+col).Output()
 		if err != nil {
-			continue // skip unparseable lines
+			return nil, err
 		}
-		// The IPs column may contain multiple comma-separated addresses. When
-		// Weka formats them with a space after the comma (e.g. "172.25.7.145,
-		// 172.25.8.145"), strings.Fields splits them across multiple fields.
-		// Detect the mode by checking whether the last field is a known mode
-		// keyword; everything between fields[1] and that boundary is IPs.
-		mode := "backend"
-		ipEnd := len(fields)
-		if last := strings.ToLower(fields[len(fields)-1]); last == "backend" || last == "client" {
-			mode = last
-			ipEnd = len(fields) - 1
-		}
-		// Join all IP fields (handles space-after-comma split) then take first IP.
-		ipStr := strings.Join(fields[1:ipEnd], "")
-		ip := strings.SplitN(ipStr, ",", 2)[0]
-		ip = strings.TrimRight(ip, ",")
-		if ip == "" || seenIP[ip] {
-			continue
-		}
-		isBackend := mode == "backend"
-		isClient := mode == "client"
-		if !isBackend && !(includeClients && isClient) {
-			continue
-		}
-		seenIP[ip] = true
-		nodes = append(nodes, clusterNode{ID: id, IP: ip, Mode: mode})
-	}
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].IP < nodes[j].IP })
-
-	// Enrich with hostnames via a separate clean 2-field query (best-effort).
-	if hout, err := exec.Command("weka", "cluster", "container",
-		"--no-header", "--output", "id,hostname").Output(); err == nil {
-		idToHost := map[int]string{}
-		for _, line := range strings.Split(string(hout), "\n") {
+		m := map[int]string{}
+		for _, line := range strings.Split(string(out), "\n") {
 			fields := strings.Fields(strings.TrimSpace(line))
 			if len(fields) < 2 {
 				continue
 			}
-			if id, err := strconv.Atoi(fields[0]); err == nil {
-				idToHost[id] = fields[1]
+			id, err := strconv.Atoi(fields[0])
+			if err != nil {
+				continue
 			}
+			m[id] = fields[1]
 		}
-		for i := range nodes {
-			if h, ok := idToHost[nodes[i].ID]; ok {
-				nodes[i].Hostname = h
-			}
+		return m, nil
+	}
+
+	// id,ips: first IP for each container (take everything up to first comma).
+	ipsOut, err := query2("ips")
+	if err != nil {
+		return nil, fmt.Errorf("weka cluster container list failed: %v", err)
+	}
+	hostOut, _ := query2("hostname") // best-effort
+	statusOut, _ := query2("status") // best-effort; missing → treated as UP
+	modeOut, _ := query2("mode")     // best-effort; missing → treated as backend
+
+	// Normalise IPs: strip trailing comma/space artifacts from multi-IP columns.
+	for id, v := range ipsOut {
+		ipsOut[id] = strings.SplitN(strings.TrimRight(v, ", "), ",", 2)[0]
+	}
+
+	// Collect all container IDs so we can iterate deterministically.
+	var allIDs []int
+	for id := range ipsOut {
+		allIDs = append(allIDs, id)
+	}
+	sort.Ints(allIDs)
+
+	// Aggregate containers per hostname (fall back to IP when hostname unknown).
+	type hostEntry struct {
+		ip       string
+		hostname string
+		ids      []int
+		hasUp    bool
+		isClient bool
+	}
+	byHost := map[string]*hostEntry{} // keyed by hostname (or IP)
+	for _, id := range allIDs {
+		ip := ipsOut[id]
+		if ip == "" {
+			continue
+		}
+		hostname := hostOut[id] // may be ""
+		key := hostname
+		if key == "" {
+			key = ip
+		}
+		e, ok := byHost[key]
+		if !ok {
+			e = &hostEntry{ip: ip, hostname: hostname}
+			byHost[key] = e
+		}
+		e.ids = append(e.ids, id)
+		if strings.ToUpper(statusOut[id]) == "UP" {
+			e.hasUp = true
+		}
+		m := strings.ToLower(modeOut[id])
+		if m == "client" {
+			e.isClient = true
 		}
 	}
 
+	// Build clusterNode list, filtered by UP status and mode.
+	var nodes []clusterNode
+	for _, e := range byHost {
+		if !e.hasUp {
+			continue // skip hosts with no UP containers (dead / repurposed nodes)
+		}
+		mode := "backend"
+		if e.isClient {
+			mode = "client"
+		}
+		if mode == "client" && !includeClients {
+			continue
+		}
+		sort.Ints(e.ids)
+		nodes = append(nodes, clusterNode{
+			ID:       e.ids[0],
+			IDs:      e.ids,
+			IP:       e.ip,
+			Mode:     mode,
+			Hostname: e.hostname,
+		})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].IP < nodes[j].IP })
 	return nodes, nil
 }
 
-// filterNodesByContainerID returns only the nodes whose IDs are in the given set.
+// filterNodesByContainerID returns only nodes that have at least one container
+// ID in the given set. A node may host multiple containers (drives0, compute0,
+// frontend0 …); any matching ID is sufficient to select the host.
 // If ids is empty, all nodes are returned unchanged.
 func filterNodesByContainerID(nodes []clusterNode, ids []int) []clusterNode {
 	if len(ids) == 0 {
@@ -1544,8 +1583,11 @@ func filterNodesByContainerID(nodes []clusterNode, ids []int) []clusterNode {
 	}
 	var out []clusterNode
 	for _, n := range nodes {
-		if idSet[n.ID] {
-			out = append(out, n)
+		for _, id := range n.IDs {
+			if idSet[id] {
+				out = append(out, n)
+				break
+			}
 		}
 	}
 	return out
