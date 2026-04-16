@@ -17,7 +17,7 @@ For most support cases, `weka diags` is your starting point. This tool is a comp
 - **Container-scoped collection** — target specific nodes by their Weka container ID (`--container-id`)
 - **IP-based node discovery** — uses node IPs directly, no DNS required
 - **Space-safe** — checks available disk before writing; aborts with a clear error if space is insufficient
-- **No upload** — produces a local `.tar.gz` you control; stream to stdout with `--output -` if needed
+- **Upload to Weka Home** — use `--upload` to send the archive directly to Weka Home via the node's uploader daemon; or use `--output -` to stream to stdout
 
 ---
 
@@ -64,14 +64,15 @@ Flags:
   --end-time           End of time window (default: now)
   --output             Output .tar.gz path (default: /tmp/<cluster>-weka-logs-<ts>.tar.gz). Use - for stdout.
   --host               Collect from this host by IP (repeatable; default: all cluster backends)
-  --container-id       Collect from this container ID only (repeatable; e.g. --container-id 0 --container-id 2)
+  --container-id       Collect from specific container IDs (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)
+  --upload             Upload collected archive to Weka Home (requires 'weka cloud enable')
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
   --no-self-deploy     Skip auto-deployment; use --remote-binary path on remote hosts instead
-  --remote-binary      Path to binary on remote hosts when using --no-self-deploy (default: /tmp/weka-log-collector)
+  --remote-binary      Path to binary on remote hosts when using --no-self-deploy (default: /opt/weka/tools/weka-log-collector)
   --ssh-user           SSH user for remote collection (default: root)
   --workers            Max parallel SSH workers (default: 10)
-  --max-size           Abort if estimated size exceeds this MB (default: 10000)
+  --max-size           Abort if estimated collection size exceeds this (default: 5GB; e.g. 2048, 2048MB, 10GB)
   --cmd-timeout        Timeout per command (default: 120s)
   --dry-run            Show what would be collected without collecting
   --verbose            Print detailed progress for every file and command
@@ -87,8 +88,11 @@ weka-log-collector --local --profile s3 --start-time -4h
 # Entire cluster, full profile
 weka-log-collector --profile full
 
-# Specific container IDs (as shown in 'weka cluster container')
-weka-log-collector --container-id 0 --container-id 1 --start-time -2h
+# Specific container IDs (comma-separated or repeatable)
+weka-log-collector --container-id 36,171 --start-time -2h
+
+# Upload to Weka Home after collecting
+weka-log-collector --start-time -2h --upload
 
 # Backends and clients
 weka-log-collector --clients --start-time -2h
@@ -155,7 +159,7 @@ The default settings are tuned for small-to-medium clusters. For large clusters:
 
 - **Always use `--start-time`** — without a time window, log collection per node can be very large. A 2–4 hour window is recommended for incident collection.
 - **Set `--output` to a filesystem with enough space** — the default `/tmp` is often small. Use `/opt/weka/` or a dedicated data volume. A 180-node cluster with a 2-hour window typically produces 5–15 GB.
-- **Raise `--max-size`** — the default 2048 MB limit will trigger on large clusters. Set it based on available space.
+- **Raise `--max-size`** — the default 5 GB limit may trigger on large clusters. Set it based on available space.
 - **Increase `--workers`** — default is 10 parallel SSH connections. For faster collection on large clusters, `--workers 30` is reasonable if the orchestrator node can handle it.
 - **Increase `--cmd-timeout`** — on busy large clusters, commands like `weka events` can take longer than the default 60s.
 
@@ -164,16 +168,41 @@ The default settings are tuned for small-to-medium clusters. For large clusters:
 weka-log-collector \
   --start-time -2h \
   --output /opt/weka/weka-logs.tar.gz \
-  --max-size 20000 \
+  --max-size 20GB \
   --workers 30 \
   --cmd-timeout 120s
 ```
 
 ---
 
+## Uploading to Weka Home
+
+Add `--upload` to any collection command to send the archive directly to Weka Home:
+
+```bash
+weka-log-collector --start-time -2h --upload
+weka-log-collector --local --upload
+```
+
+**Requirements:** `weka cloud enable` must be configured on the node. The tool uses the node's built-in uploader daemon (inotify-based) — no extra credentials needed.
+
+**How it works:**
+1. Archive is staged into an active Weka container directory (`/opt/weka/<container>/`)
+2. A symlink named `wlc:<timestamp>:<hostname>:<filename>` is created in the support upload dir
+3. The uploader daemon detects the symlink via inotify and uploads to `api.home.weka.io`
+4. Symlink is cleaned up on success
+
+> If the cluster uses **Local Weka Home (LWH)**, the tool will warn that LWH → Cloud Weka Home forwarding may not be configured.
+
+---
+
 ## Tab completion
 
-Tab completion is installed automatically the first time you run the binary (writes `/etc/bash_completion.d/weka-log-collector`). Open a new shell and completion is active — all flags, profile names, and common time values.
+```bash
+source <(./weka-log-collector --completion)
+```
+
+Add this to your `.bashrc` to make it permanent. Completes all flags, profile names, and common time values.
 
 ---
 
@@ -193,7 +222,7 @@ The log always includes verbose output (commands run, files collected/skipped, w
 
 Before writing, the tool checks:
 - At least 200 MB free on the output filesystem
-- Estimated compressed size does not exceed `--max-size` (default 2048 MB) or 80% of available space
+- Estimated compressed size does not exceed `--max-size` (default 5GB) or 80% of available space
 
 Use `--dry-run` to preview estimated size before collecting. Use `--output` to write to a different filesystem if space is tight.
 
