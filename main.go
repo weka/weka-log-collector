@@ -36,10 +36,13 @@ import (
 const version = "0.1.0"
 
 // wlcBaseDir is the unified on-node home for weka-log-collector files:
-//   - output archives (default)
+//   - output archives  (bundles/ subdirectory)
 //   - per-run debug logs  (logs/ subdirectory)
 //   - self-deployed binary
-const wlcBaseDir = "/opt/weka/weka-log-collector"
+const (
+	wlcBaseDir    = "/opt/weka/weka-log-collector"
+	wlcBundlesDir = wlcBaseDir + "/bundles"
+)
 
 // ── time parsing ─────────────────────────────────────────────────────────────
 
@@ -2142,7 +2145,7 @@ func main() {
 		startTimeStr    = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
 		endTimeStr      = flag.String("end-time", "", "End of time window (default: now)")
 		profileStr      = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
-		outputPath      = flag.String("output", "", "Output .tar.gz path (default: /opt/weka/weka-log-collector/<name>-weka-logs-<ts>.tar.gz). Use - for stdout.")
+		outputPath      = flag.String("output", "", "Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<name>-weka-logs-<ts>.tar.gz). Use - for stdout.")
 		localOnly       = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
 		nodeOnly        = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		upload          = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
@@ -2262,8 +2265,8 @@ func main() {
 		ts := time.Now().Format("2006-01-02T15-04-05")
 		archiveName := fmt.Sprintf("%s-weka-logs-%s.tar.gz", clusterName, ts)
 		if outPath == "" {
-			_ = os.MkdirAll(wlcBaseDir, 0755)
-			outPath = filepath.Join(wlcBaseDir, archiveName)
+			_ = os.MkdirAll(wlcBundlesDir, 0755)
+			outPath = filepath.Join(wlcBundlesDir, archiveName)
 		} else if info, err := os.Stat(outPath); err == nil && info.IsDir() {
 			// User gave a directory — place the archive inside it
 			outPath = filepath.Join(outPath, archiveName)
