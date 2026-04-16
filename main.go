@@ -2169,27 +2169,80 @@ func listBundleEntries() ([]os.FileInfo, error) {
 	return infos, nil
 }
 
+// listExtractedDirs returns subdirectories in wlcBundlesDir (extracted bundles).
+func listExtractedDirs() ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(wlcBundlesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var dirs []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e)
+		}
+	}
+	return dirs, nil
+}
+
+// dirSize returns the total size of all files under path.
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.Walk(path, func(_ string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() {
+			total += fi.Size()
+		}
+		return nil
+	})
+	return total
+}
+
 func handleListBundles() {
 	infos, err := listBundleEntries()
 	if err != nil {
 		errorf("Cannot read %s: %v", wlcBundlesDir, err)
 		os.Exit(1)
 	}
-	if len(infos) == 0 {
+	dirs, err := listExtractedDirs()
+	if err != nil {
+		errorf("Cannot read %s: %v", wlcBundlesDir, err)
+		os.Exit(1)
+	}
+	if len(infos) == 0 && len(dirs) == 0 {
 		fmt.Printf("No bundles in %s\n", wlcBundlesDir)
 		return
 	}
 	var totalBytes int64
+	var totalCount int
 	fmt.Printf("Bundles in %s:\n", wlcBundlesDir)
 	for _, fi := range infos {
 		totalBytes += fi.Size()
+		totalCount++
 		fmt.Printf("  %-60s  %6d MB   %s\n",
 			fi.Name(),
 			fi.Size()/(1024*1024),
 			fi.ModTime().Format("2006-01-02 15:04"),
 		)
 	}
-	fmt.Printf("  Total: %d bundle(s), %d MB\n", len(infos), totalBytes/(1024*1024))
+	for _, de := range dirs {
+		path := filepath.Join(wlcBundlesDir, de.Name())
+		sz := dirSize(path)
+		totalBytes += sz
+		totalCount++
+		info, _ := de.Info()
+		modTime := ""
+		if info != nil {
+			modTime = info.ModTime().Format("2006-01-02 15:04")
+		}
+		fmt.Printf("  %-60s  %6d MB   %s  (extracted)\n",
+			de.Name(),
+			sz/(1024*1024),
+			modTime,
+		)
+	}
+	fmt.Printf("  Total: %d bundle(s), %d MB\n", totalCount, totalBytes/(1024*1024))
 }
 
 func handleRmBundle(name string) {
@@ -2208,11 +2261,19 @@ func handleRmBundle(name string) {
 		errorf("Bundle not found: %s", target)
 		os.Exit(1)
 	}
-	if err := os.Remove(target); err != nil {
+	var sz int64
+	if fi.IsDir() {
+		sz = dirSize(target)
+		err = os.RemoveAll(target)
+	} else {
+		sz = fi.Size()
+		err = os.Remove(target)
+	}
+	if err != nil {
 		errorf("Failed to remove %s: %v", target, err)
 		os.Exit(1)
 	}
-	fmt.Printf("Removed %s (%d MB)\n", filepath.Base(target), fi.Size()/(1024*1024))
+	fmt.Printf("Removed %s (%d MB)\n", filepath.Base(target), sz/(1024*1024))
 }
 
 func handleCleanBundles() {
@@ -2221,7 +2282,12 @@ func handleCleanBundles() {
 		errorf("Cannot read %s: %v", wlcBundlesDir, err)
 		os.Exit(1)
 	}
-	if len(infos) == 0 {
+	dirs, err := listExtractedDirs()
+	if err != nil {
+		errorf("Cannot read %s: %v", wlcBundlesDir, err)
+		os.Exit(1)
+	}
+	if len(infos) == 0 && len(dirs) == 0 {
 		fmt.Printf("No bundles in %s\n", wlcBundlesDir)
 		return
 	}
@@ -2229,14 +2295,26 @@ func handleCleanBundles() {
 	for _, fi := range infos {
 		totalBytes += fi.Size()
 	}
+	for _, de := range dirs {
+		totalBytes += dirSize(filepath.Join(wlcBundlesDir, de.Name()))
+	}
 	fmt.Printf("Removing %d bundle(s) from %s (%d MB total)...\n",
-		len(infos), wlcBundlesDir, totalBytes/(1024*1024))
+		len(infos)+len(dirs), wlcBundlesDir, totalBytes/(1024*1024))
 	for _, fi := range infos {
 		path := filepath.Join(wlcBundlesDir, fi.Name())
 		if err := os.Remove(path); err != nil {
 			errorf("  failed to remove %s: %v", fi.Name(), err)
 		} else {
 			fmt.Printf("  removed %s (%d MB)\n", fi.Name(), fi.Size()/(1024*1024))
+		}
+	}
+	for _, de := range dirs {
+		path := filepath.Join(wlcBundlesDir, de.Name())
+		sz := dirSize(path)
+		if err := os.RemoveAll(path); err != nil {
+			errorf("  failed to remove %s: %v", de.Name(), err)
+		} else {
+			fmt.Printf("  removed %s/ (%d MB)\n", de.Name(), sz/(1024*1024))
 		}
 	}
 }
