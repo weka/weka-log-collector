@@ -1817,11 +1817,16 @@ func cleanStaleSymlinks(supportDir string) {
 // uploadBundle symlinks the archive into a weka support directory and waits
 // for the weka background uploader daemon to process it.
 //
+// sessionID is the shared nanosecond timestamp used in the wlc:<id>:… symlink
+// name. When all nodes in a distributed upload share the same sessionID, Weka
+// Home groups their archives under a single session entry. Pass 0 to generate
+// a fresh ID (standalone / single-node uploads).
+//
 // The weka uploader (inside wekanode) watches support/ via inotify and uploads
 // each file to Weka Home. If a container's uploader is in FAILURE state (as
 // shown by 'weka cloud status') it will not respond; we try each available
 // container in sequence, moving on after a per-dir timeout.
-func uploadBundle(archivePath string) error {
+func uploadBundle(archivePath string, sessionID int64) error {
 	phase("Uploading to Weka Home")
 
 	cloudURL, err := checkCloudEnabled()
@@ -1844,8 +1849,13 @@ func uploadBundle(archivePath string) error {
 	filename := filepath.Base(archivePath)
 	// The weka uploader daemon requires the structured format wlc:<id>:<host>:<file>
 	// to recognize and process the file. A plain prefix like "wlc-" is ignored.
+	// Use the caller-supplied sessionID so all nodes in a cluster upload share
+	// the same ID and appear as one session in Weka Home.
+	if sessionID == 0 {
+		sessionID = time.Now().UnixNano()
+	}
 	hostname, _ := os.Hostname()
-	linkName := fmt.Sprintf("wlc:%d:%s:%s", time.Now().UnixNano(), hostname, filename)
+	linkName := fmt.Sprintf("wlc:%d:%s:%s", sessionID, hostname, filename)
 
 	// Stage the file under /opt/weka/ so all container uploaders can reach it.
 	// Wekanode containers have /opt/weka/ bind-mounted but not /tmp/.
@@ -2109,22 +2119,23 @@ func (f *multiIntFlag) Set(v string) error {
 
 func main() {
 	var (
-		startTimeStr = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
-		endTimeStr   = flag.String("end-time", "", "End of time window (default: now)")
-		profileStr   = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
-		outputPath   = flag.String("output", "", "Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.")
-		localOnly    = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
-		nodeOnly     = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
-		upload       = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
-		dryRun       = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
-		maxSizeStr   = flag.String("max-size", "5GB", "Abort if estimated collection size exceeds this (e.g. 2048, 2048MB, 10GB)")
-		sshUser      = flag.String("ssh-user", "root", "SSH user for remote host collection")
-		remoteBinary = flag.String("remote-binary", "/opt/weka/tools/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
-		noSelfDeploy = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
-		workerCount  = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
-		cmdTimeout   = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
-		ver          = flag.Bool("version", false, "Print version and exit")
-		completion   = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
+		startTimeStr    = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
+		endTimeStr      = flag.String("end-time", "", "End of time window (default: now)")
+		profileStr      = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
+		outputPath      = flag.String("output", "", "Output .tar.gz path (default: /tmp/<hostname>-weka-logs-<ts>.tar.gz). Use - for stdout.")
+		localOnly       = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
+		nodeOnly        = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
+		upload          = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
+		dryRun          = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
+		maxSizeStr      = flag.String("max-size", "5GB", "Abort if estimated collection size exceeds this (e.g. 2048, 2048MB, 10GB)")
+		sshUser         = flag.String("ssh-user", "root", "SSH user for remote host collection")
+		remoteBinary    = flag.String("remote-binary", "/opt/weka/tools/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
+		noSelfDeploy    = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
+		workerCount     = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
+		cmdTimeout      = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
+		ver             = flag.Bool("version", false, "Print version and exit")
+		completion      = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
+		uploadSessionID = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -2377,7 +2388,7 @@ func main() {
 			logf("Collection complete → %s  (took %s)", outPath, elapsed)
 		}
 		if *upload && !toStdout {
-			if err := uploadBundle(outPath); err != nil {
+			if err := uploadBundle(outPath, *uploadSessionID); err != nil {
 				errorf("Upload failed: %v", err)
 			} else {
 				os.Remove(outPath) // uploaded; no need to keep local copy
@@ -2415,7 +2426,7 @@ func main() {
 				warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
 				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, containerNames, nil)
 				if *upload && !toStdout {
-					if err := uploadBundle(outPath); err != nil {
+					if err := uploadBundle(outPath, 0); err != nil {
 						errorf("Upload failed: %v", err)
 					} else {
 						os.Remove(outPath)
@@ -2481,6 +2492,15 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Single session ID shared by all nodes so Weka Home groups their
+		// archives under one session entry instead of one entry per node.
+		// If the user supplied --upload-session-id (remote node invoked by
+		// orchestrator), use that; otherwise generate a fresh one.
+		sharedSessionID := *uploadSessionID
+		if sharedSessionID == 0 {
+			sharedSessionID = time.Now().UnixNano()
+		}
+
 		type nodeUploadResult struct {
 			display string
 			err     error
@@ -2496,7 +2516,7 @@ func main() {
 			logf("  [local] collecting (cluster-wide commands + node-local data)...")
 			writeArchive(outPath, false, *profileStr, from, to, *cmdTimeout, false, containerNames, nil)
 			logf("  [local] uploading to Weka Home...")
-			err := uploadBundle(outPath)
+			err := uploadBundle(outPath, sharedSessionID)
 			if err == nil {
 				os.Remove(outPath) // uploaded; no need to keep local copy
 			} else {
@@ -2519,7 +2539,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames)
+				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames, sharedSessionID)
 				mu.Lock()
 				for _, r := range remoteResults {
 					display := nodeDisplayMap[r.Host]
@@ -2588,7 +2608,7 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, bi
 // uploadFromHost deploys the binary to a remote host and runs collection + upload there.
 // The remote node collects its own logs, uploads them to Weka Home via its local uploader,
 // and cleans up the local archive. Returns nil on success.
-func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string) error {
+func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string, sessionID int64) error {
 	if displayName == "" {
 		displayName = host
 	}
@@ -2614,7 +2634,8 @@ func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, fro
 
 	// Build remote command: --local --node-only --upload [flags]
 	// --node-only: skip cluster-wide commands (run once by orchestrator locally)
-	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile}
+	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile,
+		"--upload-session-id", strconv.FormatInt(sessionID, 10)}
 	if !from.IsZero() {
 		args = append(args, "--start-time", from.Format("2006-01-02T15:04"))
 	}
@@ -2660,7 +2681,7 @@ func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, fro
 
 // uploadCluster fans out distributed upload to all remote hosts in parallel.
 // Each host collects its own logs and uploads them to Weka Home independently.
-func uploadCluster(hosts []string, displayNames map[string]string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
+func uploadCluster(hosts []string, displayNames map[string]string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64) []HostResult {
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
@@ -2673,7 +2694,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, bin
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			err := uploadFromHost(host, displayNames[host], selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 10*cmdTimeout, containerNames)
+			err := uploadFromHost(host, displayNames[host], selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 10*cmdTimeout, containerNames, sessionID)
 			mu.Lock()
 			results = append(results, HostResult{Host: host, Err: err})
 			mu.Unlock()
