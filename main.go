@@ -644,6 +644,76 @@ func checkRemoteDiskSpace(sshTarget, path string) (diskInfo, error) {
 // custom commands here; they are collected from the orchestrator node only.
 const extraCommandsFile = wlcBaseDir + "/extra-commands"
 
+// blockedBinaries lists command names (matched against the base of the first
+// word) that are never permitted in extra-commands — destructive or
+// state-changing system utilities.
+var blockedBinaries = []string{
+	"rm", "rmdir",
+	"dd",
+	"mkfs",
+	"shred", "wipefs",
+	"fdisk", "parted", "gdisk", "sgdisk",
+	"reboot", "shutdown", "halt", "poweroff",
+}
+
+// blockedPrefixes lists full command prefixes that are never permitted.
+// Matched against the trimmed command line as: exact match OR prefix+" ".
+var blockedPrefixes = []string{
+	// Weka state-changing / destructive operations
+	"weka cluster stop-io",
+	"weka cluster start-io",
+	"weka cluster update",
+	"weka cluster reset",
+	"weka local stop",
+	"weka local restart",
+	"weka local reset",
+	"weka container stop",
+	"weka container deactivate",
+	"weka container restart",
+	"weka host deactivate",
+	"weka drive deactivate",
+	"weka drive remove",
+	"weka fs delete",
+	"weka fs-group delete",
+	"weka org delete",
+	"weka user delete",
+	"weka security",
+	"weka smb cluster destroy",
+	// systemctl state-changing subcommands
+	"systemctl stop",
+	"systemctl start",
+	"systemctl restart",
+	"systemctl disable",
+	"systemctl enable",
+	"systemctl mask",
+	"systemctl daemon-reload",
+}
+
+// isBlockedCommand returns (true, reason) if the command matches the denylist.
+// Checks the binary name (base of first word) and full command prefix.
+// Note: does not catch shell tricks such as piping through a blocked binary.
+func isBlockedCommand(line string) (bool, string) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return false, ""
+	}
+	bin := filepath.Base(fields[0])
+	for _, b := range blockedBinaries {
+		if bin == b {
+			return true, fmt.Sprintf("%q is not permitted in extra-commands", b)
+		}
+	}
+	if strings.HasPrefix(bin, "mkfs.") {
+		return true, fmt.Sprintf("%q is not permitted in extra-commands", bin)
+	}
+	for _, prefix := range blockedPrefixes {
+		if line == prefix || strings.HasPrefix(line, prefix+" ") {
+			return true, fmt.Sprintf("%q is not permitted in extra-commands", prefix)
+		}
+	}
+	return false, ""
+}
+
 // loadExtraCommands reads extraCommandsFile, strips blank lines and # comments,
 // deduplicates against the built-in command set, and returns CommandSpecs ready
 // to run. Each spec gets a stable archive name: NN_<binary>.txt.
@@ -675,6 +745,10 @@ func loadExtraCommands(builtinCmds []CommandSpec) []CommandSpec {
 		seen[line] = true
 		if builtinSet[line] {
 			logf("  extra-commands: skipping %q (already in built-in collection)", line)
+			continue
+		}
+		if blocked, reason := isBlockedCommand(line); blocked {
+			warnf("extra-commands: skipping %q — %s", line, reason)
 			continue
 		}
 		idx++

@@ -5,7 +5,16 @@
 # Commands already collected by the active profile are skipped automatically.
 #
 # These commands run on the ORCHESTRATOR NODE ONLY when --extra-commands is passed.
-# Output is saved under extra/ in the archive.
+# Output is saved under cluster/extra/ in the archive.
+#
+# BLOCKED (skipped with a warning):
+#   System:  rm, rmdir, dd, mkfs, mkfs.*, shred, wipefs, fdisk, parted, gdisk,
+#            sgdisk, reboot, shutdown, halt, poweroff
+#   Weka:    weka cluster stop-io/start-io/update/reset, weka local stop/restart/reset,
+#            weka container stop/deactivate/restart, weka host/drive deactivate,
+#            weka drive remove, weka fs/fs-group/org/user delete,
+#            weka security, weka smb cluster destroy
+#   systemctl: stop, start, restart, disable, enable, mask, daemon-reload
 #
 # Examples:
 # /weka/reader/histogram --slot 0
