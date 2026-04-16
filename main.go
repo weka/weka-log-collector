@@ -166,26 +166,6 @@ func filterByTimeWindow(paths []string, from, to time.Time) []string {
 	return result
 }
 
-// parseSize parses a size string into MB. Accepts plain numbers (MB),
-// or values with MB/GB suffix (case-insensitive). Examples:
-//
-//	"2048"   → 2048 MB
-//	"2048MB" → 2048 MB
-//	"5GB"    → 5120 MB
-func parseSize(s string) (uint64, error) {
-	s = strings.TrimSpace(s)
-	upper := strings.ToUpper(s)
-	switch {
-	case strings.HasSuffix(upper, "GB"):
-		n, err := strconv.ParseUint(strings.TrimSuffix(upper, "GB"), 10, 64)
-		return n * 1024, err
-	case strings.HasSuffix(upper, "MB"):
-		return strconv.ParseUint(strings.TrimSuffix(upper, "MB"), 10, 64)
-	default:
-		return strconv.ParseUint(s, 10, 64)
-	}
-}
-
 func parseInputTime(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	if m := relativeTimeRe.FindStringSubmatch(strings.ToLower(s)); m != nil {
@@ -601,9 +581,6 @@ const (
 	// filesystem before starting collection. Writing even a compressed bundle
 	// can temporarily use more than the final size.
 	minFreeSpaceMB = 200
-	// safetyMarginFraction: we refuse to use more than this fraction of total
-	// available space (so we don't fill the disk).
-	safetyMarginFraction = 0.80
 )
 
 type diskInfo struct {
@@ -659,52 +636,6 @@ func checkRemoteDiskSpace(sshTarget, path string) (diskInfo, error) {
 		return diskInfo{}, fmt.Errorf("cannot parse available MB %q", fields[0])
 	}
 	return diskInfo{AvailMB: avail, Path: fields[1]}, nil
-}
-
-// estimateCollectionMB returns a rough upper-bound estimate of how much disk
-// space the collection will use after compression.
-// nodeCount should be 1 for local collection, or the number of remote hosts
-// for cluster collection — log files scale linearly with node count.
-// from/to are applied to filter rotated files the same way actual collection
-// does, so the estimate reflects the time window rather than all log history.
-func estimateCollectionMB(profile string, logSpecs []LogFileSpec, nodeCount int, from, to time.Time) uint64 {
-	var totalBytes int64
-	for _, spec := range logSpecs {
-		if spec.Profile != "" && spec.Profile != profile && profile != ProfileAll {
-			continue
-		}
-		matches, err := filepath.Glob(spec.SrcGlob)
-		if err != nil || len(matches) == 0 {
-			continue
-		}
-		// Apply the same time-window filter that actual collection uses so that
-		// rotated files outside the window are not counted in the estimate.
-		if !from.IsZero() || !to.IsZero() {
-			matches = filterByTimeWindow(matches, from, to)
-		}
-		for _, f := range matches {
-			info, err := os.Stat(f)
-			if err != nil {
-				continue
-			}
-			totalBytes += info.Size()
-		}
-	}
-	// Scale log files by node count (cluster commands run once, not per node,
-	// so only multiply the per-node portion — approximated as 80% of total).
-	if nodeCount > 1 {
-		perNodeBytes := totalBytes * 80 / 100
-		clusterOnceBytes := totalBytes - perNodeBytes
-		totalBytes = perNodeBytes*int64(nodeCount) + clusterOnceBytes
-	}
-	// Add ~20MB overhead for command outputs per node
-	totalBytes += int64(max(1, nodeCount)) * 20 * 1024 * 1024
-	// Assume ~30% compression ratio for mixed log content
-	compressedMB := uint64(totalBytes/1024/1024) * 30 / 100
-	if compressedMB < 5 {
-		compressedMB = 5
-	}
-	return compressedMB
 }
 
 // ── collection result tracking ────────────────────────────────────────────────
@@ -1357,58 +1288,40 @@ func sshArgs() []string {
 	}
 }
 
-// collectFromHost SSHs into a host, runs weka-log-collector --local, and
-// streams the tar.gz back.
-//
-// When selfDeploy is true (the default), it first creates wlcBaseDir on the
-// remote host, scps the running binary there, runs it, then removes it on
-// exit — so no manual pre-deployment is required. wlcBaseDir is used
-// instead of /tmp to avoid noexec mount issues common on hardened systems.
-//
-// When selfDeploy is false, binaryPath must already exist on the remote host.
-func collectFromHost(host, displayName, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string) HostResult {
+// collectFromHost SSHs into a host, deploys the running binary to wlcBaseDir,
+// runs weka-log-collector --local, streams the tar.gz back, then removes the
+// deployed binary on exit.
+func collectFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string) HostResult {
 	result := HostResult{Host: host}
 	if displayName == "" {
 		displayName = host
 	}
 
-	sshTarget := host
-	if sshUser != "" {
-		sshTarget = sshUser + "@" + host
+	sshTarget := "root@" + host
+
+	// Use a PID-suffixed name so the orchestrator never overwrites its own
+	// running binary when it is also a member of the cluster being collected.
+	remoteBin := fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
+
+	// Ensure the base directory exists on the remote host.
+	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
+	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
+		result.Err = fmt.Errorf("mkdir %s failed: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
+		errorf("[%s] collection failed: %v", displayName, result.Err)
+		return result
 	}
 
-	// ── auto-deploy: scp binary to /tmp on the remote host ────────────────
-	remoteBin := binaryPath
-	if selfDeploy {
-		// Use a PID-suffixed name so the orchestrator never overwrites its own
-		// running binary when it is also a member of the cluster being collected.
-		// wlcBaseDir is always present and executable on Weka nodes;
-		// /tmp is often mounted noexec on hardened systems.
-		remoteBin = fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
-
-		// Ensure the base directory exists on the remote host.
-		mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
-		mkdirCmd := exec.Command("ssh", mkdirArgs...)
-		if out, err := mkdirCmd.CombinedOutput(); err != nil {
-			result.Err = fmt.Errorf("mkdir %s failed: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
-			errorf("[%s] collection failed: %v", displayName, result.Err)
-			return result
-		}
-
-		logf("  [%s] deploying binary via scp...", displayName)
-		scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
-		scpCmd := exec.Command("scp", scpArgs...)
-		if out, err := scpCmd.CombinedOutput(); err != nil {
-			result.Err = fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
-			errorf("[%s] collection failed: %v", displayName, result.Err)
-			return result
-		}
-		vlogf("[%s] binary deployed to %s", displayName, remoteBin)
+	logf("  [%s] deploying binary via scp...", displayName)
+	scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
+	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+		result.Err = fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
+		errorf("[%s] collection failed: %v", displayName, result.Err)
+		return result
 	}
+	vlogf("[%s] binary deployed to %s", displayName, remoteBin)
 
 	// ── build the remote command ───────────────────────────────────────────
-	// When self-deployed, wrap in a shell that removes the binary on exit
-	// (whether collection succeeds or fails) to keep /tmp clean.
+	// trap ensures cleanup even if collection fails or connection drops.
 	// --node-only tells the remote to skip cluster-wide commands (run once by orchestrator).
 	collectionCmd := strings.Join(append([]string{
 		remoteBin,
@@ -1433,16 +1346,10 @@ func collectFromHost(host, displayName, selfPath, binaryPath, profile string, fr
 		return extra
 	}()...), " ")
 
-	var remoteShellCmd string
-	if selfDeploy {
-		// trap ensures cleanup even if collection fails or connection drops
-		remoteShellCmd = fmt.Sprintf(
-			"chmod +x %s; trap 'rm -f %s' EXIT; %s",
-			remoteBin, remoteBin, collectionCmd,
-		)
-	} else {
-		remoteShellCmd = collectionCmd
-	}
+	remoteShellCmd := fmt.Sprintf(
+		"chmod +x %s; trap 'rm -f %s' EXIT; %s",
+		remoteBin, remoteBin, collectionCmd,
+	)
 
 	// ── run collection via SSH, streaming output to a temp file ──────────
 	// Streaming to disk (not RAM) prevents accumulating 200-400 MB per host
@@ -2068,10 +1975,9 @@ _weka_log_collector() {
 
     profiles="default perf nfs s3 smbw all"
 
-    opts="--local --upload --clients --clients-only --dry-run --verbose --version
+    opts="--local --upload --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --max-size --ssh-user --workers --cmd-timeout
-          --no-self-deploy --remote-binary
+          --workers --cmd-timeout
           --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
@@ -2274,11 +2180,6 @@ func main() {
 		localOnly       = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
 		nodeOnly        = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		upload          = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
-		dryRun          = flag.Bool("dry-run", false, "Show what would be collected and estimated size; do not collect")
-		maxSizeStr      = flag.String("max-size", "5GB", "Abort if estimated collection size exceeds this (e.g. 2048, 2048MB, 10GB)")
-		sshUser         = flag.String("ssh-user", "root", "SSH user for remote host collection")
-		remoteBinary    = flag.String("remote-binary", wlcBaseDir+"/weka-log-collector", "Path to weka-log-collector binary on remote hosts (used only with --no-self-deploy)")
-		noSelfDeploy    = flag.Bool("no-self-deploy", false, "Do not auto-deploy binary to remote hosts; use --remote-binary path instead")
 		workerCount     = flag.Int("workers", 10, "Max parallel SSH workers for cluster collection")
 		cmdTimeout      = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
 		ver             = flag.Bool("version", false, "Print version and exit")
@@ -2439,17 +2340,11 @@ func main() {
 		logf("Output:   <stdout>")
 	}
 
-	// ── pre-discover node count for accurate space estimation ────────────
-	// For cluster mode we need to know how many nodes we're collecting from
-	// before the space check. Discover early and reuse the result later.
-	// For --local or explicit --host flags we already know the count.
+	// ── pre-discover for cluster mode (cache result for later use) ───────
 	var preDiscoveredHosts []string
-	var preDiscoveredDisplayMap map[string]string // ip → display name, cached from pre-discovery
-	spaceCheckNodeCount := 1
+	var preDiscoveredDisplayMap map[string]string
 	if !*localOnly && !toStdout {
-		if len(hosts) > 0 {
-			spaceCheckNodeCount = len(hosts)
-		} else {
+		if len(hosts) == 0 {
 			if nodes, err := discoverClusterNodes(*withClients || *clientsOnly); err == nil {
 				if *clientsOnly {
 					nodes = filterClientNodes(nodes)
@@ -2458,24 +2353,17 @@ func main() {
 					nodes = filterNodesByContainerID(nodes, []int(containerIDs))
 				}
 				preDiscoveredHosts = nodeIPs(nodes)
-				spaceCheckNodeCount = len(preDiscoveredHosts)
 				preDiscoveredDisplayMap = make(map[string]string, len(nodes))
 				for _, n := range nodes {
 					preDiscoveredDisplayMap[n.IP] = nodeDisplay(n)
 				}
 			}
-			// If discovery fails here we fall back to 1; the cluster section
-			// will retry and produce a proper error message if needed.
+			// If discovery fails here the cluster section will retry and error.
 		}
-	}
-	// Distributed upload writes only a local archive (1 node); no need to
-	// reserve space for the whole cluster.
-	if *upload {
-		spaceCheckNodeCount = 1
 	}
 
 	// ── space check (skip for stdout) ─────────────────────────────────────
-	if !toStdout && !*dryRun {
+	if !toStdout {
 		outputDir := filepath.Dir(outPath)
 		di, err := checkDiskSpace(outputDir)
 		if err != nil {
@@ -2483,9 +2371,7 @@ func main() {
 			errorf("Tip: use --output to write to a different location (e.g. --output /data/weka-logs.tar.gz)")
 			os.Exit(1)
 		}
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount, from, to)
-		logf("Disk:     %d MB available on %s (estimated collection: ~%d MB compressed)", di.AvailMB, di.Path, estimated)
-
+		logf("Disk:     %d MB available on %s", di.AvailMB, di.Path)
 		if di.AvailMB < minFreeSpaceMB {
 			errorf("Not enough free space on %s: only %d MB available, need at least %d MB.",
 				di.Path, di.AvailMB, minFreeSpaceMB)
@@ -2493,39 +2379,6 @@ func main() {
 			errorf("     Or free up space on %s first.", di.Path)
 			os.Exit(1)
 		}
-		maxSizeMB, err := parseSize(*maxSizeStr)
-		if err != nil {
-			errorf("Invalid --max-size value %q: use a number in MB or with suffix, e.g. 2048, 2048MB, 10GB", *maxSizeStr)
-			os.Exit(1)
-		}
-		maxAllowed := uint64(float64(di.AvailMB) * safetyMarginFraction)
-		if estimated > maxSizeMB || estimated > maxAllowed {
-			limit := maxSizeMB
-			if maxAllowed < limit {
-				limit = maxAllowed
-			}
-			errorf("Estimated collection size (~%d MB) exceeds limit (%d MB).", estimated, limit)
-			errorf("Tip: narrow the time window with --start-time -2h to reduce the amount collected.")
-			errorf("     Or increase the limit with --max-size <MB|GB> (e.g. --max-size 10GB).")
-			errorf("     Use --output to write to a larger filesystem (e.g. /opt/weka/).")
-			errorf("     Or use --dry-run to see exactly what would be collected.")
-			os.Exit(1)
-		}
-	}
-
-	if *dryRun {
-		phase("DRY RUN — showing what would be collected")
-		estimated := estimateCollectionMB(*profileStr, logFileSpecs, spaceCheckNodeCount, from, to)
-		logf("  Profile:   %s", *profileStr)
-		logf("  Nodes:     %d", spaceCheckNodeCount)
-		logf("  Estimated: ~%d MB compressed", estimated)
-		logf("  Commands:  %d weka + %d system", len(defaultCommands)+len(buildProfileCommands(*profileStr, from, to)), len(systemCommands))
-		logf("  Log specs: %d file patterns", len(logFileSpecs))
-		if !toStdout {
-			di, _ := checkDiskSpace(filepath.Dir(outPath))
-			logf("  Disk avail on %s: %d MB", di.Path, di.AvailMB)
-		}
-		return
 	}
 
 	// ── resolve container names from IDs (for log scoping) ───────────────
@@ -2630,20 +2483,13 @@ func main() {
 		logf("Collecting from %d specified host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
 	}
 
-	// Determine self-deploy settings
-	selfDeploy := !*noSelfDeploy
-	selfPath := ""
-	if selfDeploy {
-		var err error
-		selfPath, err = os.Executable()
-		if err != nil {
-			warnf("Could not determine executable path (%v); falling back to --remote-binary mode", err)
-			selfDeploy = false
-		} else {
-			logf("Auto-deploying binary from %s to %s/weka-log-collector-<pid> on each host", selfPath, wlcBaseDir)
-			logf("(use --no-self-deploy to skip auto-deployment and use --remote-binary instead)")
-		}
+	// Resolve the running binary path for self-deploy to remote hosts.
+	selfPath, err := os.Executable()
+	if err != nil {
+		errorf("Could not determine executable path: %v", err)
+		os.Exit(1)
 	}
+	logf("Auto-deploying binary from %s to %s/weka-log-collector-<pid> on each host", selfPath, wlcBaseDir)
 
 	// ── per-node space pre-check ──────────────────────────────────────────
 	// Check available space on every cluster node in parallel before collection
@@ -2681,11 +2527,7 @@ func main() {
 				if isLocalIP(host) {
 					di, err = checkDiskSpace(remoteSpaceCheckPath)
 				} else {
-					sshTarget := host
-					if *sshUser != "" {
-						sshTarget = *sshUser + "@" + host
-					}
-					di, err = checkRemoteDiskSpace(sshTarget, remoteSpaceCheckPath)
+					di, err = checkRemoteDiskSpace("root@"+host, remoteSpaceCheckPath)
 				}
 				spaceMu.Lock()
 				spaceResults = append(spaceResults, nodeSpaceResult{display, di, err})
@@ -2780,7 +2622,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames, sharedSessionID)
+				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, *workerCount, containerNames, sharedSessionID)
 				mu.Lock()
 				for _, r := range remoteResults {
 					display := nodeDisplayMap[r.Host]
@@ -2817,13 +2659,13 @@ func main() {
 
 	// Non-upload path: collect all nodes, merge into single central archive.
 	phase("Collecting from cluster hosts")
-	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames)
+	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, *workerCount, containerNames)
 	phase("Writing archive")
 	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart)
 }
 
 // collectCluster fans out collection to all hosts in parallel.
-func collectCluster(hosts []string, displayNames map[string]string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
+func collectCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
@@ -2836,7 +2678,7 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, bi
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r := collectFromHost(host, displayNames[host], selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 5*cmdTimeout, containerNames)
+			r := collectFromHost(host, displayNames[host], selfPath, profile, from, to, 5*cmdTimeout, containerNames)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
@@ -2849,28 +2691,21 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, bi
 // uploadFromHost deploys the binary to a remote host and runs collection + upload there.
 // The remote node collects its own logs, uploads them to Weka Home via its local uploader,
 // and cleans up the local archive. Returns nil on success.
-func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string, sessionID int64) error {
+func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64) error {
 	if displayName == "" {
 		displayName = host
 	}
-	sshTarget := host
-	if sshUser != "" {
-		sshTarget = sshUser + "@" + host
-	}
+	sshTarget := "root@" + host
 
-	// Deploy binary (same logic as collectFromHost)
-	remoteBin := binaryPath
-	if selfDeploy {
-		remoteBin = fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
-		mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
-		if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
-			return fmt.Errorf("mkdir %s failed: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
-		}
-		logf("  [%s] deploying binary via scp...", displayName)
-		scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
-		if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
-			return fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
-		}
+	remoteBin := fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
+	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
+	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkdir %s failed: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
+	}
+	logf("  [%s] deploying binary via scp...", displayName)
+	scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
+	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 
 	// Build remote command: --local --node-only --upload [flags]
@@ -2890,16 +2725,10 @@ func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, fro
 		args = append(args, "--container-name", strings.Join(containerNames, ","))
 	}
 	collectionCmd := strings.Join(args, " ")
-
-	var remoteShellCmd string
-	if selfDeploy {
-		remoteShellCmd = fmt.Sprintf(
-			"chmod +x %s; trap 'rm -f %s' EXIT; %s",
-			remoteBin, remoteBin, collectionCmd,
-		)
-	} else {
-		remoteShellCmd = collectionCmd
-	}
+	remoteShellCmd := fmt.Sprintf(
+		"chmod +x %s; trap 'rm -f %s' EXIT; %s",
+		remoteBin, remoteBin, collectionCmd,
+	)
 
 	logf("  [%s] collecting and uploading...", displayName)
 	var stderrBuf bytes.Buffer
@@ -2922,7 +2751,7 @@ func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, fro
 
 // uploadCluster fans out distributed upload to all remote hosts in parallel.
 // Each host collects its own logs and uploads them to Weka Home independently.
-func uploadCluster(hosts []string, displayNames map[string]string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64) []HostResult {
+func uploadCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64) []HostResult {
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
@@ -2935,7 +2764,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, bin
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			err := uploadFromHost(host, displayNames[host], selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 10*cmdTimeout, containerNames, sessionID)
+			err := uploadFromHost(host, displayNames[host], selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID)
 			mu.Lock()
 			results = append(results, HostResult{Host: host, Err: err})
 			mu.Unlock()
@@ -3193,12 +3022,8 @@ OPTIONS
   --dry-run            Show what would be collected; do not collect
   --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
-  --max-size SIZE      Abort if estimated size exceeds this (default: 5GB; accepts MB/GB e.g. 2048, 10GB)
-  --ssh-user USER      SSH user (default: root)
   --workers N          Parallel SSH workers (default: 10)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
-  --no-self-deploy     Skip auto-deploy; use --remote-binary instead
-  --remote-binary PATH Binary path on remote hosts (default: /opt/weka/weka-log-collector/weka-log-collector)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
 
