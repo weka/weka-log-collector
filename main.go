@@ -2743,7 +2743,7 @@ func main() {
 	phase("Collecting from cluster hosts")
 	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames)
 	phase("Writing archive")
-	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart)
+	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart, extraCmds)
 }
 
 // collectCluster fans out collection to all hosts in parallel.
@@ -2914,7 +2914,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 }
 
 // writeMergedArchive merges results from all cluster hosts into a single archive.
-func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration, collectionStart time.Time) {
+func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration, collectionStart time.Time, extraCmds []CommandSpec) {
 	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
@@ -2979,6 +2979,26 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		dest := filepath.Join(archiveRoot, "cluster", wekaSubdir, spec.Name+ext)
 		if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
 			warnf("[cluster] could not add %s to archive: %v", spec.Name, addErr)
+		}
+	}
+
+	// ── run extra commands on the orchestrator ────────────────────────────
+	if len(extraCmds) > 0 {
+		phase(fmt.Sprintf("Extra commands (%d)", len(extraCmds)))
+		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
+		for i, spec := range extraCmds {
+			co := extraOutputs[i]
+			content := co.out
+			if co.result.Error != "" {
+				if len(co.out) == 0 {
+					content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
+				}
+				warnf("extra command %q failed (exit %d): %s", spec.Cmd, co.result.ExitCode, co.result.Error)
+			}
+			dest := filepath.Join(archiveRoot, "cluster", "extra", spec.Name+".txt")
+			if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
+				warnf("could not add extra/%s to archive: %v", spec.Name, addErr)
+			}
 		}
 	}
 
