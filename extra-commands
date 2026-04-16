@@ -10,7 +10,9 @@
 # BLOCKED (skipped with a warning):
 #   System:  rm, rmdir, dd, mkfs, mkfs.*, shred, wipefs, fdisk, parted, gdisk,
 #            sgdisk, reboot, shutdown, halt, poweroff
-#   Weka:    weka cluster stop-io/start-io/update/reset, weka local stop/restart/reset,
+#   Weka:    weka cluster stop-io/start-io/update/reset,
+#            weka cluster container/host/drive stop/deactivate/restart/remove,
+#            weka local stop/restart/reset,
 #            weka container stop/deactivate/restart, weka host/drive deactivate,
 #            weka drive remove, weka fs/fs-group/org/user delete,
 #            weka security, weka smb cluster destroy
