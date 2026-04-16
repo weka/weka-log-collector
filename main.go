@@ -632,6 +632,31 @@ func checkDiskSpace(path string) (diskInfo, error) {
 	return diskInfo{AvailMB: availMB, TotalMB: totalMB, Path: dir}, nil
 }
 
+// checkRemoteDiskSpace SSHes to sshTarget and returns available space on the
+// filesystem containing path, walking up to an existing ancestor if needed.
+func checkRemoteDiskSpace(sshTarget, path string) (diskInfo, error) {
+	// Walk up to an existing ancestor, then run df -m.
+	// awk 'END{...}' handles long filesystem names that wrap to a second df line.
+	cmd := fmt.Sprintf(
+		`p=%s; while [ ! -e "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done; df -m "$p" | awk 'END{print $(NF-2), $NF}'`,
+		path,
+	)
+	args := append(sshArgs(), sshTarget, cmd)
+	out, err := exec.Command("ssh", args...).Output()
+	if err != nil {
+		return diskInfo{}, err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) < 2 {
+		return diskInfo{}, fmt.Errorf("unexpected df output: %q", strings.TrimSpace(string(out)))
+	}
+	avail, err := strconv.ParseUint(fields[0], 10, 64)
+	if err != nil {
+		return diskInfo{}, fmt.Errorf("cannot parse available MB %q", fields[0])
+	}
+	return diskInfo{AvailMB: avail, Path: fields[1]}, nil
+}
+
 // estimateCollectionMB returns a rough upper-bound estimate of how much disk
 // space the collection will use after compression.
 // nodeCount should be 1 for local collection, or the number of remote hosts
@@ -2499,6 +2524,76 @@ func main() {
 		} else {
 			logf("Auto-deploying binary from %s to %s/weka-log-collector-<pid> on each host", selfPath, wlcBaseDir)
 			logf("(use --no-self-deploy to skip auto-deployment and use --remote-binary instead)")
+		}
+	}
+
+	// ── per-node space pre-check ──────────────────────────────────────────
+	// Check available space on every cluster node in parallel before collection
+	// starts. Default path is wlcBundlesDir; if --output was explicitly set,
+	// check that path's filesystem (upload mode writes per-node bundles there).
+	{
+		remoteSpaceCheckPath := wlcBundlesDir
+		if *outputPath != "" {
+			remoteSpaceCheckPath = filepath.Dir(outPath)
+		}
+
+		type nodeSpaceResult struct {
+			display string
+			di      diskInfo
+			err     error
+		}
+		var spaceResults []nodeSpaceResult
+		var spaceMu sync.Mutex
+		var spaceWg sync.WaitGroup
+
+		for _, host := range clusterHosts {
+			host := host
+			spaceWg.Add(1)
+			go func() {
+				defer spaceWg.Done()
+				display := nodeDisplayMap[host]
+				if display == "" {
+					display = host
+				}
+				var di diskInfo
+				var err error
+				if isLocalIP(host) {
+					di, err = checkDiskSpace(remoteSpaceCheckPath)
+				} else {
+					sshTarget := host
+					if *sshUser != "" {
+						sshTarget = *sshUser + "@" + host
+					}
+					di, err = checkRemoteDiskSpace(sshTarget, remoteSpaceCheckPath)
+				}
+				spaceMu.Lock()
+				spaceResults = append(spaceResults, nodeSpaceResult{display, di, err})
+				spaceMu.Unlock()
+			}()
+		}
+		spaceWg.Wait()
+
+		sort.Slice(spaceResults, func(i, j int) bool {
+			return spaceResults[i].display < spaceResults[j].display
+		})
+
+		logf("Disk space on cluster nodes (%s):", remoteSpaceCheckPath)
+		var lowSpaceNodes []string
+		for _, r := range spaceResults {
+			if r.err != nil {
+				logf("  %-35s  check failed: %v", r.display, r.err)
+			} else {
+				marker := ""
+				if r.di.AvailMB < minFreeSpaceMB {
+					marker = "  ← LOW"
+					lowSpaceNodes = append(lowSpaceNodes, r.display)
+				}
+				logf("  %-35s  %6d MB on %s%s", r.display, r.di.AvailMB, r.di.Path, marker)
+			}
+		}
+		if len(lowSpaceNodes) > 0 {
+			warnf("Low disk space on %d node(s): %s", len(lowSpaceNodes), strings.Join(lowSpaceNodes, ", "))
+			warnf("Collection may fail on these nodes. Free up space on %s or use --output to redirect.", remoteSpaceCheckPath)
 		}
 	}
 
