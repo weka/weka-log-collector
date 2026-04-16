@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1600,6 +1601,35 @@ func nodeIPs(nodes []clusterNode) []string {
 	return ips
 }
 
+// isLocalIP returns true if ip matches any local network interface address.
+// Used to identify the orchestrator node in the cluster host list so we can
+// run full local collection (with cluster-wide commands) instead of SSH.
+func isLocalIP(ip string) bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var a net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				a = v.IP
+			case *net.IPAddr:
+				a = v.IP
+			}
+			if a != nil && a.String() == ip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // getClusterName returns the Weka cluster name by parsing `weka status`.
 // Falls back to the local hostname if weka is unavailable or the output
 // cannot be parsed.
@@ -2210,6 +2240,11 @@ func main() {
 			// will retry and produce a proper error message if needed.
 		}
 	}
+	// Distributed upload writes only a local archive (1 node); no need to
+	// reserve space for the whole cluster.
+	if *upload {
+		spaceCheckNodeCount = 1
+	}
 
 	// ── space check (skip for stdout) ─────────────────────────────────────
 	if !toStdout && !*dryRun {
@@ -2295,6 +2330,8 @@ func main() {
 		if *upload && !toStdout {
 			if err := uploadBundle(outPath); err != nil {
 				errorf("Upload failed: %v", err)
+			} else {
+				os.Remove(outPath) // uploaded; no need to keep local copy
 			}
 		}
 		return
@@ -2331,6 +2368,8 @@ func main() {
 				if *upload && !toStdout {
 					if err := uploadBundle(outPath); err != nil {
 						errorf("Upload failed: %v", err)
+					} else {
+						os.Remove(outPath)
 					}
 				}
 				return
@@ -2378,18 +2417,99 @@ func main() {
 		}
 	}
 
-	// Collect from all hosts in parallel
+	if *upload && !toStdout {
+		// ── distributed upload ────────────────────────────────────────────────
+		// Each node independently collects and uploads its own archive in parallel.
+		// The orchestrator runs full local collection (cluster-wide commands included);
+		// remote nodes run --local --node-only --upload via SSH.
+		// No central archive is written — uploads complete faster and avoid a
+		// single-node bandwidth bottleneck.
+		phase("Uploading from cluster nodes (distributed)")
+
+		// Fail fast if Weka Home is unreachable from the orchestrator.
+		if _, err := checkCloudEnabled(); err != nil {
+			errorf("Cannot upload: %v", err)
+			os.Exit(1)
+		}
+
+		type nodeUploadResult struct {
+			display string
+			err     error
+		}
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		var allResults []nodeUploadResult
+
+		// Orchestrator: full local collection (cluster-wide commands) + upload.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logf("  [local] collecting (cluster-wide commands + node-local data)...")
+			writeArchive(outPath, false, *profileStr, from, to, *cmdTimeout, false, containerNames, nil)
+			logf("  [local] uploading to Weka Home...")
+			err := uploadBundle(outPath)
+			if err == nil {
+				os.Remove(outPath) // uploaded; no need to keep local copy
+			} else {
+				errorf("[local] upload failed: %v", err)
+			}
+			mu.Lock()
+			allResults = append(allResults, nodeUploadResult{"local", err})
+			mu.Unlock()
+		}()
+
+		// Remote nodes: exclude local IPs (orchestrator already handled above),
+		// then SSH to each with --local --node-only --upload.
+		var remoteHosts []string
+		for _, h := range clusterHosts {
+			if !isLocalIP(h) {
+				remoteHosts = append(remoteHosts, h)
+			}
+		}
+		if len(remoteHosts) > 0 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames)
+				mu.Lock()
+				for _, r := range remoteResults {
+					display := nodeDisplayMap[r.Host]
+					if display == "" {
+						display = r.Host
+					}
+					allResults = append(allResults, nodeUploadResult{display, r.Err})
+				}
+				mu.Unlock()
+			}()
+		}
+
+		wg.Wait()
+
+		var succeeded, failed int
+		var failedDisplays []string
+		for _, r := range allResults {
+			if r.err != nil {
+				failed++
+				failedDisplays = append(failedDisplays, r.display)
+			} else {
+				succeeded++
+			}
+		}
+		elapsed := time.Since(collectionStart).Round(time.Second)
+		logf("\nCluster upload complete  —  Duration: %s", elapsed)
+		logf("  Nodes:    %d total, %d uploaded, %d failed", len(allResults), succeeded, failed)
+		if len(failedDisplays) > 0 {
+			logf("  Failed:   %s", strings.Join(failedDisplays, ", "))
+			logf("  Tip: check SSH access and 'weka cloud status' on failed nodes.")
+		}
+		return
+	}
+
+	// Non-upload path: collect all nodes, merge into single central archive.
 	phase("Collecting from cluster hosts")
 	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *remoteBinary, *profileStr, from, to, *sshUser, selfDeploy, *cmdTimeout, *workerCount, containerNames)
-
-	// Write merged archive
 	phase("Writing archive")
 	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart)
-	if *upload && !toStdout {
-		if err := uploadBundle(outPath); err != nil {
-			errorf("Upload failed: %v", err)
-		}
-	}
 }
 
 // collectCluster fans out collection to all hosts in parallel.
@@ -2409,6 +2529,104 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, bi
 			r := collectFromHost(host, displayNames[host], selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 5*cmdTimeout, containerNames)
 			mu.Lock()
 			results = append(results, r)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+// uploadFromHost deploys the binary to a remote host and runs collection + upload there.
+// The remote node collects its own logs, uploads them to Weka Home via its local uploader,
+// and cleans up the local archive. Returns nil on success.
+func uploadFromHost(host, displayName, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, sshTimeout time.Duration, containerNames []string) error {
+	if displayName == "" {
+		displayName = host
+	}
+	sshTarget := host
+	if sshUser != "" {
+		sshTarget = sshUser + "@" + host
+	}
+
+	// Deploy binary (same logic as collectFromHost)
+	remoteBin := binaryPath
+	if selfDeploy {
+		remoteBin = fmt.Sprintf("/opt/weka/tools/weka-log-collector-%d", os.Getpid())
+		mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p /opt/weka/tools")
+		if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("mkdir /opt/weka/tools failed: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+		logf("  [%s] deploying binary via scp...", displayName)
+		scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
+		if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	// Build remote command: --local --node-only --upload [flags]
+	// --node-only: skip cluster-wide commands (run once by orchestrator locally)
+	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile}
+	if !from.IsZero() {
+		args = append(args, "--start-time", from.Format("2006-01-02T15:04"))
+	}
+	if !to.IsZero() {
+		args = append(args, "--end-time", to.Format("2006-01-02T15:04"))
+	}
+	if verbose {
+		args = append(args, "--verbose")
+	}
+	if len(containerNames) > 0 {
+		args = append(args, "--container-name", strings.Join(containerNames, ","))
+	}
+	collectionCmd := strings.Join(args, " ")
+
+	var remoteShellCmd string
+	if selfDeploy {
+		remoteShellCmd = fmt.Sprintf(
+			"chmod +x %s; trap 'rm -f %s' EXIT; %s",
+			remoteBin, remoteBin, collectionCmd,
+		)
+	} else {
+		remoteShellCmd = collectionCmd
+	}
+
+	logf("  [%s] collecting and uploading...", displayName)
+	var stderrBuf bytes.Buffer
+	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
+	sshCmd.Stderr = &stderrBuf
+	if err := sshCmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode := exitErr.ExitCode()
+			errMsg := strings.TrimSpace(stderrBuf.String())
+			if exitCode == 137 {
+				return fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", errMsg)
+			}
+			return fmt.Errorf("SSH command failed (exit %d): %s", exitCode, errMsg)
+		}
+		return fmt.Errorf("SSH error: %v", err)
+	}
+	logf("  [%s] upload complete", displayName)
+	return nil
+}
+
+// uploadCluster fans out distributed upload to all remote hosts in parallel.
+// Each host collects its own logs and uploads them to Weka Home independently.
+func uploadCluster(hosts []string, displayNames map[string]string, selfPath, binaryPath, profile string, from, to time.Time, sshUser string, selfDeploy bool, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
+	sem := make(chan struct{}, workers)
+	var mu sync.Mutex
+	var results []HostResult
+	var wg sync.WaitGroup
+
+	for _, host := range hosts {
+		host := host
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			err := uploadFromHost(host, displayNames[host], selfPath, binaryPath, profile, from, to, sshUser, selfDeploy, 10*cmdTimeout, containerNames)
+			mu.Lock()
+			results = append(results, HostResult{Host: host, Err: err})
 			mu.Unlock()
 		}()
 	}
