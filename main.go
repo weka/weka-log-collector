@@ -266,8 +266,6 @@ var defaultCommands = []CommandSpec{
 	// ── local container info (node-local: different per host) ─────────────
 	{Name: "weka_local_ps", Cmd: "weka local ps -v -J", NodeLocal: true, JSON: true},
 	// weka local resources collected dynamically per container in CollectLocal
-	// ── host hw info (node-local: different per host) ──────────────────────
-	{Name: "weka_cluster_host_info_hw", Cmd: "weka cluster host info-hw -J", NodeLocal: true, JSON: true},
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
 	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1 -J", JSON: true},
