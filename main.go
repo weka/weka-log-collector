@@ -1428,6 +1428,11 @@ type HostResult struct {
 	Err      error
 }
 
+// activeRemoteHosts tracks hosts currently being collected/uploaded via SSH.
+// Key: host IP (string), Value: remote binary path (string).
+// Used by the signal handler to kill orphaned remote processes on interrupt.
+var activeRemoteHosts sync.Map
+
 // sshArgs returns the common SSH option flags used for all SSH/SCP calls.
 func sshArgs() []string {
 	return []string{
@@ -1437,9 +1442,69 @@ func sshArgs() []string {
 	}
 }
 
-// collectFromHost SSHs into a host, deploys the running binary to wlcBaseDir,
-// runs weka-log-collector --local, streams the tar.gz back, then removes the
-// deployed binary on exit.
+// remoteBinPath returns the path used for the self-deployed binary on remote hosts.
+// The PID suffix ensures the orchestrator (when also a cluster node) never overwrites
+// its own running binary.
+func remoteBinPath() string {
+	return fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
+}
+
+// deployToHost copies the running binary to a remote host via SCP.
+func deployToHost(host, selfPath string) error {
+	sshTarget := "root@" + host
+	remoteBin := remoteBinPath()
+	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
+	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
+	}
+	scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
+	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// deployWorkers is the number of concurrent SCP operations during the deploy phase.
+// Higher than collection workers because SCP is lightweight — just file transfer.
+const deployWorkers = 20
+
+// deployAll copies the running binary to all hosts in parallel.
+// Returns the subset of hosts that were successfully deployed to.
+// Failed hosts are logged immediately and excluded from collection.
+func deployAll(hosts []string, displayNames map[string]string, selfPath string) []string {
+	sem := make(chan struct{}, deployWorkers)
+	var mu sync.Mutex
+	var succeeded []string
+	var wg sync.WaitGroup
+
+	for _, host := range hosts {
+		host := host
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			display := displayNames[host]
+			if display == "" {
+				display = host
+			}
+			if err := deployToHost(host, selfPath); err != nil {
+				errorf("  [%s] deploy failed: %v", display, err)
+				return
+			}
+			logf("  [%s] deployed", display)
+			mu.Lock()
+			succeeded = append(succeeded, host)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return succeeded
+}
+
+// collectFromHost SSHs into a host, runs weka-log-collector --local (binary already
+// deployed by deployAll), streams the tar.gz back, then removes the deployed binary on exit.
+// The caller prints start/completion lines with progress counters; this function is silent.
 func collectFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string) HostResult {
 	result := HostResult{Host: host}
 	if displayName == "" {
@@ -1447,31 +1512,17 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 	}
 
 	sshTarget := "root@" + host
+	remoteBin := remoteBinPath()
 
-	// Use a PID-suffixed name so the orchestrator never overwrites its own
-	// running binary when it is also a member of the cluster being collected.
-	remoteBin := fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
-
-	// Ensure the base directory exists on the remote host.
-	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
-	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
-		result.Err = fmt.Errorf("mkdir %s failed: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
-		errorf("[%s] collection failed: %v", displayName, result.Err)
-		return result
-	}
-
-	logf("  [%s] deploying binary via scp...", displayName)
-	scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
-	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
-		result.Err = fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
-		errorf("[%s] collection failed: %v", displayName, result.Err)
-		return result
-	}
-	vlogf("[%s] binary deployed to %s", displayName, remoteBin)
+	// Register this host as active so the signal handler can kill it on interrupt.
+	activeRemoteHosts.Store(host, remoteBin)
+	defer activeRemoteHosts.Delete(host)
 
 	// ── build the remote command ───────────────────────────────────────────
-	// trap ensures cleanup even if collection fails or connection drops.
-	// --node-only tells the remote to skip cluster-wide commands (run once by orchestrator).
+	// trap cleans up the binary even if collection fails or connection drops.
+	// timeout kills the process if it exceeds the SSH timeout, preventing orphans
+	// when the orchestrator can no longer wait (e.g. after SSH connection drops).
+	// --node-only skips cluster-wide commands (run once by the orchestrator locally).
 	collectionCmd := strings.Join(append([]string{
 		remoteBin,
 		"--local",
@@ -1495,19 +1546,18 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 		return extra
 	}()...), " ")
 
+	timeoutSecs := int(sshTimeout.Seconds())
 	remoteShellCmd := fmt.Sprintf(
-		"chmod +x %s; trap 'rm -f %s' EXIT; %s",
-		remoteBin, remoteBin, collectionCmd,
+		"chmod +x %s; trap 'rm -f %s' EXIT; timeout %d %s",
+		remoteBin, remoteBin, timeoutSecs, collectionCmd,
 	)
 
 	// ── run collection via SSH, streaming output to a temp file ──────────
 	// Streaming to disk (not RAM) prevents accumulating 200-400 MB per host
 	// in memory simultaneously when collecting a large cluster in parallel.
-	logf("  [%s] collecting...", displayName)
 	tmpFile, err := os.CreateTemp("", "wlc-host-*.tar.gz")
 	if err != nil {
 		result.Err = fmt.Errorf("create temp file: %w", err)
-		errorf("[%s] collection failed: %v", displayName, result.Err)
 		return result
 	}
 	tmpPath := tmpFile.Name()
@@ -1524,7 +1574,9 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			exitCode := exitErr.ExitCode()
 			errMsg := strings.TrimSpace(stderrBuf.String())
-			if exitCode == 137 {
+			if exitCode == 124 {
+				result.Err = fmt.Errorf("timed out after %s — collection took too long", sshTimeout)
+			} else if exitCode == 137 {
 				result.Err = fmt.Errorf("process killed (OOM) on remote host — try --start-time to reduce collection size: %s", errMsg)
 			} else {
 				result.Err = fmt.Errorf("SSH command failed (exit %d): %s", exitCode, errMsg)
@@ -1532,13 +1584,9 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 		} else {
 			result.Err = fmt.Errorf("SSH error: %v", runErr)
 		}
-		errorf("[%s] collection failed: %v", displayName, result.Err)
 		return result
 	}
 
-	if info, err := os.Stat(tmpPath); err == nil {
-		logf("  [%s] collected %d KB", displayName, info.Size()/1024)
-	}
 	result.TempFile = tmpPath
 	return result
 }
@@ -2811,7 +2859,35 @@ func main() {
 		errorf("Could not determine executable path: %v", err)
 		os.Exit(1)
 	}
-	logf("Auto-deploying binary from %s to %s/weka-log-collector-<pid> on each host", selfPath, wlcBaseDir)
+	// ── signal handler: clean up remote processes on interrupt ───────────
+	// If the user hits Ctrl+C (or SIGTERM arrives), SSH to every host that is
+	// currently being collected and kill the remote weka-log-collector process
+	// and its binary. We wait for all kills to complete before exiting so we
+	// don't leave orphaned processes consuming CPU/disk on production nodes.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		logf("\nInterrupted — killing remote processes and cleaning up...")
+		remoteBin := remoteBinPath()
+		killCmd := fmt.Sprintf("pkill -f '%s' 2>/dev/null; rm -f %s; true",
+			filepath.Base(remoteBin), remoteBin)
+		var cleanupWg sync.WaitGroup
+		activeRemoteHosts.Range(func(k, _ interface{}) bool {
+			host := k.(string)
+			cleanupWg.Add(1)
+			go func() {
+				defer cleanupWg.Done()
+				args := append(sshArgs(), "root@"+host, killCmd)
+				exec.Command("ssh", args...).Run() //nolint:errcheck // best-effort cleanup
+			}()
+			return true
+		})
+		cleanupWg.Wait()
+		logf("Cleanup complete.")
+		os.Exit(1)
+	}()
+	defer signal.Stop(sigCh)
 
 	// ── per-node space pre-check ──────────────────────────────────────────
 	// Check available space on every cluster node in parallel before collection
@@ -2986,52 +3062,75 @@ func main() {
 	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart, extraCmds)
 }
 
-// collectCluster fans out collection to all hosts in parallel.
+// collectCluster deploys the binary to all hosts first, then fans out collection
+// in parallel (up to workers at a time). Logs each host's result atomically with
+// a [done/total] progress counter so output stays readable on large clusters.
 func collectCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
+	// ── phase 1: deploy binary to all hosts ───────────────────────────────
+	phase("Deploying binary to cluster hosts")
+	deployed := deployAll(hosts, displayNames, selfPath)
+	if len(deployed) == 0 {
+		errorf("Deploy failed on all hosts — nothing to collect.")
+		return nil
+	}
+	if len(deployed) < len(hosts) {
+		logf("  Deploy: %d/%d succeeded — collecting from reachable nodes only", len(deployed), len(hosts))
+	}
+
+	// ── phase 2: collect from successfully deployed hosts ─────────────────
+	total := len(deployed)
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
+	var done int
 	var wg sync.WaitGroup
 
-	for _, host := range hosts {
+	for _, host := range deployed {
 		host := host
+		display := displayNames[host]
+		if display == "" {
+			display = host
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r := collectFromHost(host, displayNames[host], selfPath, profile, from, to, 5*cmdTimeout, containerNames)
+			logf("  [%s] collecting...", display)
+			r := collectFromHost(host, display, selfPath, profile, from, to, 5*cmdTimeout, containerNames)
 			mu.Lock()
+			done++
+			n := done
 			results = append(results, r)
 			mu.Unlock()
+			if r.Err != nil {
+				errorf("  [%s] failed [%d/%d]: %v", display, n, total, r.Err)
+			} else if info, err := os.Stat(r.TempFile); err == nil {
+				logf("  [%s] collected %d KB  [%d/%d]", display, info.Size()/1024, n, total)
+			}
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-// uploadFromHost deploys the binary to a remote host and runs collection + upload there.
-// The remote node collects its own logs, uploads them to Weka Home via its local uploader,
-// and cleans up the local archive. Returns nil on success.
+// uploadFromHost runs collection + upload on a remote host (binary already deployed
+// by deployAll). The remote node collects its own logs, uploads to Weka Home via its
+// local uploader, and cleans up the local archive. The caller handles start/completion logs.
 func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64) error {
 	if displayName == "" {
 		displayName = host
 	}
 	sshTarget := "root@" + host
+	remoteBin := remoteBinPath()
 
-	remoteBin := fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
-	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
-	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkdir %s failed: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
-	}
-	logf("  [%s] deploying binary via scp...", displayName)
-	scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
-	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
-		return fmt.Errorf("scp failed: %v: %s", err, strings.TrimSpace(string(out)))
-	}
+	// Register this host as active so the signal handler can kill it on interrupt.
+	activeRemoteHosts.Store(host, remoteBin)
+	defer activeRemoteHosts.Delete(host)
 
 	// Build remote command: --local --node-only --upload [flags]
-	// --node-only: skip cluster-wide commands (run once by orchestrator locally)
+	// --node-only: skip cluster-wide commands (run once by orchestrator locally).
+	// timeout kills the process if it exceeds the SSH timeout, preventing orphans.
 	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile,
 		"--upload-session-id", strconv.FormatInt(sessionID, 10)}
 	if !from.IsZero() {
@@ -3047,12 +3146,12 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 		args = append(args, "--container-name", strings.Join(containerNames, ","))
 	}
 	collectionCmd := strings.Join(args, " ")
+	timeoutSecs := int(sshTimeout.Seconds())
 	remoteShellCmd := fmt.Sprintf(
-		"chmod +x %s; trap 'rm -f %s' EXIT; %s",
-		remoteBin, remoteBin, collectionCmd,
+		"chmod +x %s; trap 'rm -f %s' EXIT; timeout %d %s",
+		remoteBin, remoteBin, timeoutSecs, collectionCmd,
 	)
 
-	logf("  [%s] collecting and uploading...", displayName)
 	var stderrBuf bytes.Buffer
 	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
 	sshCmd.Stderr = &stderrBuf
@@ -3060,6 +3159,9 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode := exitErr.ExitCode()
 			errMsg := strings.TrimSpace(stderrBuf.String())
+			if exitCode == 124 {
+				return fmt.Errorf("timed out after %s — collection/upload took too long", sshTimeout)
+			}
 			if exitCode == 137 {
 				return fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", errMsg)
 			}
@@ -3067,29 +3169,54 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 		}
 		return fmt.Errorf("SSH error: %v", err)
 	}
-	logf("  [%s] upload complete", displayName)
 	return nil
 }
 
-// uploadCluster fans out distributed upload to all remote hosts in parallel.
-// Each host collects its own logs and uploads them to Weka Home independently.
+// uploadCluster deploys the binary to all remote hosts first, then fans out
+// collect+upload in parallel (up to workers at a time).
 func uploadCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64) []HostResult {
+	// ── phase 1: deploy binary to all remote hosts ────────────────────────
+	phase("Deploying binary to remote hosts")
+	deployed := deployAll(hosts, displayNames, selfPath)
+	if len(deployed) == 0 {
+		errorf("Deploy failed on all remote hosts — nothing to upload.")
+		return nil
+	}
+	if len(deployed) < len(hosts) {
+		logf("  Deploy: %d/%d succeeded — uploading from reachable nodes only", len(deployed), len(hosts))
+	}
+
+	// ── phase 2: collect + upload from successfully deployed hosts ─────────
+	total := len(deployed)
 	sem := make(chan struct{}, workers)
 	var mu sync.Mutex
 	var results []HostResult
+	var done int
 	var wg sync.WaitGroup
 
-	for _, host := range hosts {
+	for _, host := range deployed {
 		host := host
+		display := displayNames[host]
+		if display == "" {
+			display = host
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			err := uploadFromHost(host, displayNames[host], selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID)
+			logf("  [%s] collecting and uploading...", display)
+			err := uploadFromHost(host, display, selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID)
 			mu.Lock()
+			done++
+			n := done
 			results = append(results, HostResult{Host: host, Err: err})
 			mu.Unlock()
+			if err != nil {
+				errorf("  [%s] failed [%d/%d]: %v", display, n, total, err)
+			} else {
+				logf("  [%s] upload complete  [%d/%d]", display, n, total)
+			}
 		}()
 	}
 	wg.Wait()
