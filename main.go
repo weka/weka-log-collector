@@ -772,6 +772,7 @@ type CommandResult struct {
 	Error    string        `json:"error,omitempty"`
 	Skipped  bool          `json:"skipped,omitempty"`
 	SkipNote string        `json:"skip_reason,omitempty"`
+	Optional bool          `json:"optional,omitempty"`
 }
 
 // FileResult records the outcome of a single log file collection.
@@ -886,8 +887,9 @@ func runCommandsParallel(specs []CommandSpec, timeout time.Duration) []cmdOutput
 func runCommand(spec CommandSpec, timeout time.Duration) (CommandResult, []byte) {
 	start := time.Now()
 	result := CommandResult{
-		Name:    spec.Name,
-		Command: spec.Cmd,
+		Name:     spec.Name,
+		Command:  spec.Cmd,
+		Optional: spec.NodeOptional,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -1371,7 +1373,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// ── tally results ─────────────────────────────────────────────────────
 	manifest.TotalCommands = len(manifest.Commands)
 	for _, r := range manifest.Commands {
-		if r.Error != "" {
+		if r.Error != "" && !r.Optional {
 			manifest.FailedCommands++
 		}
 	}
