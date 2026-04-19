@@ -369,7 +369,6 @@ var nfsCommands = []CommandSpec{
 	{Name: "weka_nfs_custom_options", Cmd: "weka nfs custom-options -J", Profile: ProfileNFS, JSON: true},
 	{Name: "showmount", Cmd: "showmount -e", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS, NodeLocal: true, JSON: true},
-	{Name: "nfs_ganesha_config", Cmd: "weka local run /weka/cfgdump --container frontend0 | grep -i nfsGaneshaConfig -A 20", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "nfs_ganesha_queue", Cmd: "weka local exec --container ganesha cat /proc/wekafs/frontend0/queue", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "weka_stats_ops_nfsw", Cmd: "weka stats --category ops_nfsw --per-node -Z", Profile: ProfileNFS},
 	{Name: "netstat_nfs", Cmd: "netstat -tupnl", Profile: ProfileNFS, NodeLocal: true},
@@ -430,24 +429,11 @@ var systemCommands = []CommandSpec{
 	{Name: "timedatectl_timesync", Cmd: "timedatectl show-timesync --no-pager", NodeOptional: true},
 	// systemd-timesyncd (Ubuntu/Debian default)
 	{Name: "timesyncd_status", Cmd: "systemctl status systemd-timesyncd --no-pager", NodeOptional: true},
-	// chrony (RHEL 8+, Rocky, Ubuntu 20.04+ when explicitly installed)
-	{Name: "chronyc_tracking", Cmd: "chronyc tracking", NodeOptional: true},
-	{Name: "chronyc_sources", Cmd: "chronyc sources -v", NodeOptional: true},
-	{Name: "chronyd_status", Cmd: "systemctl status chronyd --no-pager", NodeOptional: true},
-	// ntpd fallback (older distros)
-	{Name: "ntpd_status", Cmd: "systemctl status ntpd --no-pager", NodeOptional: true},
-	// PTP (hardware clock sync — common in Weka clusters with RoCE/InfiniBand)
-	{Name: "ptp4l_status", Cmd: "systemctl status ptp4l --no-pager", NodeOptional: true},
-	{Name: "phc2sys_status", Cmd: "systemctl status phc2sys --no-pager", NodeOptional: true},
 	// ── kernel parameters ─────────────────────────────────────────────────
 	// sysctl -a captures all live values including numa_balancing, kernel.panic, etc.
 	{Name: "sysctl_all", Cmd: "sysctl -a"},
 	// kernel ring buffer with timestamps
 	{Name: "dmesg", Cmd: "dmesg -T"},
-	// ── kdump (should be enabled for crash diagnostics; not present on all distros) ─
-	{Name: "kdump_status", Cmd: "systemctl status kdump --no-pager", NodeOptional: true},
-	// Ubuntu uses kdump-tools instead
-	{Name: "kdump_tools_status", Cmd: "systemctl status kdump-tools --no-pager", NodeOptional: true},
 	// ── NIC / OFED / routing ──────────────────────────────────────────────
 	{Name: "lshw_network", Cmd: "lshw -C network -businfo"},
 	{Name: "ofed_info", Cmd: "ofed_info -s"},
