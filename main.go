@@ -270,7 +270,6 @@ var defaultCommands = []CommandSpec{
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
 	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1 -J", JSON: true},
-	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J --TIMEOUT 60s", JSON: true, NodeOptional: true},
 	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump"}, // raw exec, no -J
 }
 
