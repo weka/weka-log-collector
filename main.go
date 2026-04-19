@@ -271,7 +271,7 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
 	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1 -J", JSON: true},
 	// NodeOptional: requires local management API on 127.0.0.1:14000 — not available on all node types
-	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J --TIMEOUT 30s", NodeLocal: true, JSON: true, NodeOptional: true},
+	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J --TIMEOUT 60s", NodeLocal: true, JSON: true, NodeOptional: true},
 	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", NodeLocal: true}, // raw exec, no -J
 }
 
