@@ -2513,6 +2513,32 @@ func handleCleanBundles() {
 	if logCount > 0 {
 		fmt.Printf("Removed %d debug log(s) from %s\n", logCount, wlcLogsDir)
 	}
+
+	// ── cluster-wide cleanup ───────────────────────────────────────────────
+	// If we can discover cluster nodes, SSH to each and clean up their
+	// logs/ and bundles/ as well.
+	nodes, err := discoverClusterNodes(false)
+	if err != nil || len(nodes) == 0 {
+		return
+	}
+	hostname, _ := os.Hostname()
+	cleanCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz", wlcBaseDir, wlcBaseDir)
+	fmt.Printf("Cleaning remote nodes...\n")
+	var remoteCount int
+	for _, n := range nodes {
+		display := nodeDisplay(n)
+		// Skip self — already cleaned above.
+		if n.IP == hostname || n.Hostname == hostname {
+			continue
+		}
+		cmd := exec.Command("ssh", append(sshArgs(), "root@"+n.IP, cleanCmd)...)
+		if err := cmd.Run(); err != nil {
+			errorf("  [%s] cleanup failed: %v", display, err)
+		} else {
+			remoteCount++
+		}
+	}
+	fmt.Printf("Cleaned %d remote node(s)\n", remoteCount)
 }
 
 func main() {
@@ -3169,6 +3195,10 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 		}
 		return fmt.Errorf("SSH error: %v", err)
 	}
+	// Clean up remote logs/ and bundles/ after successful upload.
+	// Debug logs are already inside the uploaded bundle; no need to keep them on disk.
+	cleanupCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz", wlcBaseDir, wlcBaseDir)
+	exec.Command("ssh", append(sshArgs(), sshTarget, cleanupCmd)...).Run() //nolint:errcheck
 	return nil
 }
 
