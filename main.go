@@ -456,9 +456,9 @@ var systemCommands = []CommandSpec{
 	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core"},
 	{Name: "modinfo_ice", Cmd: "modinfo ice"},
 	// ethtool per interface: link speed, duplex, driver, MTU validation
-	// NodeOptional: ethtool may not be installed, and some virtual/loopback interfaces
-	// return errors that cause the loop script to exit non-zero even when data was collected.
-	{Name: "ethtool_all", Cmd: `for iface in $(ls /sys/class/net/); do echo "=== $iface ==="; ethtool "$iface" 2>&1; ethtool -i "$iface" 2>&1; done`, NodeOptional: true},
+	// NodeOptional: ethtool may not be installed. Skip virtual interfaces (lo, etc.) that
+	// have no physical device and cause ethtool -i to exit non-zero.
+	{Name: "ethtool_all", Cmd: `for iface in $(ls /sys/class/net/); do [ -e /sys/class/net/$iface/device ] || continue; echo "=== $iface ==="; ethtool "$iface" 2>&1; ethtool -i "$iface" 2>&1; done`, NodeOptional: true},
 	{Name: "ip_rule", Cmd: "ip rule"},
 	{Name: "ip_neighbor", Cmd: "ip neighbor"},
 	{Name: "ip_route_all_tables", Cmd: "ip route show table all"},
