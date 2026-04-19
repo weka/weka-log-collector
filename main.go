@@ -221,12 +221,13 @@ func profileEnabled(selected, check string) bool {
 
 // CommandSpec describes a shell command to run and capture.
 type CommandSpec struct {
-	Name      string // output filename (without extension)
-	Cmd       string // shell command
-	Profile   string // which profile this belongs to (empty = always run)
-	Fatal     bool   // if true, collection fails if this command fails; default non-fatal
-	NodeLocal bool   // if true, output varies per node (weka local *); otherwise cluster-wide
-	JSON      bool   // if true, command outputs JSON; archive entry uses .json extension
+	Name         string // output filename (without extension)
+	Cmd          string // shell command
+	Profile      string // which profile this belongs to (empty = always run)
+	Fatal        bool   // if true, collection fails if this command fails; default non-fatal
+	NodeLocal    bool   // if true, output varies per node (weka local *); otherwise cluster-wide
+	JSON         bool   // if true, command outputs JSON; archive entry uses .json extension
+	NodeOptional bool   // if true, failure is expected on some nodes/distros — logged at verbose only, not WARN
 }
 
 // defaultCommands are run on every node that has the weka CLI available.
@@ -269,7 +270,8 @@ var defaultCommands = []CommandSpec{
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
 	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1 -J", JSON: true},
-	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J --TIMEOUT 30s", NodeLocal: true, JSON: true},
+	// NodeOptional: requires local management API on 127.0.0.1:14000 — not available on all node types
+	{Name: "weka_cluster_container_info_hw", Cmd: "weka cluster container info-hw -J --TIMEOUT 30s", NodeLocal: true, JSON: true, NodeOptional: true},
 	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump", NodeLocal: true}, // raw exec, no -J
 }
 
@@ -424,23 +426,29 @@ var systemCommands = []CommandSpec{
 	// ── swap (must be disabled on Weka backends) ──────────────────────────
 	{Name: "swapon", Cmd: "swapon --show"},
 	// ── clock synchronization (critical for Weka cluster consistency) ─────
-	// timedatectl works on all systemd distros
+	// timedatectl works on all systemd distros — always present, always warn if missing
 	{Name: "timedatectl", Cmd: "timedatectl status"},
-	// chrony (RHEL 8+, Rocky, Ubuntu 20.04+)
-	{Name: "chronyc_tracking", Cmd: "chronyc tracking"},
-	{Name: "chronyc_sources", Cmd: "chronyc sources -v"},
-	{Name: "chronyd_status", Cmd: "systemctl status chronyd --no-pager"},
+	{Name: "timedatectl_timesync", Cmd: "timedatectl show-timesync --no-pager", NodeOptional: true},
+	// systemd-timesyncd (Ubuntu/Debian default)
+	{Name: "timesyncd_status", Cmd: "systemctl status systemd-timesyncd --no-pager", NodeOptional: true},
+	// chrony (RHEL 8+, Rocky, Ubuntu 20.04+ when explicitly installed)
+	{Name: "chronyc_tracking", Cmd: "chronyc tracking", NodeOptional: true},
+	{Name: "chronyc_sources", Cmd: "chronyc sources -v", NodeOptional: true},
+	{Name: "chronyd_status", Cmd: "systemctl status chronyd --no-pager", NodeOptional: true},
 	// ntpd fallback (older distros)
-	{Name: "ntpd_status", Cmd: "systemctl status ntpd --no-pager"},
+	{Name: "ntpd_status", Cmd: "systemctl status ntpd --no-pager", NodeOptional: true},
+	// PTP (hardware clock sync — common in Weka clusters with RoCE/InfiniBand)
+	{Name: "ptp4l_status", Cmd: "systemctl status ptp4l --no-pager", NodeOptional: true},
+	{Name: "phc2sys_status", Cmd: "systemctl status phc2sys --no-pager", NodeOptional: true},
 	// ── kernel parameters ─────────────────────────────────────────────────
 	// sysctl -a captures all live values including numa_balancing, kernel.panic, etc.
 	{Name: "sysctl_all", Cmd: "sysctl -a"},
 	// kernel ring buffer with timestamps
 	{Name: "dmesg", Cmd: "dmesg -T"},
-	// ── kdump (should be enabled for crash diagnostics) ───────────────────
-	{Name: "kdump_status", Cmd: "systemctl status kdump --no-pager"},
+	// ── kdump (should be enabled for crash diagnostics; not present on all distros) ─
+	{Name: "kdump_status", Cmd: "systemctl status kdump --no-pager", NodeOptional: true},
 	// Ubuntu uses kdump-tools instead
-	{Name: "kdump_tools_status", Cmd: "systemctl status kdump-tools --no-pager"},
+	{Name: "kdump_tools_status", Cmd: "systemctl status kdump-tools --no-pager", NodeOptional: true},
 	// ── NIC / OFED / routing ──────────────────────────────────────────────
 	{Name: "lshw_network", Cmd: "lshw -C network -businfo"},
 	{Name: "ofed_info", Cmd: "ofed_info -s"},
@@ -448,7 +456,9 @@ var systemCommands = []CommandSpec{
 	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core"},
 	{Name: "modinfo_ice", Cmd: "modinfo ice"},
 	// ethtool per interface: link speed, duplex, driver, MTU validation
-	{Name: "ethtool_all", Cmd: `for iface in $(ls /sys/class/net/); do echo "=== $iface ==="; ethtool "$iface" 2>&1; ethtool -i "$iface" 2>&1; done`},
+	// NodeOptional: ethtool may not be installed, and some virtual/loopback interfaces
+	// return errors that cause the loop script to exit non-zero even when data was collected.
+	{Name: "ethtool_all", Cmd: `for iface in $(ls /sys/class/net/); do echo "=== $iface ==="; ethtool "$iface" 2>&1; ethtool -i "$iface" 2>&1; done`, NodeOptional: true},
 	{Name: "ip_rule", Cmd: "ip rule"},
 	{Name: "ip_neighbor", Cmd: "ip neighbor"},
 	{Name: "ip_route_all_tables", Cmd: "ip route show table all"},
@@ -1118,7 +1128,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		co := sysOutputs[i]
 		manifest.Commands = append(manifest.Commands, co.result)
 		if co.result.Error != "" {
-			warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+			if spec.NodeOptional {
+				vlogf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+			} else {
+				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+			}
 		}
 		content := co.out
 		if co.result.Error != "" && len(co.out) == 0 {
@@ -1175,9 +1189,9 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		co := wekaOutputs[i]
 		manifest.Commands = append(manifest.Commands, co.result)
 		if co.result.Error != "" {
-			if spec.Profile != "" {
-				// Protocol-specific command — failure is expected when the protocol
-				// is not deployed on this cluster. Log to verbose/debug only.
+			if spec.Profile != "" || spec.NodeOptional {
+				// Protocol-specific or node-optional command — failure is expected on
+				// some nodes/distros. Log to verbose/debug only, not as a WARN.
 				vlogf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
 			} else {
 				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
