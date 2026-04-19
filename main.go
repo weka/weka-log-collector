@@ -2374,6 +2374,9 @@ func dirSize(path string) int64 {
 }
 
 func handleListBundles() {
+	hostname, _ := os.Hostname()
+
+	// ── local node ────────────────────────────────────────────────────────
 	infos, err := listBundleEntries()
 	if err != nil {
 		errorf("Cannot read %s: %v", wlcBundlesDir, err)
@@ -2384,39 +2387,63 @@ func handleListBundles() {
 		errorf("Cannot read %s: %v", wlcBundlesDir, err)
 		os.Exit(1)
 	}
+	fmt.Printf("[%s] %s:\n", hostname, wlcBundlesDir)
 	if len(infos) == 0 && len(dirs) == 0 {
-		fmt.Printf("No bundles in %s\n", wlcBundlesDir)
+		fmt.Printf("  (none)\n")
+	} else {
+		var totalBytes int64
+		var totalCount int
+		for _, fi := range infos {
+			totalBytes += fi.Size()
+			totalCount++
+			fmt.Printf("  %-60s  %6d MB   %s\n",
+				fi.Name(),
+				fi.Size()/(1024*1024),
+				fi.ModTime().Format("2006-01-02 15:04"),
+			)
+		}
+		for _, de := range dirs {
+			path := filepath.Join(wlcBundlesDir, de.Name())
+			sz := dirSize(path)
+			totalBytes += sz
+			totalCount++
+			info, _ := de.Info()
+			modTime := ""
+			if info != nil {
+				modTime = info.ModTime().Format("2006-01-02 15:04")
+			}
+			fmt.Printf("  %-60s  %6d MB   %s  (extracted)\n",
+				de.Name(),
+				sz/(1024*1024),
+				modTime,
+			)
+		}
+		fmt.Printf("  Total: %d bundle(s), %d MB\n", totalCount, totalBytes/(1024*1024))
+	}
+
+	// ── remote nodes ──────────────────────────────────────────────────────
+	nodes, err := discoverClusterNodes(false)
+	if err != nil || len(nodes) == 0 {
 		return
 	}
-	var totalBytes int64
-	var totalCount int
-	fmt.Printf("Bundles in %s:\n", wlcBundlesDir)
-	for _, fi := range infos {
-		totalBytes += fi.Size()
-		totalCount++
-		fmt.Printf("  %-60s  %6d MB   %s\n",
-			fi.Name(),
-			fi.Size()/(1024*1024),
-			fi.ModTime().Format("2006-01-02 15:04"),
-		)
-	}
-	for _, de := range dirs {
-		path := filepath.Join(wlcBundlesDir, de.Name())
-		sz := dirSize(path)
-		totalBytes += sz
-		totalCount++
-		info, _ := de.Info()
-		modTime := ""
-		if info != nil {
-			modTime = info.ModTime().Format("2006-01-02 15:04")
+	listCmd := fmt.Sprintf("ls -lh %s/bundles/*.tar.gz 2>/dev/null || true", wlcBaseDir)
+	for _, n := range nodes {
+		display := nodeDisplay(n)
+		if n.IP == hostname || n.Hostname == hostname {
+			continue
 		}
-		fmt.Printf("  %-60s  %6d MB   %s  (extracted)\n",
-			de.Name(),
-			sz/(1024*1024),
-			modTime,
-		)
+		out, _ := exec.Command("ssh", append(sshArgs(), "root@"+n.IP, listCmd)...).Output()
+		lines := strings.TrimSpace(string(out))
+		if lines == "" {
+			continue // skip nodes with nothing
+		}
+		fmt.Printf("[%s] %s/bundles:\n", display, wlcBaseDir)
+		for _, line := range strings.Split(lines, "\n") {
+			if line != "" {
+				fmt.Printf("  %s\n", line)
+			}
+		}
 	}
-	fmt.Printf("  Total: %d bundle(s), %d MB\n", totalCount, totalBytes/(1024*1024))
 }
 
 func handleRmBundle(name string) {
