@@ -2463,34 +2463,34 @@ func handleCleanBundles() {
 	}
 	if len(infos) == 0 && len(dirs) == 0 {
 		fmt.Printf("No bundles in %s\n", wlcBundlesDir)
-		return
-	}
-	var totalBytes int64
-	for _, fi := range infos {
-		totalBytes += fi.Size()
-	}
-	for _, de := range dirs {
-		totalBytes += dirSize(filepath.Join(wlcBundlesDir, de.Name()))
-	}
-	fmt.Printf("Removing %d bundle(s) from %s (%d MB total)...\n",
-		len(infos)+len(dirs), wlcBundlesDir, totalBytes/(1024*1024))
-	for _, fi := range infos {
-		path := filepath.Join(wlcBundlesDir, fi.Name())
-		if err := os.Remove(path); err != nil {
-			errorf("  failed to remove %s: %v", fi.Name(), err)
-		} else {
-			fmt.Printf("  removed %s (%d MB)\n", fi.Name(), fi.Size()/(1024*1024))
+	} else {
+		var totalBytes int64
+		for _, fi := range infos {
+			totalBytes += fi.Size()
 		}
-	}
-	for _, de := range dirs {
-		path := filepath.Join(wlcBundlesDir, de.Name())
-		sz := dirSize(path)
-		if err := os.RemoveAll(path); err != nil {
-			errorf("  failed to remove %s: %v", de.Name(), err)
-		} else {
-			fmt.Printf("  removed %s/ (%d MB)\n", de.Name(), sz/(1024*1024))
+		for _, de := range dirs {
+			totalBytes += dirSize(filepath.Join(wlcBundlesDir, de.Name()))
 		}
-	}
+		fmt.Printf("Removing %d bundle(s) from %s (%d MB total)...\n",
+			len(infos)+len(dirs), wlcBundlesDir, totalBytes/(1024*1024))
+		for _, fi := range infos {
+			path := filepath.Join(wlcBundlesDir, fi.Name())
+			if err := os.Remove(path); err != nil {
+				errorf("  failed to remove %s: %v", fi.Name(), err)
+			} else {
+				fmt.Printf("  removed %s (%d MB)\n", fi.Name(), fi.Size()/(1024*1024))
+			}
+		}
+		for _, de := range dirs {
+			path := filepath.Join(wlcBundlesDir, de.Name())
+			sz := dirSize(path)
+			if err := os.RemoveAll(path); err != nil {
+				errorf("  failed to remove %s: %v", de.Name(), err)
+			} else {
+				fmt.Printf("  removed %s/ (%d MB)\n", de.Name(), sz/(1024*1024))
+			}
+		}
+	} // end else (local bundles exist)
 
 	// Also clean debug log files from the logs/ directory.
 	logEntries, err := os.ReadDir(wlcLogsDir)
