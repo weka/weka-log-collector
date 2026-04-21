@@ -2212,12 +2212,40 @@ func uploadBundle(archivePath string, sessionID int64) error {
 
 const bashCompletionScript = `# bash completion for weka-log-collector
 _weka_log_collector() {
-    local cur prev opts profiles
+    local cur prev word opts profiles subcommands
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
+    subcommands="k8s"
     profiles="default perf nfs s3 smbw all"
+
+    # Detect if we are completing inside the k8s subcommand
+    local in_k8s=0
+    for word in "${COMP_WORDS[@]}"; do
+        if [[ "$word" == "k8s" ]]; then
+            in_k8s=1
+            break
+        fi
+    done
+
+    if [[ $in_k8s -eq 1 ]]; then
+        # k8s-specific flags
+        local k8s_opts="--k8s-host --kubeconfig --operator-ns --cluster-ns --csi-ns
+                        --output --cmd-timeout --verbose --version"
+        case "$prev" in
+            --output|--kubeconfig)
+                COMPREPLY=( $(compgen -f -- "$cur") )
+                return 0
+                ;;
+            --cmd-timeout)
+                COMPREPLY=( $(compgen -W "30s 60s 120s 180s 300s" -- "$cur") )
+                return 0
+                ;;
+        esac
+        COMPREPLY=( $(compgen -W "$k8s_opts" -- "$cur") )
+        return 0
+    fi
 
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
@@ -2229,7 +2257,7 @@ _weka_log_collector() {
             COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
             return 0
             ;;
-        --output|--remote-binary)
+        --output)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
@@ -2239,13 +2267,14 @@ _weka_log_collector() {
             COMPREPLY=( $(compgen -W "-1h -2h -4h -8h -12h -24h -1d -2d ${now} ${today}T00:00 ${today}T06:00 ${today}T12:00 ${today}T18:00" -- "$cur") )
             return 0
             ;;
-        --ssh-user)
-            COMPREPLY=( $(compgen -W "root" -- "$cur") )
-            return 0
-            ;;
     esac
 
-    COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    # Offer subcommands when the user has typed nothing yet or is completing first word
+    if [[ ${COMP_CWORD} -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "$subcommands $opts" -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
     return 0
 }
 complete -F _weka_log_collector weka-log-collector ./weka-log-collector
@@ -2285,6 +2314,628 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 		}
 	}
 	return nil
+}
+
+// ── kubernetes collection ─────────────────────────────────────────────────────
+//
+// The `k8s` subcommand collects diagnostic data from a Weka-on-Kubernetes
+// deployment. It uses kubectl to access the cluster, optionally routing through
+// an SSH jump host that has kubeconfig configured.
+//
+// Architecture:
+//   - Weka Operator: manages WekaCluster CRDs; typically in weka-operator-system
+//   - WekaCluster pods: compute/drive/frontend/management pods running Weka
+//   - CSI plugin: controller + node daemonset; typically in weka-csi-plugin ns
+
+// kubectlRunner wraps kubectl invocations. When jumpHost is set, all commands
+// are transparently routed through SSH to that host.
+type kubectlRunner struct {
+	jumpHost   string        // empty ⟹ invoke kubectl locally
+	kubeconfig string        // empty ⟹ use default kubeconfig
+	timeout    time.Duration // per-command timeout
+}
+
+// shellQuote wraps s in single quotes with internal single-quote escaping,
+// safe for embedding in a shell command string.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// buildKubectlArgs prepends --kubeconfig=... when set.
+func (k *kubectlRunner) buildKubectlArgs(args []string) []string {
+	if k.kubeconfig != "" {
+		return append([]string{"--kubeconfig=" + k.kubeconfig}, args...)
+	}
+	return args
+}
+
+// run invokes kubectl (locally or via SSH jump host) with a timeout and returns
+// combined stdout+stderr. Non-zero exit returns an error containing the output.
+func (k *kubectlRunner) run(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	defer cancel()
+
+	kcArgs := k.buildKubectlArgs(args)
+
+	var cmd *exec.Cmd
+	if k.jumpHost != "" {
+		// Serialize kubectl args as a single shell string for SSH transport.
+		parts := make([]string, len(kcArgs))
+		for i, a := range kcArgs {
+			parts[i] = shellQuote(a)
+		}
+		remoteCmd := "kubectl " + strings.Join(parts, " ")
+		sshOpts := append(sshArgs(), "root@"+k.jumpHost, remoteCmd)
+		cmd = exec.CommandContext(ctx, "ssh", sshOpts...)
+	} else {
+		cmd = exec.CommandContext(ctx, "kubectl", kcArgs...)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("kubectl %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
+}
+
+// runLenient runs kubectl but silently swallows errors, returning whatever
+// output was produced. Use for resources that may not exist on all clusters.
+func (k *kubectlRunner) runLenient(args ...string) []byte {
+	out, _ := k.run(args...)
+	return out
+}
+
+// execInPod runs a command inside a pod via kubectl exec.
+// container may be "" to use the pod's default container.
+func (k *kubectlRunner) execInPod(ns, pod, container string, cmd ...string) ([]byte, error) {
+	args := []string{"exec", pod, "-n", ns}
+	if container != "" {
+		args = append(args, "-c", container)
+	}
+	args = append(args, "--")
+	args = append(args, cmd...)
+	return k.run(args...)
+}
+
+// podLogs fetches logs for a pod. When container is "", collects all containers
+// with --prefix=true so each line is tagged with the container name.
+func (k *kubectlRunner) podLogs(ns, pod, container string) ([]byte, error) {
+	if container == "" {
+		return k.run("logs", pod, "-n", ns,
+			"--all-containers=true", "--prefix=true", "--tail=50000")
+	}
+	return k.run("logs", pod, "-n", ns, "-c", container, "--tail=50000")
+}
+
+// safeName replaces characters unsafe for tar paths (/, :, space) with _.
+func safeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '/', ':', ' ', '\t':
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// parsePodNames parses the first column (pod name) from kubectl get pods --no-headers output.
+func parsePodNames(out []byte) []string {
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "NAME") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			names = append(names, fields[0])
+		}
+	}
+	return names
+}
+
+// wekaK8sNamespaces holds the discovered (or user-overridden) namespace for each
+// Weka component in the K8s cluster.
+type wekaK8sNamespaces struct {
+	Operator string // weka-operator deployment
+	Cluster  string // WekaCluster pods (compute/drive/frontend)
+	CSI      string // CSI plugin controller + node daemonset
+}
+
+// discoverWekaK8sNamespaces auto-detects namespaces for Weka Operator, WekaCluster
+// pods, and the CSI plugin. Falls back to well-known defaults when discovery fails.
+func discoverWekaK8sNamespaces(kc *kubectlRunner) wekaK8sNamespaces {
+	ns := wekaK8sNamespaces{
+		Operator: "weka-operator-system",
+		Cluster:  "default",
+		CSI:      "weka-csi-plugin",
+	}
+
+	// Operator: deployment name contains "weka-operator"
+	out := kc.runLenient("get", "deployments", "--all-namespaces", "--no-headers",
+		"-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.Contains(strings.ToLower(fields[1]), "weka-operator") {
+			ns.Operator = fields[0]
+			break
+		}
+	}
+
+	// WekaCluster CRD namespace (first instance)
+	out = kc.runLenient("get", "wekacluster", "--all-namespaces", "--no-headers",
+		"-o", "custom-columns=NS:.metadata.namespace")
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && line != "NS" {
+			ns.Cluster = line
+			break
+		}
+	}
+
+	// CSI: deployment or daemonset name contains "csi-wekafs"
+	out = kc.runLenient("get", "deployments,daemonsets", "--all-namespaces", "--no-headers",
+		"-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.Contains(strings.ToLower(fields[1]), "csi-wekafs") {
+			ns.CSI = fields[0]
+			break
+		}
+	}
+
+	return ns
+}
+
+// kubectlToArchive runs kubectl args, writes output into tw at archivePath.
+// Errors are logged as verbose and return false; partial output is still archived.
+func kubectlToArchive(tw *tar.Writer, kc *kubectlRunner, archivePath string, args ...string) bool {
+	out, err := kc.run(args...)
+	if len(out) > 0 {
+		_ = addBytesToArchive(tw, archivePath, out)
+	}
+	if err != nil {
+		vlogf("k8s: %s: %v", archivePath, err)
+		return false
+	}
+	return true
+}
+
+// k8sManifest is written as collection_manifest.json at the k8s/ archive root.
+type k8sManifest struct {
+	CollectedAt       time.Time `json:"collected_at"`
+	Version           string    `json:"version"`
+	JumpHost          string    `json:"jump_host,omitempty"`
+	OperatorNamespace string    `json:"operator_namespace"`
+	ClusterNamespace  string    `json:"cluster_namespace"`
+	CSINamespace      string    `json:"csi_namespace"`
+	TotalCommands     int       `json:"total_commands"`
+	FailedCommands    int       `json:"failed_commands"`
+	Errors            []string  `json:"errors,omitempty"`
+}
+
+// collectK8sClusterLevel gathers cluster-wide K8s resources: nodes, events,
+// CRDs, storage classes, PVs/PVCs, and all Weka CRD instances.
+func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k8sManifest) {
+	base := root + "/cluster"
+
+	run := func(name string, args ...string) {
+		m.TotalCommands++
+		if !kubectlToArchive(tw, kc, base+"/"+name, args...) {
+			m.FailedCommands++
+		}
+	}
+
+	logf("  Collecting cluster-level resources...")
+
+	run("version.txt", "version")
+	run("nodes_wide.txt", "get", "nodes", "-o", "wide")
+	run("nodes.yaml", "get", "nodes", "-o", "yaml")
+	run("cluster_info.txt", "cluster-info")
+	run("namespaces.txt", "get", "namespaces")
+	run("events_all.txt", "get", "events", "--all-namespaces", "--sort-by=.lastTimestamp")
+	run("crds.txt", "get", "crd", "-o", "wide")
+	run("storageclasses_wide.txt", "get", "storageclass", "-o", "wide")
+	run("storageclasses.yaml", "get", "storageclass", "-o", "yaml")
+	run("pvc_all.txt", "get", "pvc", "--all-namespaces")
+	run("pv_all.txt", "get", "pv", "-o", "wide")
+	run("csidrivers.txt", "get", "csidrivers")
+	run("csidrivers.yaml", "get", "csidriver", "-o", "yaml")
+
+	// Weka CRD instances (all namespaces) — lenient: CRD may not exist
+	wekaCRDs := []struct{ file, crd string }{
+		{"wekacluster.yaml", "wekacluster"},
+		{"wekafilesystem.yaml", "wekafilesystem"},
+		{"wekafilesystemgroup.yaml", "wekafilesystemgroup"},
+		{"wekanfsinterface.yaml", "wekanfsinterface"},
+		{"wekasnapshot.yaml", "wekasnapshot"},
+		{"wekauploadimage.yaml", "wekauploadimage"},
+		{"wekanfspermission.yaml", "wekanfspermission"},
+		{"wekasmb.yaml", "wekasmb"},
+		{"wekaclientconfig.yaml", "wekaclientconfig"},
+	}
+	for _, c := range wekaCRDs {
+		run(c.file, "get", c.crd, "--all-namespaces", "-o", "yaml")
+	}
+}
+
+// collectK8sNamespaceMeta collects pod listing, events, workloads, and services
+// for a namespace into root/, then returns the list of pod names.
+func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) []string {
+	run := func(name string, args ...string) {
+		m.TotalCommands++
+		if !kubectlToArchive(tw, kc, root+"/"+name, args...) {
+			m.FailedCommands++
+		}
+	}
+
+	run("pods_wide.txt", "get", "pods", "-n", ns, "-o", "wide")
+	run("events.txt", "get", "events", "-n", ns, "--sort-by=.lastTimestamp")
+	run("workloads.txt", "get", "deployments,statefulsets,daemonsets,replicasets", "-n", ns)
+	run("services.txt", "get", "svc,endpoints", "-n", ns)
+	run("configmaps.txt", "get", "configmap", "-n", ns)
+	run("secrets_names.txt", "get", "secret", "-n", ns, "--no-headers",
+		"-o", "custom-columns=NAME:.metadata.name,TYPE:.type")
+	run("pvcs.txt", "get", "pvc", "-n", ns, "-o", "wide")
+
+	// Get pod names for caller
+	m.TotalCommands++
+	podsOut, err := kc.run("get", "pods", "-n", ns, "--no-headers")
+	if err != nil {
+		m.FailedCommands++
+		warnf("k8s: cannot list pods in namespace %s: %v", ns, err)
+		return nil
+	}
+	return parsePodNames(podsOut)
+}
+
+// collectK8sPodLogs collects describe + stdout logs + previous logs for one pod.
+func collectK8sPodLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, podDir string, m *k8sManifest) {
+	m.TotalCommands++
+	if !kubectlToArchive(tw, kc, podDir+"/describe.txt", "describe", "pod", pod, "-n", ns) {
+		m.FailedCommands++
+	}
+
+	m.TotalCommands++
+	logsOut, logsErr := kc.podLogs(ns, pod, "")
+	if logsErr != nil {
+		m.FailedCommands++
+		vlogf("k8s: logs %s/%s: %v", ns, pod, logsErr)
+	} else if len(logsOut) > 0 {
+		_ = addBytesToArchive(tw, podDir+"/logs/stdout.log", logsOut)
+	}
+
+	// Previous container logs are valuable when a pod has crashed/restarted
+	prevOut := kc.runLenient("logs", pod, "-n", ns,
+		"--all-containers=true", "--prefix=true", "--previous=true", "--tail=10000")
+	if len(prevOut) > 0 {
+		_ = addBytesToArchive(tw, podDir+"/logs/previous.log", prevOut)
+	}
+}
+
+// wekaPodCLICommands are run via kubectl exec inside WekaCluster pods.
+// Many will fail on non-compute pods — failures are silently skipped.
+var wekaPodCLICommands = []struct {
+	name string
+	cmd  []string
+}{
+	{"weka_status.json", []string{"weka", "status", "--json"}},
+	{"weka_local_ps.txt", []string{"weka", "local", "ps"}},
+	{"weka_local_resources.json", []string{"weka", "local", "resources", "--json"}},
+	{"weka_alerts.json", []string{"weka", "alerts", "--json"}},
+}
+
+// collectK8sOptWekaLogs tries to enumerate and cat file-based weka process logs
+// from inside the pod. These live on PVCs and survive pod restarts.
+// Paths tried: /opt/weka/logs and /opt/weka/data/default/logs.
+func collectK8sOptWekaLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, archiveDir string, m *k8sManifest) {
+	logPaths := []string{"/opt/weka/logs", "/opt/weka/data/default/logs"}
+
+	for _, logPath := range logPaths {
+		m.TotalCommands++
+		findOut, findErr := kc.execInPod(ns, pod, "",
+			"find", logPath, "-maxdepth", "3", "-type", "f",
+			"(", "-name", "*.log", "-o", "-name", "syslog",
+			"-o", "-name", "output", "-o", "-name", "events", ")",
+		)
+		if findErr != nil {
+			m.FailedCommands++
+			vlogf("k8s: find %s in %s/%s: %v", logPath, ns, pod, findErr)
+			continue
+		}
+
+		files := strings.Fields(string(findOut))
+		if len(files) == 0 {
+			continue
+		}
+		logf("    Pod %s: %d files under %s", pod, len(files), logPath)
+
+		// Cap at 100 files to avoid overwhelming the archive
+		if len(files) > 100 {
+			files = files[:100]
+		}
+		for _, f := range files {
+			m.TotalCommands++
+			content, catErr := kc.execInPod(ns, pod, "", "cat", f)
+			if catErr != nil {
+				m.FailedCommands++
+				vlogf("k8s: cat %s in %s/%s: %v", f, ns, pod, catErr)
+				continue
+			}
+			// Strip leading slash, replace remaining / with __ for flat filename
+			rel := strings.TrimPrefix(f, "/")
+			destName := strings.ReplaceAll(rel, "/", "__")
+			_ = addBytesToArchive(tw, archiveDir+"/"+destName, content)
+		}
+	}
+}
+
+// collectK8sOperator collects the Weka Operator pod, its logs, and the
+// WekaCluster CRD spec/status from the operator namespace.
+func collectK8sOperator(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) {
+	logf("  Collecting Weka Operator (namespace: %s)...", ns)
+
+	pods := collectK8sNamespaceMeta(tw, kc, root, ns, m)
+	logf("    %d pods", len(pods))
+
+	for _, pod := range pods {
+		podDir := root + "/" + safeName(pod)
+		vlogf("k8s: operator pod %s/%s", ns, pod)
+		collectK8sPodLogs(tw, kc, ns, pod, podDir, m)
+	}
+
+	// WekaCluster CRD status (most useful resource in operator namespace)
+	m.TotalCommands++
+	if !kubectlToArchive(tw, kc, root+"/wekacluster_status.yaml",
+		"get", "wekacluster", "-n", ns, "-o", "yaml") {
+		m.FailedCommands++
+	}
+}
+
+// collectK8sWekaCluster collects WekaCluster pod diagnostics: namespace metadata,
+// per-pod stdout logs, in-pod weka CLI commands, and file-based /opt/weka logs.
+func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) {
+	logf("  Collecting WekaCluster pods (namespace: %s)...", ns)
+
+	pods := collectK8sNamespaceMeta(tw, kc, root, ns, m)
+	logf("    %d pods", len(pods))
+
+	for _, pod := range pods {
+		podDir := root + "/" + safeName(pod)
+		vlogf("k8s: wekacluster pod %s/%s", ns, pod)
+
+		collectK8sPodLogs(tw, kc, ns, pod, podDir, m)
+
+		// Weka CLI via exec (best-effort — only compute pods will respond)
+		for _, spec := range wekaPodCLICommands {
+			m.TotalCommands++
+			out, execErr := kc.execInPod(ns, pod, "", spec.cmd...)
+			if execErr != nil {
+				m.FailedCommands++
+				vlogf("k8s: exec %s %v: %v", pod, spec.cmd[0], execErr)
+				continue
+			}
+			_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, out)
+		}
+
+		// File-based weka logs from /opt/weka/ (PVC-backed, most valuable source)
+		collectK8sOptWekaLogs(tw, kc, ns, pod, podDir+"/opt-weka-logs", m)
+	}
+}
+
+// collectK8sCSI collects CSI plugin diagnostics: controller + node daemonset
+// pods, their stdout logs, and CSI-specific K8s resources.
+func collectK8sCSI(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) {
+	logf("  Collecting CSI plugin (namespace: %s)...", ns)
+
+	pods := collectK8sNamespaceMeta(tw, kc, root, ns, m)
+	logf("    %d pods", len(pods))
+
+	for _, pod := range pods {
+		podDir := root + "/" + safeName(pod)
+		vlogf("k8s: CSI pod %s/%s", ns, pod)
+		collectK8sPodLogs(tw, kc, ns, pod, podDir, m)
+	}
+}
+
+func k8sUsageFunc() {
+	fmt.Fprint(os.Stderr, `weka-log-collector k8s — collect diagnostics from a Weka-on-Kubernetes deployment
+
+USAGE
+  weka-log-collector k8s [options]
+
+OPTIONS
+  --k8s-host HOST      SSH jump host with kubectl + kubeconfig (e.g. jump.server.internal)
+                       Omit to run kubectl locally (kubeconfig must be on PATH host)
+  --kubeconfig PATH    Path to kubeconfig file (on the jump host when --k8s-host is set)
+  --operator-ns NS     Override auto-detected Weka Operator namespace
+                       (default: auto-detect, fall back to weka-operator-system)
+  --cluster-ns NS      Override auto-detected WekaCluster pod namespace
+                       (default: auto-detect via WekaCluster CRD)
+  --csi-ns NS          Override auto-detected CSI plugin namespace
+                       (default: auto-detect, fall back to weka-csi-plugin)
+  --output PATH        Output .tar.gz path (default: ./k8s-weka-logs-<ts>.tar.gz)
+  --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
+  --verbose            Verbose output (show every kubectl call)
+  --version            Print version and exit
+
+EXAMPLES
+  # Collect via SSH jump server (most common for Weka-on-K8s)
+  weka-log-collector k8s --k8s-host jump.internal
+
+  # Run locally when kubectl is already on PATH
+  weka-log-collector k8s
+
+  # Override namespaces when auto-detection fails
+  weka-log-collector k8s --k8s-host jump.internal --cluster-ns my-weka --csi-ns my-csi
+
+  # Save to specific path
+  weka-log-collector k8s --k8s-host jump.internal --output /tmp/k8s-bundle.tar.gz
+
+`)
+}
+
+// runK8sMode is the entry point for `weka-log-collector k8s [args]`.
+// It parses k8s-specific flags, discovers Weka namespaces, collects diagnostics
+// from all Weka components in the K8s cluster, and produces a .tar.gz bundle.
+func runK8sMode(args []string) {
+	fs := flag.NewFlagSet("k8s", flag.ExitOnError)
+	fs.Usage = k8sUsageFunc
+
+	k8sHost := fs.String("k8s-host", "", "SSH jump host with kubectl/kubeconfig")
+	kubeconfig := fs.String("kubeconfig", "", "Path to kubeconfig (on jump host when --k8s-host is set)")
+	operatorNS := fs.String("operator-ns", "", "Override Weka Operator namespace")
+	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
+	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
+	outputPath := fs.String("output", "", "Output .tar.gz path (default: ./k8s-weka-logs-<ts>.tar.gz)")
+	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
+	verboseFlag := fs.Bool("verbose", false, "Verbose output")
+	ver := fs.Bool("version", false, "Print version and exit")
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	if *ver {
+		fmt.Printf("weka-log-collector %s\n", version)
+		return
+	}
+
+	if extra := fs.Args(); len(extra) > 0 {
+		fmt.Fprintf(os.Stderr, "error: unexpected argument(s): %s\n", strings.Join(extra, ", "))
+		os.Exit(1)
+	}
+
+	verbose = *verboseFlag
+
+	// Open debug log (best-effort; use same logs dir as regular collection)
+	_ = os.MkdirAll(wlcLogsDir, 0755)
+	logPath := filepath.Join(wlcLogsDir, fmt.Sprintf("weka-log-collector-k8s-%s.log",
+		time.Now().Format("2006-01-02T15-04-05")))
+	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+		debugLog = lf
+		defer lf.Close()
+		fmt.Fprintf(os.Stderr, "Debug log: %s\n", logPath)
+	}
+
+	collectionStart := time.Now()
+
+	outPath := *outputPath
+	if outPath == "" {
+		ts := time.Now().Format("2006-01-02T15-04-05")
+		outPath = fmt.Sprintf("k8s-weka-logs-%s.tar.gz", ts)
+	}
+
+	kc := &kubectlRunner{
+		jumpHost:   *k8sHost,
+		kubeconfig: *kubeconfig,
+		timeout:    *cmdTimeout,
+	}
+
+	if *k8sHost != "" {
+		logf("K8s jump host: %s", *k8sHost)
+	} else {
+		logf("K8s collection: using local kubectl")
+	}
+
+	// Verify kubectl is reachable before doing anything else
+	phase("Checking kubectl connectivity")
+	verOut, verErr := kc.run("version", "--short")
+	if verErr != nil {
+		// --short removed in kubectl v1.28+
+		verOut, verErr = kc.run("version")
+	}
+	if verErr != nil {
+		errorf("Cannot reach kubectl: %v", verErr)
+		if *k8sHost != "" {
+			errorf("Check SSH access to %s and that kubectl is installed there", *k8sHost)
+		} else {
+			errorf("Ensure kubectl is installed and kubeconfig is accessible")
+		}
+		os.Exit(1)
+	}
+	logf("  %s", strings.SplitN(strings.TrimSpace(string(verOut)), "\n", 2)[0])
+
+	// Namespace discovery
+	phase("Discovering Weka namespaces")
+	ns := discoverWekaK8sNamespaces(kc)
+	if *operatorNS != "" {
+		ns.Operator = *operatorNS
+	}
+	if *clusterNS != "" {
+		ns.Cluster = *clusterNS
+	}
+	if *csiNS != "" {
+		ns.CSI = *csiNS
+	}
+	logf("  Operator namespace:    %s", ns.Operator)
+	logf("  WekaCluster namespace: %s", ns.Cluster)
+	logf("  CSI namespace:         %s", ns.CSI)
+
+	// Open output archive
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		errorf("Cannot create output file %s: %v", outPath, err)
+		os.Exit(1)
+	}
+
+	gz, gzErr := gzip.NewWriterLevel(outFile, gzip.BestCompression)
+	if gzErr != nil {
+		outFile.Close()
+		errorf("gzip init: %v", gzErr)
+		os.Exit(1)
+	}
+	tw := tar.NewWriter(gz)
+
+	archiveRoot := "k8s"
+	m := &k8sManifest{
+		CollectedAt:       time.Now(),
+		Version:           version,
+		JumpHost:          *k8sHost,
+		OperatorNamespace: ns.Operator,
+		ClusterNamespace:  ns.Cluster,
+		CSINamespace:      ns.CSI,
+	}
+
+	phase("Collecting cluster-level resources")
+	collectK8sClusterLevel(tw, kc, archiveRoot, m)
+
+	phase("Collecting Weka Operator")
+	collectK8sOperator(tw, kc, archiveRoot+"/operator", ns.Operator, m)
+
+	phase("Collecting WekaCluster pods")
+	collectK8sWekaCluster(tw, kc, archiveRoot+"/wekacluster", ns.Cluster, m)
+
+	if ns.CSI != ns.Cluster {
+		phase("Collecting CSI plugin")
+		collectK8sCSI(tw, kc, archiveRoot+"/csi", ns.CSI, m)
+	} else {
+		logf("\nCSI namespace same as cluster namespace (%s) — skipping separate CSI collection", ns.CSI)
+	}
+
+	// Write manifest
+	manifestJSON, _ := json.MarshalIndent(m, "", "  ")
+	_ = addBytesToArchive(tw, archiveRoot+"/collection_manifest.json", manifestJSON)
+
+	if err := tw.Close(); err != nil {
+		errorf("Finalizing tar: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		errorf("Finalizing gzip: %v", err)
+	}
+	outFile.Close()
+
+	elapsed := time.Since(collectionStart).Round(time.Second)
+	if info, err := os.Stat(outPath); err == nil {
+		logf("\nK8s collection complete → %s (%d KB, took %s)",
+			outPath, info.Size()/1024, elapsed)
+	} else {
+		logf("\nK8s collection complete → %s (took %s)", outPath, elapsed)
+	}
+	logf("  Commands: %d total, %d failed", m.TotalCommands, m.FailedCommands)
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -2569,6 +3220,13 @@ func handleCleanBundles() {
 }
 
 func main() {
+	// Subcommand routing: must precede flag.Parse() so k8s-specific flags are
+	// not seen by the global flag set and --help stays uncluttered.
+	if len(os.Args) > 1 && os.Args[1] == "k8s" {
+		runK8sMode(os.Args[2:])
+		return
+	}
+
 	var (
 		startTimeStr    = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
 		endTimeStr      = flag.String("end-time", "", "End of time window (default: now)")
@@ -3525,6 +4183,7 @@ func usageFunc() {
 USAGE
   weka-log-collector [options]          cluster-wide (auto-discovers all backends via weka CLI)
   weka-log-collector --local [options]  this host only
+  weka-log-collector k8s [options]      Weka-on-Kubernetes (run --help after k8s for flags)
 
 TIME
   --start-time TIME  Relative: -2h, -30m, -1d  |  Absolute: 2026-03-04T10:30[:00]
