@@ -2325,6 +2325,7 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 // Architecture:
 //   - Weka Operator: manages WekaCluster CRDs; typically in weka-operator-system
 //   - WekaCluster pods: compute/drive/frontend/management pods running Weka
+//     NOTE: in many deployments these share the same namespace as the operator
 //   - CSI plugin: controller + node daemonset; typically in weka-csi-plugin ns
 
 // kubectlRunner wraps kubectl invocations. When jumpHost is set, all commands
@@ -2422,11 +2423,13 @@ func safeName(s string) string {
 }
 
 // parsePodNames parses the first column (pod name) from kubectl get pods --no-headers output.
+// Skips blank lines, header lines, and the "No resources found..." message that kubectl
+// prints when a namespace exists but contains no pods.
 func parsePodNames(out []byte) []string {
 	var names []string
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "NAME") {
+		if line == "" || strings.HasPrefix(line, "NAME") || strings.HasPrefix(line, "No ") {
 			continue
 		}
 		fields := strings.Fields(line)
@@ -2437,20 +2440,35 @@ func parsePodNames(out []byte) []string {
 	return names
 }
 
+// isOperatorPod returns true for pods belonging to the Weka Operator itself
+// (controller-manager, node-agents, driver distribution pod).
+func isOperatorPod(pod string) bool {
+	return strings.HasPrefix(pod, "weka-operator-") || pod == "weka-drivers-dist"
+}
+
+// isWekaContainerPod returns true for pods that run weka processes (compute/drive/frontend).
+// Only these pods have the weka binary on PATH and /opt/weka/logs on a mounted PVC.
+func isWekaContainerPod(pod string) bool {
+	return strings.Contains(pod, "-compute-") ||
+		strings.Contains(pod, "-drive-") ||
+		strings.Contains(pod, "-frontend-")
+}
+
 // wekaK8sNamespaces holds the discovered (or user-overridden) namespace for each
 // Weka component in the K8s cluster.
 type wekaK8sNamespaces struct {
-	Operator string // weka-operator deployment
-	Cluster  string // WekaCluster pods (compute/drive/frontend)
-	CSI      string // CSI plugin controller + node daemonset
+	Operator    string // weka-operator deployment
+	Cluster     string // WekaCluster pods (compute/drive/frontend); often same as Operator
+	ClusterName string // WekaCluster CRD instance name (e.g. "mycluster-1")
+	CSI         string // CSI plugin controller + node daemonset
 }
 
-// discoverWekaK8sNamespaces auto-detects namespaces for Weka Operator, WekaCluster
-// pods, and the CSI plugin. Falls back to well-known defaults when discovery fails.
+// discoverWekaK8sNamespaces auto-detects namespaces and the WekaCluster name.
+// In most deployments all Weka pods share a single namespace (weka-operator-system).
 func discoverWekaK8sNamespaces(kc *kubectlRunner) wekaK8sNamespaces {
 	ns := wekaK8sNamespaces{
 		Operator: "weka-operator-system",
-		Cluster:  "default",
+		Cluster:  "weka-operator-system", // default: same namespace as operator
 		CSI:      "weka-csi-plugin",
 	}
 
@@ -2461,17 +2479,19 @@ func discoverWekaK8sNamespaces(kc *kubectlRunner) wekaK8sNamespaces {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && strings.Contains(strings.ToLower(fields[1]), "weka-operator") {
 			ns.Operator = fields[0]
+			ns.Cluster = fields[0] // align cluster default to discovered operator ns
 			break
 		}
 	}
 
-	// WekaCluster CRD namespace (first instance)
+	// WekaCluster CRD: get both namespace and instance name
 	out = kc.runLenient("get", "wekacluster", "--all-namespaces", "--no-headers",
-		"-o", "custom-columns=NS:.metadata.namespace")
+		"-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
 	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && line != "NS" {
-			ns.Cluster = line
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && !strings.HasPrefix(fields[0], "No") {
+			ns.Cluster = fields[0]
+			ns.ClusterName = fields[1]
 			break
 		}
 	}
@@ -2509,6 +2529,7 @@ type k8sManifest struct {
 	CollectedAt       time.Time `json:"collected_at"`
 	Version           string    `json:"version"`
 	JumpHost          string    `json:"jump_host,omitempty"`
+	ClusterName       string    `json:"cluster_name,omitempty"`
 	OperatorNamespace string    `json:"operator_namespace"`
 	ClusterNamespace  string    `json:"cluster_namespace"`
 	CSINamespace      string    `json:"csi_namespace"`
@@ -2522,10 +2543,18 @@ type k8sManifest struct {
 func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k8sManifest) {
 	base := root + "/cluster"
 
+	// run counts failures (required resources).
 	run := func(name string, args ...string) {
 		m.TotalCommands++
 		if !kubectlToArchive(tw, kc, base+"/"+name, args...) {
 			m.FailedCommands++
+		}
+	}
+	// soft: optional resources — not counted as failures when missing.
+	soft := func(name string, args ...string) {
+		out := kc.runLenient(args...)
+		if len(out) > 0 {
+			_ = addBytesToArchive(tw, base+"/"+name, out)
 		}
 	}
 
@@ -2534,6 +2563,7 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 	run("version.txt", "version")
 	run("nodes_wide.txt", "get", "nodes", "-o", "wide")
 	run("nodes.yaml", "get", "nodes", "-o", "yaml")
+	run("nodes_describe.txt", "describe", "nodes") // conditions, events, resource pressure per node
 	run("cluster_info.txt", "cluster-info")
 	run("namespaces.txt", "get", "namespaces")
 	run("events_all.txt", "get", "events", "--all-namespaces", "--sort-by=.lastTimestamp")
@@ -2545,9 +2575,12 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 	run("csidrivers.txt", "get", "csidrivers")
 	run("csidrivers.yaml", "get", "csidriver", "-o", "yaml")
 
-	// Weka CRD instances (all namespaces) — lenient: CRD may not exist
-	wekaCRDs := []struct{ file, crd string }{
-		{"wekacluster.yaml", "wekacluster"},
+	// Required Weka CRD (counts as failure if missing)
+	run("wekacluster.yaml", "get", "wekacluster", "--all-namespaces", "-o", "yaml")
+
+	// Optional Weka CRDs — may not be installed depending on features in use.
+	// Not counted as failures when absent.
+	for _, c := range []struct{ file, crd string }{
 		{"wekafilesystem.yaml", "wekafilesystem"},
 		{"wekafilesystemgroup.yaml", "wekafilesystemgroup"},
 		{"wekanfsinterface.yaml", "wekanfsinterface"},
@@ -2556,15 +2589,16 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 		{"wekanfspermission.yaml", "wekanfspermission"},
 		{"wekasmb.yaml", "wekasmb"},
 		{"wekaclientconfig.yaml", "wekaclientconfig"},
-	}
-	for _, c := range wekaCRDs {
-		run(c.file, "get", c.crd, "--all-namespaces", "-o", "yaml")
+	} {
+		soft(c.file, "get", c.crd, "--all-namespaces", "-o", "yaml")
 	}
 }
 
-// collectK8sNamespaceMeta collects pod listing, events, workloads, and services
-// for a namespace into root/, then returns the list of pod names.
-func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) []string {
+// collectK8sNamespaceMeta collects namespace-level resources (pods listing, events,
+// workloads, services) into root/ and returns the list of pod names.
+// podFilter, when non-nil, restricts which pod names are returned for per-pod
+// collection; namespace-level resources are always collected in full.
+func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest, podFilter func(string) bool) []string {
 	run := func(name string, args ...string) {
 		m.TotalCommands++
 		if !kubectlToArchive(tw, kc, root+"/"+name, args...) {
@@ -2581,7 +2615,6 @@ func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string,
 		"-o", "custom-columns=NAME:.metadata.name,TYPE:.type")
 	run("pvcs.txt", "get", "pvc", "-n", ns, "-o", "wide")
 
-	// Get pod names for caller
 	m.TotalCommands++
 	podsOut, err := kc.run("get", "pods", "-n", ns, "--no-headers")
 	if err != nil {
@@ -2589,7 +2622,17 @@ func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string,
 		warnf("k8s: cannot list pods in namespace %s: %v", ns, err)
 		return nil
 	}
-	return parsePodNames(podsOut)
+	pods := parsePodNames(podsOut)
+	if podFilter == nil {
+		return pods
+	}
+	var filtered []string
+	for _, p := range pods {
+		if podFilter(p) {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
 }
 
 // collectK8sPodLogs collects describe + stdout logs + previous logs for one pod.
@@ -2616,16 +2659,25 @@ func collectK8sPodLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, podDir string
 	}
 }
 
-// wekaPodCLICommands are run via kubectl exec inside WekaCluster pods.
-// Many will fail on non-compute pods — failures are silently skipped.
-var wekaPodCLICommands = []struct {
+// clusterWideCLICommands are run once per cluster from the first responsive
+// compute pod. Output is identical on every pod so there is no value running
+// them per-pod — doing so only inflates the failure count on non-compute pods.
+var clusterWideCLICommands = []struct {
 	name string
 	cmd  []string
 }{
 	{"weka_status.json", []string{"weka", "status", "--json"}},
+	{"weka_alerts.json", []string{"weka", "alerts", "--json"}},
+}
+
+// perPodCLICommands are run on each compute/drive pod individually because
+// they return node-local data that differs per container.
+var perPodCLICommands = []struct {
+	name string
+	cmd  []string
+}{
 	{"weka_local_ps.txt", []string{"weka", "local", "ps"}},
 	{"weka_local_resources.json", []string{"weka", "local", "resources", "--json"}},
-	{"weka_alerts.json", []string{"weka", "alerts", "--json"}},
 }
 
 // collectK8sOptWekaLogs tries to enumerate and cat file-based weka process logs
@@ -2673,66 +2725,108 @@ func collectK8sOptWekaLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, archiveDi
 	}
 }
 
-// collectK8sOperator collects the Weka Operator pod, its logs, and the
-// WekaCluster CRD spec/status from the operator namespace.
-func collectK8sOperator(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) {
-	logf("  Collecting Weka Operator (namespace: %s)...", ns)
+// collectK8sOperator collects Weka Operator pods (controller-manager, node-agents,
+// driver-dist), their logs, and the WekaCluster CRD spec/status.
+// When operatorNS == clusterNS the namespace is shared; podFilter restricts
+// per-pod collection to operator pods only so WekaCluster pods are not duplicated.
+func collectK8sOperator(tw *tar.Writer, kc *kubectlRunner, root, operatorNS, clusterNS string, m *k8sManifest) {
+	logf("  Collecting Weka Operator (namespace: %s)...", operatorNS)
 
-	pods := collectK8sNamespaceMeta(tw, kc, root, ns, m)
-	logf("    %d pods", len(pods))
+	var podFilter func(string) bool
+	if operatorNS == clusterNS {
+		podFilter = isOperatorPod // only weka-operator-* and weka-drivers-dist
+	}
+
+	pods := collectK8sNamespaceMeta(tw, kc, root, operatorNS, m, podFilter)
+	logf("    %d operator pods", len(pods))
 
 	for _, pod := range pods {
 		podDir := root + "/" + safeName(pod)
-		vlogf("k8s: operator pod %s/%s", ns, pod)
-		collectK8sPodLogs(tw, kc, ns, pod, podDir, m)
+		vlogf("k8s: operator pod %s/%s", operatorNS, pod)
+		collectK8sPodLogs(tw, kc, operatorNS, pod, podDir, m)
 	}
 
-	// WekaCluster CRD status (most useful resource in operator namespace)
+	// WekaCluster CRD status — most useful single resource for diagnosing operator issues
 	m.TotalCommands++
 	if !kubectlToArchive(tw, kc, root+"/wekacluster_status.yaml",
-		"get", "wekacluster", "-n", ns, "-o", "yaml") {
+		"get", "wekacluster", "-n", operatorNS, "-o", "yaml") {
 		m.FailedCommands++
 	}
 }
 
-// collectK8sWekaCluster collects WekaCluster pod diagnostics: namespace metadata,
-// per-pod stdout logs, in-pod weka CLI commands, and file-based /opt/weka logs.
-func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) {
-	logf("  Collecting WekaCluster pods (namespace: %s)...", ns)
+// collectK8sWekaCluster collects WekaCluster pod diagnostics.
+// When clusterNS == operatorNS, operator pods are excluded via podFilter.
+// Cluster-wide weka CLI (status/alerts) is run once from the first compute pod.
+// Per-pod CLI (local ps/resources) and /opt/weka/logs are only attempted on
+// compute/drive/frontend pods that actually have the weka binary.
+func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, operatorNS string, m *k8sManifest) {
+	logf("  Collecting WekaCluster pods (namespace: %s)...", clusterNS)
 
-	pods := collectK8sNamespaceMeta(tw, kc, root, ns, m)
-	logf("    %d pods", len(pods))
+	var podFilter func(string) bool
+	if clusterNS == operatorNS {
+		podFilter = func(p string) bool { return !isOperatorPod(p) }
+	}
 
-	for _, pod := range pods {
-		podDir := root + "/" + safeName(pod)
-		vlogf("k8s: wekacluster pod %s/%s", ns, pod)
+	pods := collectK8sNamespaceMeta(tw, kc, root, clusterNS, m, podFilter)
+	logf("    %d WekaCluster pods", len(pods))
 
-		collectK8sPodLogs(tw, kc, ns, pod, podDir, m)
-
-		// Weka CLI via exec (best-effort — only compute pods will respond)
-		for _, spec := range wekaPodCLICommands {
-			m.TotalCommands++
-			out, execErr := kc.execInPod(ns, pod, "", spec.cmd...)
-			if execErr != nil {
-				m.FailedCommands++
-				vlogf("k8s: exec %s %v: %v", pod, spec.cmd[0], execErr)
+	// Cluster-wide CLI: run once from the first responsive compute pod.
+	// weka status / weka alerts return the same output on every pod.
+	for _, spec := range clusterWideCLICommands {
+		for _, pod := range pods {
+			if !isWekaContainerPod(pod) {
 				continue
 			}
-			_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, out)
+			m.TotalCommands++
+			out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
+			if err != nil {
+				m.FailedCommands++
+				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
+				continue
+			}
+			_ = addBytesToArchive(tw, root+"/weka-cli/"+spec.name, out)
+			break // success — no need to try other pods
 		}
+	}
 
-		// File-based weka logs from /opt/weka/ (PVC-backed, most valuable source)
-		collectK8sOptWekaLogs(tw, kc, ns, pod, podDir+"/opt-weka-logs", m)
+	// Per-pod collection
+	for _, pod := range pods {
+		podDir := root + "/" + safeName(pod)
+		vlogf("k8s: wekacluster pod %s/%s", clusterNS, pod)
+
+		collectK8sPodLogs(tw, kc, clusterNS, pod, podDir, m)
+
+		// weka local ps/resources and /opt/weka/logs only on compute/drive/frontend pods
+		if isWekaContainerPod(pod) {
+			for _, spec := range perPodCLICommands {
+				m.TotalCommands++
+				out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
+				if err != nil {
+					m.FailedCommands++
+					vlogf("k8s: exec %s %s: %v", pod, spec.cmd[0], err)
+					continue
+				}
+				_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, out)
+			}
+			collectK8sOptWekaLogs(tw, kc, clusterNS, pod, podDir+"/opt-weka-logs", m)
+		}
 	}
 }
 
 // collectK8sCSI collects CSI plugin diagnostics: controller + node daemonset
-// pods, their stdout logs, and CSI-specific K8s resources.
+// pods and their stdout logs. Skips gracefully when the namespace does not exist.
 func collectK8sCSI(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest) {
 	logf("  Collecting CSI plugin (namespace: %s)...", ns)
 
-	pods := collectK8sNamespaceMeta(tw, kc, root, ns, m)
-	logf("    %d pods", len(pods))
+	// Check namespace exists before attempting collection — CSI may not be installed.
+	if _, err := kc.run("get", "namespace", ns); err != nil {
+		logf("  CSI namespace %q not found — skipping", ns)
+		logf("  (CSI plugin may not be installed; use --csi-ns to override)")
+		return
+	}
+
+	pods := collectK8sNamespaceMeta(tw, kc, root, ns, m, nil)
+	logf("    %d CSI pods", len(pods))
 
 	for _, pod := range pods {
 		podDir := root + "/" + safeName(pod)
@@ -2757,7 +2851,7 @@ OPTIONS
                        (default: auto-detect via WekaCluster CRD)
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
-  --output PATH        Output .tar.gz path (default: ./k8s-weka-logs-<ts>.tar.gz)
+  --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
   --verbose            Verbose output (show every kubectl call)
   --version            Print version and exit
@@ -2790,7 +2884,7 @@ func runK8sMode(args []string) {
 	operatorNS := fs.String("operator-ns", "", "Override Weka Operator namespace")
 	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
-	outputPath := fs.String("output", "", "Output .tar.gz path (default: ./k8s-weka-logs-<ts>.tar.gz)")
+	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz)", wlcBundlesDir))
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
 	ver := fs.Bool("version", false, "Print version and exit")
@@ -2824,10 +2918,8 @@ func runK8sMode(args []string) {
 	collectionStart := time.Now()
 
 	outPath := *outputPath
-	if outPath == "" {
-		ts := time.Now().Format("2006-01-02T15-04-05")
-		outPath = fmt.Sprintf("k8s-weka-logs-%s.tar.gz", ts)
-	}
+	// Default output goes to the standard bundles directory, named after the cluster.
+	// Resolved after namespace discovery so we have the cluster name.
 
 	kc := &kubectlRunner{
 		jumpHost:   *k8sHost,
@@ -2843,11 +2935,7 @@ func runK8sMode(args []string) {
 
 	// Verify kubectl is reachable before doing anything else
 	phase("Checking kubectl connectivity")
-	verOut, verErr := kc.run("version", "--short")
-	if verErr != nil {
-		// --short removed in kubectl v1.28+
-		verOut, verErr = kc.run("version")
-	}
+	verOut, verErr := kc.run("version")
 	if verErr != nil {
 		errorf("Cannot reach kubectl: %v", verErr)
 		if *k8sHost != "" {
@@ -2873,7 +2961,25 @@ func runK8sMode(args []string) {
 	}
 	logf("  Operator namespace:    %s", ns.Operator)
 	logf("  WekaCluster namespace: %s", ns.Cluster)
+	if ns.ClusterName != "" {
+		logf("  WekaCluster name:      %s", ns.ClusterName)
+	}
 	logf("  CSI namespace:         %s", ns.CSI)
+	if ns.Operator == ns.Cluster {
+		logf("  (operator and cluster share namespace — operator pods will be separated by name prefix)")
+	}
+
+	// Resolve default output path now that we have the cluster name.
+	if outPath == "" {
+		_ = os.MkdirAll(wlcBundlesDir, 0755)
+		clusterLabel := ns.ClusterName
+		if clusterLabel == "" {
+			clusterLabel = "k8s"
+		}
+		ts := time.Now().Format("2006-01-02T15-04-05")
+		outPath = filepath.Join(wlcBundlesDir, fmt.Sprintf("%s-weka-logs-%s.tar.gz", clusterLabel, ts))
+	}
+	logf("  Output: %s", outPath)
 
 	// Open output archive
 	outFile, err := os.Create(outPath)
@@ -2895,6 +3001,7 @@ func runK8sMode(args []string) {
 		CollectedAt:       time.Now(),
 		Version:           version,
 		JumpHost:          *k8sHost,
+		ClusterName:       ns.ClusterName,
 		OperatorNamespace: ns.Operator,
 		ClusterNamespace:  ns.Cluster,
 		CSINamespace:      ns.CSI,
@@ -2904,17 +3011,13 @@ func runK8sMode(args []string) {
 	collectK8sClusterLevel(tw, kc, archiveRoot, m)
 
 	phase("Collecting Weka Operator")
-	collectK8sOperator(tw, kc, archiveRoot+"/operator", ns.Operator, m)
+	collectK8sOperator(tw, kc, archiveRoot+"/operator", ns.Operator, ns.Cluster, m)
 
 	phase("Collecting WekaCluster pods")
-	collectK8sWekaCluster(tw, kc, archiveRoot+"/wekacluster", ns.Cluster, m)
+	collectK8sWekaCluster(tw, kc, archiveRoot+"/wekacluster", ns.Cluster, ns.Operator, m)
 
-	if ns.CSI != ns.Cluster {
-		phase("Collecting CSI plugin")
-		collectK8sCSI(tw, kc, archiveRoot+"/csi", ns.CSI, m)
-	} else {
-		logf("\nCSI namespace same as cluster namespace (%s) — skipping separate CSI collection", ns.CSI)
-	}
+	phase("Collecting CSI plugin")
+	collectK8sCSI(tw, kc, archiveRoot+"/csi", ns.CSI, m)
 
 	// Write manifest
 	manifestJSON, _ := json.MarshalIndent(m, "", "  ")
