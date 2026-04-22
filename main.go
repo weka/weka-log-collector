@@ -2316,9 +2316,13 @@ func uploadK8sBundle(kc *kubectlRunner, clusterNS, archivePath string) error {
 	supportDir := strings.TrimSpace(strings.SplitN(string(findOut), "\n", 2)[0])
 	logf("  Support dir: %s", supportDir)
 
-	// 4. Stream archive into the pod at /tmp/<filename>.
+	// 4. Stream archive into the pod under /opt/weka/ (one level above support/).
+	// The weka uploader agent runs with /opt/weka/ bind-mounted; /tmp is not
+	// accessible to it, so the symlink target must be inside /opt/weka/.
+	// This mirrors the bare-metal uploadBundle() staging approach exactly.
 	filename := filepath.Base(archivePath)
-	podArchivePath := "/tmp/" + filename
+	podStagedDir := filepath.Dir(supportDir) // e.g. /opt/weka/compute<uuid>
+	podArchivePath := podStagedDir + "/" + filename
 
 	info, _ := os.Stat(archivePath)
 	var sizeMB int64
