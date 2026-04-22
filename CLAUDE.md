@@ -31,11 +31,11 @@ Install staticcheck:
 
 ## Deploying to Weka nodes
 
-The repo is cloned on backend nodes. After committing, update any node with:
+The compiled Linux binary is committed to the repo. Backend nodes update with:
 
-    git pull && go build -o weka-log-collector ./...
+    git pull
 
-This is the default deployment method — no scp needed.
+No build step needed on the node — the binary is always up to date in git.
 
 ## Code Layout
 
@@ -47,6 +47,7 @@ This is the default deployment method — no scp needed.
 
 - NEVER commit without running `task check` first
 - Fix ALL fmt, vet, lint, and test failures before committing
+- ALWAYS stage and commit the `weka-log-collector` binary alongside code changes (`git add weka-log-collector`)
 - No external dependencies — stdlib only
 - No CGo
 - Binary must build statically for Linux amd64 via `task build-linux`
