@@ -2,23 +2,22 @@
 
 ## Before Every Commit: Run All Quality Checks
 
-    cd /Users/manmeet.singh/weka_log_collector
     task check
 
-This runs in order: fmt -> vet -> lint -> test -> build.
+This runs in order: fmt -> vet -> lint -> test -> build -> build-linux.
 **Do not commit if any step fails.**
 
 ## Individual Tasks
 
-| Command         | What it does                                          |
-|-----------------|-------------------------------------------------------|
-| `task fmt`      | Format code with gofmt (modifies files)               |
-| `task vet`      | Static analysis (go vet)                              |
-| `task lint`     | Linter (staticcheck)                                  |
-| `task test`     | Unit tests (go test ./... -v)                         |
-| `task build`    | Compile binary for current platform                   |
-| `task build-linux` | Cross-compile static Linux binary for Weka nodes  |
-| `task check`    | All of the above, in order                            |
+| Command            | What it does                                          |
+|--------------------|-------------------------------------------------------|
+| `task fmt`         | Format code with gofmt (modifies files)               |
+| `task vet`         | Static analysis (go vet)                              |
+| `task lint`        | Linter (staticcheck)                                  |
+| `task test`        | Unit tests (go test ./... -v)                         |
+| `task build`       | Compile binary for current platform (macOS)           |
+| `task build-linux` | Cross-compile static Linux binary                     |
+| `task check`       | All of the above, in order                            |
 
 ## One-Time Setup
 
@@ -30,14 +29,13 @@ Install staticcheck:
 
     go install honnef.co/go/tools/cmd/staticcheck@latest
 
-## Building a Linux binary (for deployment to Weka nodes)
+## Deploying to Weka nodes
 
-    task build-linux
-    # produces: weka-log-collector_linux_amd64
+The repo is cloned on backend nodes. After committing, update any node with:
 
-Copy to a Weka node and run:
+    git pull && go build -o weka-log-collector ./...
 
-    scp weka-log-collector_linux_amd64 root@<node>:/tmp/weka-log-collector
+This is the default deployment method — no scp needed.
 
 ## Code Layout
 

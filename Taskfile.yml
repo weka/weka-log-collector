@@ -36,13 +36,14 @@ tasks:
       - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o {{.LINUX_BINARY}} ./...
 
   check:
-    desc: Run all quality checks (fmt, vet, lint, test, build)
+    desc: Run all quality checks (fmt, vet, lint, test, build, build-linux)
     cmds:
       - task: fmt
       - task: vet
       - task: lint
       - task: test
       - task: build
+      - task: build-linux
 
   clean:
     desc: Remove built binaries
