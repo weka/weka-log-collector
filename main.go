@@ -2950,48 +2950,48 @@ var perPodCLICommands = []struct {
 	{"weka_local_resources.json", []string{"weka", "local", "resources", "--json"}},
 }
 
-// collectK8sOptWekaLogs tries to enumerate and cat file-based weka process logs
-// from inside the pod. These live on PVCs and survive pod restarts.
-// / Path: /opt/weka/logs (PVC-backed, survives pod restarts).
+// collectK8sOptWekaLogs enumerates and archives weka process log files from
+// inside the pod. Files live on PVCs at /opt/weka/logs and survive pod restarts.
+// Extensions collected: *.log* (including rotated .log.1, .log.2), *.stats*
+// (atop.stats), *.json (upgrade_report_*.json), *.txt (traces.txt).
+// Directory structure is preserved in the archive under archiveDir.
 func collectK8sOptWekaLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, archiveDir string, m *k8sManifest) {
-	logPaths := []string{"/opt/weka/logs"}
+	logPath := "/opt/weka/logs"
 
-	for _, logPath := range logPaths {
+	m.TotalCommands++
+	findOut, findErr := kc.execInPod(ns, pod, "",
+		"find", logPath, "-maxdepth", "3", "-type", "f",
+		"(", "-name", "*.log*",
+		"-o", "-name", "*.stats*",
+		"-o", "-name", "*.json",
+		"-o", "-name", "*.txt",
+		"-o", "-name", "syslog",
+		")",
+	)
+	if findErr != nil {
+		m.FailedCommands++
+		vlogf("k8s: find %s in %s/%s: %v", logPath, ns, pod, findErr)
+		return
+	}
+
+	files := strings.Fields(string(findOut))
+	if len(files) == 0 {
+		return
+	}
+	logf("    Pod %s: %d files under %s", pod, len(files), logPath)
+
+	for _, f := range files {
 		m.TotalCommands++
-		findOut, findErr := kc.execInPod(ns, pod, "",
-			"find", logPath, "-maxdepth", "3", "-type", "f",
-			"(", "-name", "*.log", "-o", "-name", "syslog",
-			"-o", "-name", "output", "-o", "-name", "events", ")",
-		)
-		if findErr != nil {
+		content, catErr := kc.execInPod(ns, pod, "", "cat", f)
+		if catErr != nil {
 			m.FailedCommands++
-			vlogf("k8s: find %s in %s/%s: %v", logPath, ns, pod, findErr)
+			vlogf("k8s: cat %s in %s/%s: %v", f, ns, pod, catErr)
 			continue
 		}
-
-		files := strings.Fields(string(findOut))
-		if len(files) == 0 {
-			continue
-		}
-		logf("    Pod %s: %d files under %s", pod, len(files), logPath)
-
-		// Cap at 100 files to avoid overwhelming the archive
-		if len(files) > 100 {
-			files = files[:100]
-		}
-		for _, f := range files {
-			m.TotalCommands++
-			content, catErr := kc.execInPod(ns, pod, "", "cat", f)
-			if catErr != nil {
-				m.FailedCommands++
-				vlogf("k8s: cat %s in %s/%s: %v", f, ns, pod, catErr)
-				continue
-			}
-			// Strip leading slash, replace remaining / with __ for flat filename
-			rel := strings.TrimPrefix(f, "/")
-			destName := strings.ReplaceAll(rel, "/", "__")
-			_ = addBytesToArchive(tw, archiveDir+"/"+destName, content)
-		}
+		// Preserve directory structure: strip /opt/weka/logs/ prefix and use
+		// the remaining path directly so weka/output.log.1 stays as weka/output.log.1.
+		rel := strings.TrimPrefix(f, logPath+"/")
+		_ = addBytesToArchive(tw, archiveDir+"/"+rel, content)
 	}
 }
 
