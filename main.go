@@ -2585,12 +2585,26 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 	run("csidrivers.yaml", "get", "csidriver", "-o", "yaml")
 	run("csinodes.yaml", "get", "csinode", "-o", "yaml")
 
+	// Cluster-wide pod listing — useful for spotting co-located workloads and
+	// understanding scheduling when diagnosing node-level issues.
+	run("pods_all_wide.txt", "get", "pods", "--all-namespaces", "-o", "wide")
+
+	// kubectl top — requires metrics-server; skipped gracefully if unavailable.
+	soft("nodes_top.txt", "top", "nodes")
+	soft("pods_top.txt", "top", "pods", "--all-namespaces")
+
+	// helm list — deployment config (kubelet path, CSI version) is a frequent root cause.
+	soft("helm_releases.txt", "helm", "list", "--all-namespaces")
+
 	// Required Weka CRD (counts as failure if missing)
 	run("wekacluster.yaml", "get", "wekacluster", "--all-namespaces", "-o", "yaml")
 
 	// Optional Weka CRDs — may not be installed depending on features in use.
 	// Not counted as failures when absent.
+	// WekaContainer is the per-pod CRD managed by the operator — its status shows
+	// reconciliation errors, resource allocation, and container health per node.
 	for _, c := range []struct{ file, crd string }{
+		{"wekacontainer.yaml", "wekacontainer"},
 		{"wekafilesystem.yaml", "wekafilesystem"},
 		{"wekafilesystemgroup.yaml", "wekafilesystemgroup"},
 		{"wekanfsinterface.yaml", "wekanfsinterface"},
@@ -2622,9 +2636,12 @@ func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string,
 	run("workloads.txt", "get", "deployments,statefulsets,daemonsets,replicasets", "-n", ns)
 	run("services.txt", "get", "svc,endpoints", "-n", ns)
 	run("configmaps.txt", "get", "configmap", "-n", ns)
+	run("configmaps.yaml", "get", "configmap", "-n", ns, "-o", "yaml")
 	run("secrets_names.txt", "get", "secret", "-n", ns, "--no-headers",
 		"-o", "custom-columns=NAME:.metadata.name,TYPE:.type")
 	run("pvcs.txt", "get", "pvc", "-n", ns, "-o", "wide")
+	// Leader election leases — diagnoses split-brain and controller restart issues.
+	run("leases.txt", "get", "lease", "-n", ns)
 
 	m.TotalCommands++
 	podsOut, err := kc.run("get", "pods", "-n", ns, "--no-headers")
