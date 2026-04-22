@@ -2,13 +2,13 @@
 
 A standalone diagnostic log collector for [Weka](https://www.weka.io/) clusters.
 
-Drop a single binary on any Weka node and collect a compressed archive of logs and diagnostics — from one node or the entire cluster — in seconds.
+Drop a single binary on any Weka node and collect a compressed archive of logs and diagnostics — from one node or the entire cluster — in seconds. Works for both bare-metal/VM Weka clusters and **Weka-on-Kubernetes** deployments.
 
 ---
 
 ## Why this tool?
 
-For most support cases, `weka diags` is your starting point. This tool is a complement for situations where you need more targeted or flexible log collection.
+For most support cases, `weka diags` is your starting point. This tool complements it for situations where you need more targeted or flexible collection.
 
 - **Profile-based collection** — gather only what's relevant: default, full, perf, NFS, S3, SMB-W, or all
 - **Time-windowed journalctl** — scope `journalctl` to an incident window with `--start-time`/`--end-time`; all log files always collected in full
@@ -20,13 +20,14 @@ For most support cases, `weka diags` is your starting point. This tool is a comp
 - **Upload to Weka Home** — use `--upload` to send the archive directly to Weka Home via the node's uploader daemon; or use `--output -` to stream to stdout
 - **Bundle management** — list, remove, and clean up local bundles with `--list-bundles`, `--rm-bundle`, `--clean-bundles`
 - **Extra commands** — extend collection with custom commands via `--extra-commands`
+- **Kubernetes support** — first-class `k8s` subcommand for Weka-on-Kubernetes deployments
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/weka/weka-log-collector
+git clone https://github.com/manmeet-weka/weka-log-collector
 scp weka-log-collector/weka-log-collector root@<node-ip>:/opt/weka/weka-log-collector/weka-log-collector
 ```
 
@@ -58,6 +59,9 @@ weka-log-collector --start-time -2h
 
 # Specific incident window, full profile
 weka-log-collector --profile full --start-time 2026-03-20T14:00 --end-time 2026-03-20T16:00
+
+# Collect from a Weka-on-Kubernetes cluster
+weka-log-collector k8s --k8s-host jump.server.internal
 ```
 
 ---
@@ -66,6 +70,7 @@ weka-log-collector --profile full --start-time 2026-03-20T14:00 --end-time 2026-
 
 ```
 Usage: weka-log-collector [flags]
+       weka-log-collector k8s [k8s-flags]
 
 Flags:
   --local              Collect from local host only (no SSH, no cluster discovery)
@@ -86,9 +91,9 @@ Flags:
   --completion         Print bash completion script to stdout (also installs to /etc/bash_completion.d/)
 
 Bundle management:
-  --list-bundles       List bundles in /opt/weka/weka-log-collector/bundles
+  --list-bundles       List bundles across all cluster nodes (or just this node with --local)
   --rm-bundle          Remove a specific bundle (filename or full path)
-  --clean-bundles      Remove all bundles
+  --clean-bundles      Remove all bundles on all cluster nodes (or just this node with --local)
 ```
 
 ### Examples
@@ -118,8 +123,11 @@ weka-log-collector --local --output - | ssh admin@bastion "cat > /data/weka-logs
 # Run extra commands from /opt/weka/weka-log-collector/extra-commands
 weka-log-collector --extra-commands --start-time -2h
 
-# List collected bundles on this node
+# List collected bundles across all cluster nodes
 weka-log-collector --list-bundles
+
+# List bundles on local node only
+weka-log-collector --list-bundles --local
 
 # Upload a previously collected archive to Weka Home
 weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
@@ -144,7 +152,7 @@ weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
 
 ## What gets collected
 
-**System commands** — uname, os-release, uptime, free, lscpu, ip addr/route/rule/neighbor, netstat, ps, df, lspci, lsblk, sysctl -a, dmesg, journalctl (weka-agent + time-windowed full journal), lshw (network), ofed_info, lsmod, modinfo (mlx5_core, ice), rp_filter, ethtool (all interfaces)
+**System commands** — uname, os-release, uptime, free, lscpu, ip addr/route/rule/neighbor, netstat, ps, df, lspci, lsblk, sysctl -a, dmesg, journalctl (weka-agent + time-windowed full journal), lshw (network), ofed_info, lsmod, modinfo (mlx5_core, ice), rp_filter, ethtool (all physical interfaces)
 
 **Clock sync** — timedatectl, timedatectl show-timesync, systemd-timesyncd status, chronyc tracking/sources, chronyd status, ntpd status, ptp4l/phc2sys status — whichever sync daemon is present on each node
 
@@ -157,6 +165,8 @@ weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
 **Vendor/driver logs** — `/var/log/mlnx/*.log*`, Weka kernel driver build logs
 
 Every host directory includes a `collection_manifest.json` with counts of commands run, files collected, and any failures.
+
+> Commands that are expected to fail on some distros or node types (e.g. `chronyc` on systems using ntpd, `ofed_info` on nodes without OFED) are automatically excluded from the failure count so the manifest accurately reflects real problems.
 
 ---
 
@@ -193,6 +203,138 @@ weka-log-collector \
 
 ---
 
+## Kubernetes (Weka-on-K8s)
+
+The `k8s` subcommand collects diagnostics from a Weka-on-Kubernetes deployment. It requires `kubectl` and a valid kubeconfig — either on the local machine or on an SSH jump host.
+
+```
+Usage: weka-log-collector k8s [flags]
+
+Flags:
+  --k8s-host HOST      SSH jump host with kubectl + kubeconfig (e.g. jump.server.internal)
+                       Omit to run kubectl locally (kubeconfig must be configured on PATH)
+  --kubeconfig PATH    Path to kubeconfig file (on the jump host when --k8s-host is set)
+  --operator-ns NS     Override auto-detected Weka Operator namespace
+                       (default: auto-detect, fall back to weka-operator-system)
+  --cluster-ns NS      Override auto-detected WekaCluster pod namespace
+                       (default: auto-detect via WekaCluster CRD)
+  --csi-ns NS          Override auto-detected CSI plugin namespace
+                       (default: auto-detect, fall back to weka-csi-plugin)
+  --output PATH        Output .tar.gz path (default: ~/wlc-bundles/<cluster>-weka-logs-<ts>.tar.gz)
+  --cmd-timeout        Timeout per kubectl command (default: 120s)
+  --verbose            Print detailed progress
+```
+
+### Examples
+
+```bash
+# Collect via SSH jump server (most common for Weka-on-K8s)
+weka-log-collector k8s --k8s-host jump.internal
+
+# Run locally when kubectl is already configured
+weka-log-collector k8s
+
+# Override namespaces when auto-detection fails
+weka-log-collector k8s --k8s-host jump.internal --cluster-ns my-weka --csi-ns my-csi
+
+# Save bundle to specific path
+weka-log-collector k8s --k8s-host jump.internal --output /tmp/k8s-bundle.tar.gz
+```
+
+### Namespace auto-detection
+
+The tool automatically discovers Weka namespaces by querying the `wekacluster` CRD. Typical Weka-on-K8s deployments have the operator and WekaCluster pods in the same namespace (`weka-operator-system`); the tool handles this correctly and avoids duplicate collection. CSI is detected separately (typically `weka-csi-plugin`) and skipped gracefully if not installed.
+
+### What the k8s subcommand collects
+
+**Cluster level**
+- `kubectl describe nodes` (all nodes — kubelet args, allocatable resources, conditions, events)
+- Events across all namespaces
+- Namespaces, StorageClasses, PersistentVolumes, PersistentVolumeClaims
+- CSIDrivers, CSINodes, CSIStorageCapacities
+- WekaCluster CRD (spec + status) and all optional Weka CRDs: WekaFilesystem, WekaSnapshot, WekaFilesystemGroup, WekaClientSet, WekaLocalVolume, WekaBackup, WekaQuota, WekaObjectStore
+
+**Weka Operator**
+- Controller-manager pod logs (current + previous)
+- Node-agent daemonset pod logs (current + previous, one per K8s node)
+- `weka-drivers-dist` pod logs
+- Pod describe + events for all operator pods
+- WekaCluster CRD instance describe
+
+**WekaCluster pods** (compute, drive, frontend)
+- Pod logs for all containers (current + previous)
+- Pod describe + events per pod
+- `weka status --json` — collected once cluster-wide from first responsive compute pod
+- `weka alerts --json` — collected once cluster-wide
+- `weka local ps` — per pod (node-local data)
+- `weka local resources --json` — per pod (node-local data)
+- Full `/opt/weka/logs/` tree via `kubectl exec` — syslog, output, supervisord, shelld, nginx, events, api logs, wtracer logs (PVC-backed, survives pod restarts)
+
+**CSI plugin** (if installed)
+- Controller pod logs (current + previous)
+- Node daemonset pod logs (current + previous, one per K8s node)
+- Pod describe + events
+- Namespace events
+
+A `collection_manifest.json` at the bundle root records the total commands run, failed commands, and timestamps.
+
+### Bundle output
+
+The k8s bundle is structured as:
+
+```
+<cluster>-weka-logs-<timestamp>/
+  collection_manifest.json
+  cluster/
+    nodes_describe.txt
+    events.txt
+    storageclasses.txt
+    persistentvolumes.txt
+    persistentvolumeclaims.txt
+    csidrivers.txt
+    csinodes.txt
+    wekacluster.yaml
+    wekafilesystem.yaml
+    ...
+  operator/
+    pods_wide.txt
+    events.txt
+    weka-operator-controller-manager-xxx/
+      logs/current.log
+      logs/previous.log
+      describe.txt
+    weka-operator-node-agent-xxx/  (one per node)
+      ...
+  wekacluster/
+    pods_wide.txt
+    events.txt
+    weka-cli/
+      weka_status.json
+      weka_alerts.json
+    <cluster>-compute-xxx/
+      logs/current.log
+      logs/previous.log
+      describe.txt
+      weka_local_ps.txt
+      weka_local_resources.json
+      opt-weka-logs/
+        syslog
+        output
+        supervisord.log
+        ...
+    <cluster>-drive-xxx/
+      ...
+  csi/
+    pods_wide.txt
+    events.txt
+    csi-wekafsplugin-controller-xxx/
+      ...
+    csi-wekafsplugin-node-xxx/  (one per node)
+      ...
+```
+
+---
+
 ## Uploading to Weka Home
 
 Add `--upload` to any collection command to send the archive directly to Weka Home:
@@ -224,36 +366,44 @@ When `--upload` is used in cluster mode (without `--local`), collection and uplo
 
 ---
 
+## Bundle management
+
+Bundles are stored in `/opt/weka/weka-log-collector/bundles/` by default.
+
+`--list-bundles` and `--clean-bundles` operate cluster-wide by default (SSH to all nodes), or locally with `--local`.
+
+```bash
+# List all bundles across the cluster
+weka-log-collector --list-bundles
+
+# List bundles on local node only
+weka-log-collector --list-bundles --local
+
+# Remove a specific bundle
+weka-log-collector --rm-bundle mycluster-weka-logs-2026-04-20T10-00-00.tar.gz
+
+# Remove all bundles on all cluster nodes
+weka-log-collector --clean-bundles
+
+# Remove all bundles on local node only
+weka-log-collector --clean-bundles --local
+```
+
+---
+
 ## Tab completion
 
 ```bash
 source <(./weka-log-collector --completion)
 ```
 
-This also installs the completion script to `/etc/bash_completion.d/weka-log-collector` so future shell sessions load it automatically. Add the line to your `.bashrc` for this session. Completes all flags, profile names, and common time values.
+This also installs the completion script to `/etc/bash_completion.d/weka-log-collector` so future shell sessions load it automatically. Add the line to your `.bashrc` for this session. Completes all flags, profile names, and common time values. The `k8s` subcommand has its own completion branch with k8s-specific flags.
 
 ---
 
 ## Extra commands
 
 Place custom shell commands in `/opt/weka/weka-log-collector/extra-commands` (one per line, `#` for comments) and pass `--extra-commands` to include their output in the archive. Commands already collected by the default profile are skipped automatically.
-
----
-
-## Bundle management
-
-Bundles are stored in `/opt/weka/weka-log-collector/bundles/` by default.
-
-```bash
-# List all bundles
-weka-log-collector --list-bundles
-
-# Remove a specific bundle
-weka-log-collector --rm-bundle mycluster-weka-logs-2026-04-20T10-00-00.tar.gz
-
-# Remove all bundles
-weka-log-collector --clean-bundles
-```
 
 ---
 
@@ -300,6 +450,8 @@ go install honnef.co/go/tools/cmd/staticcheck@latest
 | `task build` | Build binary for current platform |
 | `task build-linux` | Cross-compile static Linux binary |
 | `task check` | All of the above in order |
+
+Run `task check` before every commit. All fmt, vet, lint, and test failures must be resolved.
 
 ### Constraints
 
