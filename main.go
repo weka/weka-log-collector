@@ -2571,7 +2571,7 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 	run("nodes_wide.txt", "get", "nodes", "-o", "wide")
 	run("nodes.yaml", "get", "nodes", "-o", "yaml")
 	run("nodes_describe.txt", "describe", "nodes") // conditions, events, resource pressure per node
-	run("cluster_info.txt", "cluster-info")
+	run("cluster_info_dump.txt", "cluster-info", "dump")
 	run("namespaces.txt", "get", "namespaces")
 	run("events_all.txt", "get", "events", "--all-namespaces", "--sort-by=.lastTimestamp")
 	run("crds.txt", "get", "crd", "-o", "wide")
