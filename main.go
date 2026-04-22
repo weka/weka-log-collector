@@ -2689,9 +2689,9 @@ var perPodCLICommands = []struct {
 
 // collectK8sOptWekaLogs tries to enumerate and cat file-based weka process logs
 // from inside the pod. These live on PVCs and survive pod restarts.
-// Paths tried: /opt/weka/logs and /opt/weka/data/default/logs.
+// / Path: /opt/weka/logs (PVC-backed, survives pod restarts).
 func collectK8sOptWekaLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, archiveDir string, m *k8sManifest) {
-	logPaths := []string{"/opt/weka/logs", "/opt/weka/data/default/logs"}
+	logPaths := []string{"/opt/weka/logs"}
 
 	for _, logPath := range logPaths {
 		m.TotalCommands++
