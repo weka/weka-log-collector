@@ -2238,6 +2238,148 @@ func uploadBundle(archivePath string, sessionID int64) error {
 	return fmt.Errorf("upload failed — no weka uploader processed the file; check 'weka cloud status'")
 }
 
+// uploadK8sBundle uploads the collected archive to Weka Home by exec-ing into a
+// compute pod and using the weka uploader daemon that runs inside it.
+//
+// On a K8s node the weka binary does not exist — all weka commands must be
+// run inside pods. This function:
+//  1. Finds a live compute/drive/frontend pod in clusterNS.
+//  2. Verifies cloud is registered via `weka cloud status` inside the pod.
+//  3. Streams the archive into the pod at /tmp/<filename> via stdin.
+//  4. Finds the support directory (e.g. /opt/weka/drives0/support) in the pod.
+//  5. Creates the wlc:<id>:<host>:<file> symlink the uploader expects.
+//  6. Polls until the uploader moves the symlink to .uploaded/ or removes it.
+func uploadK8sBundle(kc *kubectlRunner, clusterNS, archivePath string) error {
+	phase("Uploading to Weka Home (via K8s pod)")
+
+	// 1. Find a compute/drive/frontend pod.
+	podOut, err := kc.run("get", "pods", "-n", clusterNS, "--no-headers")
+	if err != nil {
+		return fmt.Errorf("list pods in %s: %w", clusterNS, err)
+	}
+	var computePod string
+	for _, name := range parsePodNames(podOut) {
+		if isWekaContainerPod(name) {
+			computePod = name
+			break
+		}
+	}
+	if computePod == "" {
+		return fmt.Errorf("no compute/drive/frontend pod found in namespace %s", clusterNS)
+	}
+	logf("  Using pod: %s/%s", clusterNS, computePod)
+
+	// 2. Verify cloud is registered inside the pod.
+	cloudOut, err := kc.execInPod(clusterNS, computePod, "", "weka", "cloud", "status")
+	if err != nil {
+		return fmt.Errorf("'weka cloud status' in pod %s: %w", computePod, err)
+	}
+	var hasURL, isRegistered bool
+	cloudURL := ""
+	totalHosts, disabledHosts := 0, 0
+	for _, line := range strings.Split(string(cloudOut), "\n") {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "url:") {
+			u := strings.TrimSpace(strings.TrimPrefix(trimmed, strings.SplitN(trimmed, ":", 2)[0]+":"))
+			if u != "" {
+				hasURL = true
+				cloudURL = u
+			}
+		}
+		if strings.HasPrefix(lower, "registration:") && strings.Contains(lower, "registered") {
+			isRegistered = true
+		}
+		if strings.Contains(trimmed, "HostId<") {
+			totalHosts++
+			if strings.HasSuffix(strings.ToUpper(trimmed), "DISABLED") {
+				disabledHosts++
+			}
+		}
+	}
+	if !hasURL || !isRegistered {
+		return fmt.Errorf("weka cloud is not registered — run 'weka cloud enable' inside a compute pod first")
+	}
+	if totalHosts > 0 && totalHosts == disabledHosts {
+		return fmt.Errorf("weka uploader daemon is DISABLED on all hosts — check 'weka cloud status' inside a compute pod")
+	}
+	if cloudURL != "" {
+		logf("  Target: %s", cloudURL)
+	}
+
+	// 3. Find the support directory inside the pod.
+	findOut, err := kc.execInPod(clusterNS, computePod, "",
+		"find", "/opt/weka", "-maxdepth", "4", "-name", "support", "-type", "d")
+	if err != nil || len(strings.TrimSpace(string(findOut))) == 0 {
+		return fmt.Errorf("no support directory found in pod %s under /opt/weka", computePod)
+	}
+	supportDir := strings.TrimSpace(strings.SplitN(string(findOut), "\n", 2)[0])
+	logf("  Support dir: %s", supportDir)
+
+	// 4. Stream archive into the pod at /tmp/<filename>.
+	filename := filepath.Base(archivePath)
+	podArchivePath := "/tmp/" + filename
+
+	info, _ := os.Stat(archivePath)
+	var sizeMB int64
+	if info != nil {
+		sizeMB = info.Size() / (1024 * 1024)
+	}
+	logf("  Transferring archive (%d MB) to pod...", sizeMB)
+	if err := kc.copyFileToPod(clusterNS, computePod, archivePath, podArchivePath); err != nil {
+		return fmt.Errorf("transfer archive to pod: %w", err)
+	}
+	// Always clean up the copied archive from the pod.
+	defer func() {
+		kc.execInPod(clusterNS, computePod, "", "rm", "-f", podArchivePath) //nolint:errcheck
+	}()
+
+	// 5. Create the wlc symlink in the support directory.
+	sessionID := time.Now().UnixNano()
+	hostname, _ := os.Hostname()
+	linkName := fmt.Sprintf("wlc:%d:%s:%s", sessionID, hostname, filename)
+	linkPath := supportDir + "/" + linkName
+	uploadedPath := supportDir + "/.uploaded/" + linkName
+
+	if _, err := kc.execInPod(clusterNS, computePod, "", "ln", "-s", podArchivePath, linkPath); err != nil {
+		return fmt.Errorf("create upload symlink in pod: %w", err)
+	}
+
+	estMins := (sizeMB / 60) + 1
+	logf("  Queued %s (%d MB) — waiting for weka uploader (~1 MB/s, est. ~%d min)...", filename, sizeMB, estMins)
+
+	// 6. Poll until the uploader daemon signals completion.
+	perDirTimeout := time.Duration(max(300, sizeMB*2)) * time.Second
+	start := time.Now()
+	lastLog := start
+	deadline := start.Add(perDirTimeout)
+
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Second)
+
+		// .uploaded/<linkName> appears when the uploader finishes.
+		if _, err := kc.execInPod(clusterNS, computePod, "", "test", "-e", uploadedPath); err == nil {
+			logf("  Upload complete (%.0fs)", time.Since(start).Seconds())
+			kc.execInPod(clusterNS, computePod, "", "rm", "-f", uploadedPath) //nolint:errcheck
+			return nil
+		}
+		// Uploader may also simply remove the symlink when done.
+		if _, err := kc.execInPod(clusterNS, computePod, "", "test", "-L", linkPath); err != nil {
+			logf("  Upload complete (%.0fs)", time.Since(start).Seconds())
+			return nil
+		}
+
+		if time.Since(lastLog) >= 60*time.Second {
+			logf("  Still uploading... elapsed: %s", time.Since(start).Round(time.Second))
+			lastLog = time.Now()
+		}
+	}
+
+	// Timed out — clean up the symlink to stop the uploader from picking it up later.
+	kc.execInPod(clusterNS, computePod, "", "rm", "-f", linkPath) //nolint:errcheck
+	return fmt.Errorf("upload timed out after %v — check 'weka cloud status' inside a compute pod", perDirTimeout)
+}
+
 // ── bash completion ───────────────────────────────────────────────────────────
 
 const bashCompletionScript = `# bash completion for weka-log-collector
@@ -2436,6 +2578,42 @@ func (k *kubectlRunner) podLogs(ns, pod, container string) ([]byte, error) {
 			"--all-containers=true", "--prefix=true", "--tail=50000")
 	}
 	return k.run("logs", pod, "-n", ns, "-c", container, "--tail=50000")
+}
+
+// copyFileToPod streams a local file into remotePath inside the pod via stdin,
+// using `kubectl exec -i -- sh -c 'cat > path'`. Works transparently through
+// the SSH jump host because stdin is forwarded through the SSH tunnel.
+func (k *kubectlRunner) copyFileToPod(ns, pod, localPath, remotePath string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", localPath, err)
+	}
+	defer f.Close()
+
+	remoteCmd := "cat > " + shellQuote(remotePath)
+	kcArgs := k.buildKubectlArgs([]string{"exec", "-i", pod, "-n", ns, "--", "sh", "-c", remoteCmd})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if k.jumpHost != "" {
+		parts := make([]string, len(kcArgs))
+		for i, a := range kcArgs {
+			parts[i] = shellQuote(a)
+		}
+		sshCmd := "kubectl " + strings.Join(parts, " ")
+		sshOpts := append(sshArgs(), "root@"+k.jumpHost, sshCmd)
+		cmd = exec.CommandContext(ctx, "ssh", sshOpts...)
+	} else {
+		cmd = exec.CommandContext(ctx, "kubectl", kcArgs...)
+	}
+	cmd.Stdin = f
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("copy to pod: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // safeName replaces characters unsafe for tar paths (/, :, space) with _.
@@ -2921,7 +3099,7 @@ OPTIONS
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
   --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz)
-  --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' on this node)
+  --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
   --verbose            Verbose output (show every kubectl call)
   --version            Print version and exit
@@ -2939,7 +3117,7 @@ EXAMPLES
   # Save to specific path
   weka-log-collector k8s --k8s-host jump.internal --output /tmp/k8s-bundle.tar.gz
 
-  # Collect and upload bundle to Weka Home (requires 'weka cloud enable' on this node)
+  # Collect and upload bundle to Weka Home (requires 'weka cloud enable' inside a compute pod)
   weka-log-collector k8s --upload
 
 `)
@@ -2958,7 +3136,7 @@ func runK8sMode(args []string) {
 	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
 	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz)", wlcBundlesDir))
-	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' on this node)")
+	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
 	ver := fs.Bool("version", false, "Print version and exit")
@@ -3115,7 +3293,7 @@ func runK8sMode(args []string) {
 	logf("  Commands: %d total, %d failed", m.TotalCommands, m.FailedCommands)
 
 	if *upload {
-		if err := uploadBundle(outPath, 0); err != nil {
+		if err := uploadK8sBundle(kc, ns.Cluster, outPath); err != nil {
 			errorf("Upload failed: %v", err)
 		}
 	}
