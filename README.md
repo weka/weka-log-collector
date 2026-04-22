@@ -221,6 +221,7 @@ Flags:
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
   --output PATH        Output .tar.gz path (default: ~/wlc-bundles/<cluster>-weka-logs-<ts>.tar.gz)
+  --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' on this node)
   --cmd-timeout        Timeout per kubectl command (default: 120s)
   --verbose            Print detailed progress
 ```

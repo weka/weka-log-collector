@@ -2262,7 +2262,7 @@ _weka_log_collector() {
     if [[ $in_k8s -eq 1 ]]; then
         # k8s-specific flags
         local k8s_opts="--k8s-host --kubeconfig --operator-ns --cluster-ns --csi-ns
-                        --output --cmd-timeout --verbose --version"
+                        --output --upload --cmd-timeout --verbose --version"
         case "$prev" in
             --output|--kubeconfig)
                 COMPREPLY=( $(compgen -f -- "$cur") )
@@ -2921,6 +2921,7 @@ OPTIONS
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
   --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz)
+  --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' on this node)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
   --verbose            Verbose output (show every kubectl call)
   --version            Print version and exit
@@ -2938,6 +2939,9 @@ EXAMPLES
   # Save to specific path
   weka-log-collector k8s --k8s-host jump.internal --output /tmp/k8s-bundle.tar.gz
 
+  # Collect and upload bundle to Weka Home (requires 'weka cloud enable' on this node)
+  weka-log-collector k8s --upload
+
 `)
 }
 
@@ -2954,6 +2958,7 @@ func runK8sMode(args []string) {
 	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
 	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz)", wlcBundlesDir))
+	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' on this node)")
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
 	ver := fs.Bool("version", false, "Print version and exit")
@@ -3108,6 +3113,12 @@ func runK8sMode(args []string) {
 		logf("\nK8s collection complete → %s (took %s)", outPath, elapsed)
 	}
 	logf("  Commands: %d total, %d failed", m.TotalCommands, m.FailedCommands)
+
+	if *upload {
+		if err := uploadBundle(outPath, 0); err != nil {
+			errorf("Upload failed: %v", err)
+		}
+	}
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
