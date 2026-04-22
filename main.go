@@ -64,6 +64,29 @@ var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
 
 func stripANSI(b []byte) []byte { return ansiEscape.ReplaceAll(b, nil) }
 
+// sensitiveKeyRe matches YAML/text keys that likely hold credentials or tokens.
+// Used to redact configmap values before archiving — secrets are never collected,
+// but some operators store tokens or API keys in configmaps.
+var sensitiveKeyRe = regexp.MustCompile(
+	`(?i)(password|passwd|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\s*:`)
+
+// redactSensitiveYAML replaces the value of any YAML key whose name matches
+// sensitiveKeyRe with [REDACTED]. Only single-line scalar values are redacted;
+// multiline blocks are left as-is (they do not contain credentials in practice).
+func redactSensitiveYAML(b []byte) []byte {
+	lines := bytes.Split(b, []byte("\n"))
+	for i, line := range lines {
+		if sensitiveKeyRe.Match(line) {
+			// Find the colon and replace everything after it.
+			idx := bytes.Index(line, []byte(":"))
+			if idx >= 0 && idx < len(line)-1 {
+				lines[i] = append(line[:idx+1], []byte(" [REDACTED]")...)
+			}
+		}
+	}
+	return bytes.Join(lines, []byte("\n"))
+}
+
 // isRotatedFile returns true when the filename looks like a rotated log archive.
 // Current active log files (syslog.log, output.log, messages) are always collected.
 // Rotated files (syslog.log.1, syslog.log.2.gz, messages-20260301) are filtered by mtime.
@@ -2636,7 +2659,15 @@ func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string,
 	run("workloads.txt", "get", "deployments,statefulsets,daemonsets,replicasets", "-n", ns)
 	run("services.txt", "get", "svc,endpoints", "-n", ns)
 	run("configmaps.txt", "get", "configmap", "-n", ns)
-	run("configmaps.yaml", "get", "configmap", "-n", ns, "-o", "yaml")
+	// configmaps.yaml: redact any sensitive-looking keys before archiving.
+	// Secrets are never collected (names only), but some operators store tokens
+	// or API endpoints in configmaps — redact as a precaution.
+	m.TotalCommands++
+	if cmOut, cmErr := kc.run("get", "configmap", "-n", ns, "-o", "yaml"); cmErr == nil {
+		_ = addBytesToArchive(tw, root+"/configmaps.yaml", redactSensitiveYAML(cmOut))
+	} else {
+		m.FailedCommands++
+	}
 	run("secrets_names.txt", "get", "secret", "-n", ns, "--no-headers",
 		"-o", "custom-columns=NAME:.metadata.name,TYPE:.type")
 	run("pvcs.txt", "get", "pvc", "-n", ns, "-o", "wide")

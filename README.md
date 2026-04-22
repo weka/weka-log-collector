@@ -429,6 +429,29 @@ Use `--output` to write to a different filesystem if space is tight.
 
 ---
 
+## Privacy & security
+
+This tool is designed to collect diagnostic data only — no credentials or secret values are ever included in the bundle.
+
+**What is deliberately excluded:**
+- Kubernetes Secret values — only names and types are collected (`NAME` + `TYPE` columns, no `.data`)
+- kubeconfig files
+- Environment variables from pods
+- Any files outside `/opt/weka/logs/` and `/opt/weka/data/`
+
+**Configmap redaction:**
+ConfigMap YAML content is collected (configmaps can contain useful config like proxy endpoints and boot scripts), but any key whose name matches a sensitive pattern is automatically redacted before writing to the archive. Redacted patterns include: `password`, `passwd`, `token`, `secret`, `api-key`, `auth`, `credential`, `private-key`, `access-key`, `signing-key`. The value is replaced with `[REDACTED]`.
+
+**What IS in the bundle that you should be aware of:**
+- Pod logs — may contain hostnames, IP addresses, filesystem paths, and internal service URLs
+- Weka cluster status — cluster name, node IPs, filesystem names, capacity figures
+- ConfigMap content (sensitive keys redacted as above)
+- Kubernetes node names, namespace names, and pod names
+
+**Recommendation:** Review the bundle before sharing externally, especially if the cluster handles regulated data. The bundle can be inspected with `tar -tzf <bundle>.tar.gz` and individual files extracted for review.
+
+---
+
 ## Developer guide
 
 ### Prerequisites
