@@ -2578,9 +2578,12 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 	run("storageclasses_wide.txt", "get", "storageclass", "-o", "wide")
 	run("storageclasses.yaml", "get", "storageclass", "-o", "yaml")
 	run("pvc_all.txt", "get", "pvc", "--all-namespaces")
+	run("pvc_all.yaml", "get", "pvc", "--all-namespaces", "-o", "yaml")
 	run("pv_all.txt", "get", "pv", "-o", "wide")
+	run("pv_all.yaml", "get", "pv", "-o", "yaml")
 	run("csidrivers.txt", "get", "csidrivers")
 	run("csidrivers.yaml", "get", "csidriver", "-o", "yaml")
+	run("csinodes.yaml", "get", "csinode", "-o", "yaml")
 
 	// Required Weka CRD (counts as failure if missing)
 	run("wekacluster.yaml", "get", "wekacluster", "--all-namespaces", "-o", "yaml")
@@ -2595,6 +2598,7 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 		{"wekauploadimage.yaml", "wekauploadimage"},
 		{"wekanfspermission.yaml", "wekanfspermission"},
 		{"wekasmb.yaml", "wekasmb"},
+		{"wekaclient.yaml", "wekaclient"},
 		{"wekaclientconfig.yaml", "wekaclientconfig"},
 	} {
 		soft(c.file, "get", c.crd, "--all-namespaces", "-o", "yaml")
@@ -2839,6 +2843,16 @@ func collectK8sCSI(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sMan
 		podDir := root + "/" + safeName(pod)
 		vlogf("k8s: CSI pod %s/%s", ns, pod)
 		collectK8sPodLogs(tw, kc, ns, pod, podDir, m)
+
+		// /run/weka-fs-mounts/ is a hostPath bind-mount directory created by the
+		// CSI node plugin. Its contents (or absence) reveal stale/rotated bind anchors
+		// that cause FailedMount errors — the primary signal for CSI mount failures.
+		if strings.Contains(pod, "-node-") {
+			out := kc.runLenient("exec", pod, "-n", ns, "--", "ls", "-la", "/run/weka-fs-mounts/")
+			if len(out) > 0 {
+				_ = addBytesToArchive(tw, podDir+"/weka_fs_mounts.txt", out)
+			}
+		}
 	}
 }
 
