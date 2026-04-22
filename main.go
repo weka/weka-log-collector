@@ -57,6 +57,13 @@ var relativeTimeRe = regexp.MustCompile(
 // Does NOT match: .log  .json  (current active log extensions)
 var rotatedFileSuffixRe = regexp.MustCompile(`(\.\d+|\.gz|-\d{8})$`)
 
+// ansiEscape matches ANSI/VT100 escape sequences (e.g. ESC[32m, ESC[0m).
+// Some containers (e.g. the Weka operator manager) emit colored log output;
+// kubectl captures the raw bytes, so these appear literally in saved log files.
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
+
+func stripANSI(b []byte) []byte { return ansiEscape.ReplaceAll(b, nil) }
+
 // isRotatedFile returns true when the filename looks like a rotated log archive.
 // Current active log files (syslog.log, output.log, messages) are always collected.
 // Rotated files (syslog.log.1, syslog.log.2.gz, messages-20260301) are filtered by mtime.
@@ -2648,14 +2655,14 @@ func collectK8sPodLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, podDir string
 		m.FailedCommands++
 		vlogf("k8s: logs %s/%s: %v", ns, pod, logsErr)
 	} else if len(logsOut) > 0 {
-		_ = addBytesToArchive(tw, podDir+"/logs/stdout.log", logsOut)
+		_ = addBytesToArchive(tw, podDir+"/logs/stdout.log", stripANSI(logsOut))
 	}
 
 	// Previous container logs are valuable when a pod has crashed/restarted
 	prevOut := kc.runLenient("logs", pod, "-n", ns,
 		"--all-containers=true", "--prefix=true", "--previous=true", "--tail=10000")
 	if len(prevOut) > 0 {
-		_ = addBytesToArchive(tw, podDir+"/logs/previous.log", prevOut)
+		_ = addBytesToArchive(tw, podDir+"/logs/previous.log", stripANSI(prevOut))
 	}
 }
 
