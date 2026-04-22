@@ -1,0 +1,5 @@
+#!/bin/sh
+# Build the Linux binary and stage it so every commit includes the latest binary.
+# Backend nodes only need `git pull` to get the updated binary.
+~/go/bin/task build-linux
+git add weka-log-collector

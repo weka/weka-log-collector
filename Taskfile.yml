@@ -45,6 +45,13 @@ tasks:
       - task: build
       - task: build-linux
 
+  install-hooks:
+    desc: Install git hooks (builds Linux binary and stages it on every commit)
+    cmds:
+      - cp hooks/pre-commit .git/hooks/pre-commit
+      - chmod +x .git/hooks/pre-commit
+      - echo "Git hooks installed."
+
   clean:
     desc: Remove built binaries
     cmds:

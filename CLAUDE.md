@@ -29,6 +29,10 @@ Install staticcheck:
 
     go install honnef.co/go/tools/cmd/staticcheck@latest
 
+Install git hooks (builds and stages the Linux binary on every commit):
+
+    task install-hooks
+
 ## Deploying to Weka nodes
 
 The compiled Linux binary is committed to the repo. Backend nodes update with:
