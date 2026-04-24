@@ -2436,7 +2436,7 @@ _weka_log_collector() {
 
     if [[ $in_k8s -eq 1 ]]; then
         # k8s-specific flags
-        local k8s_opts="--k8s-host --kubeconfig --operator-ns --cluster-ns --csi-ns
+        local k8s_opts="--k8s-host --kubeconfig --operator-ns --cluster-ns --cluster-name --csi-ns
                         --output --upload --cmd-timeout --verbose --version"
         case "$prev" in
             --output|--kubeconfig)
@@ -2706,7 +2706,7 @@ type wekaK8sNamespaces struct {
 
 // discoverWekaK8sNamespaces auto-detects namespaces and the WekaCluster name.
 // In most deployments all Weka pods share a single namespace (weka-operator-system).
-func discoverWekaK8sNamespaces(kc *kubectlRunner) wekaK8sNamespaces {
+func discoverWekaK8sNamespaces(kc *kubectlRunner, clusterNameHint string) wekaK8sNamespaces {
 	ns := wekaK8sNamespaces{
 		Operator: "weka-operator-system",
 		Cluster:  "weka-operator-system", // default: same namespace as operator
@@ -2731,9 +2731,11 @@ func discoverWekaK8sNamespaces(kc *kubectlRunner) wekaK8sNamespaces {
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && !strings.HasPrefix(fields[0], "No") {
-			ns.Cluster = fields[0]
-			ns.ClusterName = fields[1]
-			break
+			if clusterNameHint == "" || fields[1] == clusterNameHint {
+				ns.Cluster = fields[0]
+				ns.ClusterName = fields[1]
+				break
+			}
 		}
 	}
 
@@ -3129,6 +3131,8 @@ OPTIONS
                        (default: auto-detect, fall back to weka-operator-system)
   --cluster-ns NS      Override auto-detected WekaCluster pod namespace
                        (default: auto-detect via WekaCluster CRD)
+  --cluster-name NAME  Target a specific WekaCluster by name
+                       (required when multiple WekaCluster CRDs exist across namespaces)
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
   --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz)
@@ -3146,6 +3150,9 @@ EXAMPLES
 
   # Override namespaces when auto-detection fails
   weka-log-collector k8s --k8s-host jump.internal --cluster-ns my-weka --csi-ns my-csi
+
+  # Target a specific cluster when multiple WekaCluster CRDs exist
+  weka-log-collector k8s --cluster-name kreka-cluster
 
   # Save to specific path
   weka-log-collector k8s --k8s-host jump.internal --output /tmp/k8s-bundle.tar.gz
@@ -3167,6 +3174,7 @@ func runK8sMode(args []string) {
 	kubeconfig := fs.String("kubeconfig", "", "Path to kubeconfig (on jump host when --k8s-host is set)")
 	operatorNS := fs.String("operator-ns", "", "Override Weka Operator namespace")
 	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
+	clusterName := fs.String("cluster-name", "", "Target specific WekaCluster by name (required when multiple clusters exist)")
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
 	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz)", wlcBundlesDir))
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
@@ -3234,7 +3242,7 @@ func runK8sMode(args []string) {
 
 	// Namespace discovery
 	phase("Discovering Weka namespaces")
-	ns := discoverWekaK8sNamespaces(kc)
+	ns := discoverWekaK8sNamespaces(kc, *clusterName)
 	if *operatorNS != "" {
 		ns.Operator = *operatorNS
 	}
