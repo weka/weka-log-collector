@@ -2706,6 +2706,8 @@ type wekaK8sNamespaces struct {
 
 // discoverWekaK8sNamespaces auto-detects namespaces and the WekaCluster name.
 // In most deployments all Weka pods share a single namespace (weka-operator-system).
+// clusterNameHint, when non-empty, selects the WekaCluster CRD with that name; if
+// no CRD matches the hint the function prints an error and exits.
 func discoverWekaK8sNamespaces(kc *kubectlRunner, clusterNameHint string) wekaK8sNamespaces {
 	ns := wekaK8sNamespaces{
 		Operator: "weka-operator-system",
@@ -2725,18 +2727,37 @@ func discoverWekaK8sNamespaces(kc *kubectlRunner, clusterNameHint string) wekaK8
 		}
 	}
 
-	// WekaCluster CRD: get both namespace and instance name
+	// WekaCluster CRD: get both namespace and instance name.
+	// When clusterNameHint is set, select the CRD whose name matches exactly;
+	// otherwise pick the first one found.
 	out = kc.runLenient("get", "wekacluster", "--all-namespaces", "--no-headers",
 		"-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+	var allClusters []string
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && !strings.HasPrefix(fields[0], "No") {
-			if clusterNameHint == "" || fields[1] == clusterNameHint {
-				ns.Cluster = fields[0]
-				ns.ClusterName = fields[1]
-				break
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "No") {
+			continue
+		}
+		allClusters = append(allClusters, line)
+		if clusterNameHint == "" || fields[1] == clusterNameHint {
+			ns.Cluster = fields[0]
+			ns.ClusterName = fields[1]
+			if clusterNameHint == "" {
+				break // take first when no hint
 			}
 		}
+	}
+	if clusterNameHint != "" && ns.ClusterName != clusterNameHint {
+		errorf("WekaCluster CRD %q not found.", clusterNameHint)
+		if len(allClusters) > 0 {
+			errorf("Available clusters:")
+			for _, c := range allClusters {
+				errorf("  %s", c)
+			}
+		} else {
+			errorf("No WekaCluster CRDs found in the cluster.")
+		}
+		os.Exit(1)
 	}
 
 	// CSI: deployment or daemonset name contains "csi-wekafs"
@@ -3127,12 +3148,12 @@ OPTIONS
   --k8s-host HOST      SSH jump host with kubectl + kubeconfig (e.g. jump.server.internal)
                        Omit to run kubectl locally (kubeconfig must be on PATH host)
   --kubeconfig PATH    Path to kubeconfig file (on the jump host when --k8s-host is set)
+  --cluster-name NAME  Target a specific WekaCluster CRD by name (required when multiple
+                       clusters exist; list available: kubectl get wekacluster -A --no-headers)
   --operator-ns NS     Override auto-detected Weka Operator namespace
                        (default: auto-detect, fall back to weka-operator-system)
   --cluster-ns NS      Override auto-detected WekaCluster pod namespace
                        (default: auto-detect via WekaCluster CRD)
-  --cluster-name NAME  Target a specific WekaCluster by name
-                       (required when multiple WekaCluster CRDs exist across namespaces)
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
   --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz)
@@ -3172,9 +3193,9 @@ func runK8sMode(args []string) {
 
 	k8sHost := fs.String("k8s-host", "", "SSH jump host with kubectl/kubeconfig")
 	kubeconfig := fs.String("kubeconfig", "", "Path to kubeconfig (on jump host when --k8s-host is set)")
+	clusterName := fs.String("cluster-name", "", "Target specific WekaCluster by name (required when multiple clusters exist)")
 	operatorNS := fs.String("operator-ns", "", "Override Weka Operator namespace")
 	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
-	clusterName := fs.String("cluster-name", "", "Target specific WekaCluster by name (required when multiple clusters exist)")
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
 	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz)", wlcBundlesDir))
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
