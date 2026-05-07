@@ -2539,12 +2539,16 @@ _weka_log_collector() {
 
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --extra-commands --cmd-timeout
+          --extra-commands --cmd-timeout --compression
           --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
         --profile)
             COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
+            return 0
+            ;;
+        --compression)
+            COMPREPLY=( $(compgen -W "gzip xz" -- "$cur") )
             return 0
             ;;
         --output)
