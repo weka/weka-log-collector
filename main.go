@@ -2159,7 +2159,7 @@ func validateUploadFile(path string) (string, error) {
 	}
 	// Extension allowlist.
 	name := fi.Name()
-	allowed_exts := []string{".tar.gz", ".log", ".txt", ".json", ".out"}
+	allowed_exts := []string{".tar.gz", ".tar.xz", ".log", ".txt", ".json", ".out"}
 	ok := false
 	for _, ext := range allowed_exts {
 		if strings.HasSuffix(name, ext) {
@@ -2604,6 +2604,53 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 		}
 	}
 	return nil
+}
+
+// archiveExt returns the file extension for the given compression format.
+func archiveExt(compression string) string {
+	if compression == "xz" {
+		return ".tar.xz"
+	}
+	return ".tar.gz"
+}
+
+// newCompressedWriter wraps w with the requested compressor and returns:
+//   - an io.WriteCloser for the tar.Writer to write into
+//   - a finalize func to call after tw.Close() — flushes/waits for the compressor
+//   - the compression actually used ("gzip" or "xz")
+//
+// For "xz", it execs the system xz binary with -T0 (multi-threaded). If xz is
+// not on PATH, it warns and falls back to gzip. gzipLevel is only used for gzip.
+func newCompressedWriter(w io.Writer, compression string, gzipLevel int) (io.WriteCloser, func() error, string) {
+	if compression == "xz" {
+		xzPath, err := exec.LookPath("xz")
+		if err != nil {
+			warnf("xz binary not found — falling back to gzip (install xz-utils or xz to use --compression xz)")
+		} else {
+			pr, pw := io.Pipe()
+			cmd := exec.Command(xzPath, "-z", "-T0", "-")
+			cmd.Stdin = pr
+			cmd.Stdout = w
+			var stderrBuf bytes.Buffer
+			cmd.Stderr = &stderrBuf
+			if startErr := cmd.Start(); startErr != nil {
+				warnf("Failed to start xz: %v — falling back to gzip", startErr)
+			} else {
+				return pw, func() error {
+					pw.Close()
+					if waitErr := cmd.Wait(); waitErr != nil {
+						return fmt.Errorf("xz: %v: %s", waitErr, strings.TrimSpace(stderrBuf.String()))
+					}
+					return nil
+				}, "xz"
+			}
+		}
+	}
+	gz, err := gzip.NewWriterLevel(w, gzipLevel)
+	if err != nil {
+		gz, _ = gzip.NewWriterLevel(w, gzip.DefaultCompression)
+	}
+	return gz, gz.Close, "gzip"
 }
 
 // ── kubernetes collection ─────────────────────────────────────────────────────
@@ -3243,6 +3290,7 @@ OPTIONS
                        (default: auto-detect, fall back to weka-csi-plugin)
   --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz)
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
+  --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
   --verbose            Verbose output (show every kubectl call)
   --version            Print version and exit
@@ -3287,6 +3335,7 @@ func runK8sMode(args []string) {
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
 	ver := fs.Bool("version", false, "Print version and exit")
+	compression := fs.String("compression", "gzip", "Compression format: gzip|xz")
 
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
@@ -3376,7 +3425,7 @@ func runK8sMode(args []string) {
 			clusterLabel = "k8s"
 		}
 		ts := time.Now().Format("2006-01-02T15-04-05")
-		outPath = filepath.Join(wlcBundlesDir, fmt.Sprintf("%s-weka-logs-%s.tar.gz", clusterLabel, ts))
+		outPath = filepath.Join(wlcBundlesDir, fmt.Sprintf("%s-weka-logs-%s%s", clusterLabel, ts, archiveExt(*compression)))
 	}
 	logf("  Output: %s", outPath)
 
@@ -3387,13 +3436,8 @@ func runK8sMode(args []string) {
 		os.Exit(1)
 	}
 
-	gz, gzErr := gzip.NewWriterLevel(outFile, gzip.BestCompression)
-	if gzErr != nil {
-		outFile.Close()
-		errorf("gzip init: %v", gzErr)
-		os.Exit(1)
-	}
-	tw := tar.NewWriter(gz)
+	cw, finalize, _ := newCompressedWriter(outFile, *compression, gzip.BestCompression)
+	tw := tar.NewWriter(cw)
 
 	archiveRoot := "k8s"
 	m := &k8sManifest{
@@ -3425,8 +3469,8 @@ func runK8sMode(args []string) {
 	if err := tw.Close(); err != nil {
 		errorf("Finalizing tar: %v", err)
 	}
-	if err := gz.Close(); err != nil {
-		errorf("Finalizing gzip: %v", err)
+	if err := finalize(); err != nil {
+		errorf("Finalizing archive: %v", err)
 	}
 	outFile.Close()
 
@@ -3491,7 +3535,8 @@ func listBundleEntries() ([]os.FileInfo, error) {
 	}
 	var infos []os.FileInfo
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
+		ext := e.Name()
+		if e.IsDir() || (!strings.HasSuffix(ext, ".tar.gz") && !strings.HasSuffix(ext, ".tar.xz")) {
 			continue
 		}
 		info, err := e.Info()
@@ -3585,7 +3630,7 @@ func handleListBundles() {
 	if err != nil || len(nodes) == 0 {
 		return
 	}
-	listCmd := fmt.Sprintf("ls -lh %s/bundles/*.tar.gz 2>/dev/null || true", wlcBaseDir)
+	listCmd := fmt.Sprintf("ls -lh %s/bundles/*.tar.gz %s/bundles/*.tar.xz 2>/dev/null || true", wlcBaseDir, wlcBaseDir)
 	for _, n := range nodes {
 		display := nodeDisplay(n)
 		if n.IP == hostname || n.Hostname == hostname {
@@ -3708,7 +3753,7 @@ func handleCleanBundles() {
 		return
 	}
 	hostname, _ := os.Hostname()
-	cleanCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz", wlcBaseDir, wlcBaseDir)
+	cleanCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz", wlcBaseDir, wlcBaseDir, wlcBaseDir)
 	fmt.Printf("Cleaning remote nodes...\n")
 	var remoteCount int
 	for _, n := range nodes {
@@ -3750,8 +3795,9 @@ func main() {
 		listBundles     = flag.Bool("list-bundles", false, fmt.Sprintf("List bundles in %s", wlcBundlesDir))
 		rmBundle        = flag.String("rm-bundle", "", fmt.Sprintf("Remove a specific bundle from %s (filename or full path)", wlcBundlesDir))
 		cleanBundles    = flag.Bool("clean-bundles", false, fmt.Sprintf("Remove all bundles from %s", wlcBundlesDir))
-		uploadFile      = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.log/.txt/.json/.out)", wlcBaseDir))
+		uploadFile      = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)", wlcBaseDir))
 		uploadSessionID = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
+		compression     = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -3768,6 +3814,13 @@ func main() {
 	if args := flag.Args(); len(args) > 0 {
 		fmt.Fprintf(os.Stderr, "error: unexpected argument(s): %s\n", strings.Join(args, ", "))
 		fmt.Fprintf(os.Stderr, "       (flags require -- prefix, e.g. --profile %s)\n", args[0])
+		os.Exit(1)
+	}
+
+	switch *compression {
+	case "gzip", "xz":
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown --compression %q (valid: gzip, xz)\n", *compression)
 		os.Exit(1)
 	}
 
@@ -3884,7 +3937,7 @@ func main() {
 	if !toStdout {
 		clusterName := getClusterName()
 		ts := time.Now().Format("2006-01-02T15-04-05")
-		archiveName := fmt.Sprintf("%s-weka-logs-%s.tar.gz", clusterName, ts)
+		archiveName := fmt.Sprintf("%s-weka-logs-%s%s", clusterName, ts, archiveExt(*compression))
 		if outPath == "" {
 			_ = os.MkdirAll(wlcBundlesDir, 0755)
 			outPath = filepath.Join(wlcBundlesDir, archiveName)
@@ -3992,7 +4045,7 @@ func main() {
 	if *localOnly {
 		localStart := time.Now()
 		phase("Local collection")
-		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, containerNames, nil, extraCmds)
+		writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, *nodeOnly, containerNames, nil, extraCmds, *compression)
 		if !toStdout {
 			elapsed := time.Since(localStart).Round(time.Second)
 			logf("Collection complete → %s  (took %s)", outPath, elapsed)
@@ -4034,7 +4087,7 @@ func main() {
 			if err != nil {
 				warnf("Could not discover cluster hosts: %v", err)
 				warnf("Falling back to local-only collection. Use --host to specify hosts manually.")
-				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, containerNames, nil, extraCmds)
+				writeArchive(outPath, toStdout, *profileStr, from, to, *cmdTimeout, false, containerNames, nil, extraCmds, *compression)
 				if *upload && !toStdout {
 					if err := uploadBundle(outPath, 0); err != nil {
 						errorf("Upload failed: %v", err)
@@ -4214,7 +4267,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			logf("  [local] collecting (cluster-wide commands + node-local data)...")
-			writeArchive(outPath, false, *profileStr, from, to, *cmdTimeout, false, containerNames, nil, extraCmds)
+			writeArchive(outPath, false, *profileStr, from, to, *cmdTimeout, false, containerNames, nil, extraCmds, *compression)
 			logf("  [local] uploading to Weka Home...")
 			err := uploadBundle(outPath, sharedSessionID)
 			if err == nil {
@@ -4239,7 +4292,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames, sharedSessionID)
+				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames, sharedSessionID, *compression)
 				mu.Lock()
 				for _, r := range remoteResults {
 					display := nodeDisplayMap[r.Host]
@@ -4278,7 +4331,7 @@ func main() {
 	phase("Collecting from cluster hosts")
 	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames)
 	phase("Writing archive")
-	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart, extraCmds)
+	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, collectionStart, extraCmds, *compression)
 }
 
 // collectCluster deploys the binary to all hosts first, then fans out collection
@@ -4336,7 +4389,7 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, pr
 // uploadFromHost runs collection + upload on a remote host (binary already deployed
 // by deployAll). The remote node collects its own logs, uploads to Weka Home via its
 // local uploader, and cleans up the local archive. The caller handles start/completion logs.
-func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64) error {
+func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64, compression string) error {
 	if displayName == "" {
 		displayName = host
 	}
@@ -4364,6 +4417,9 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	if len(containerNames) > 0 {
 		args = append(args, "--container-name", strings.Join(containerNames, ","))
 	}
+	if compression != "" && compression != "gzip" {
+		args = append(args, "--compression", compression)
+	}
 	collectionCmd := strings.Join(args, " ")
 	timeoutSecs := int(sshTimeout.Seconds())
 	remoteShellCmd := fmt.Sprintf(
@@ -4390,14 +4446,14 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	}
 	// Clean up remote logs/ and bundles/ after successful upload.
 	// Debug logs are already inside the uploaded bundle; no need to keep them on disk.
-	cleanupCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz", wlcBaseDir, wlcBaseDir)
+	cleanupCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz", wlcBaseDir, wlcBaseDir, wlcBaseDir)
 	exec.Command("ssh", append(sshArgs(), sshTarget, cleanupCmd)...).Run() //nolint:errcheck
 	return nil
 }
 
 // uploadCluster deploys the binary to all remote hosts first, then fans out
 // collect+upload in parallel (up to workers at a time).
-func uploadCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64) []HostResult {
+func uploadCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64, compression string) []HostResult {
 	// ── phase 1: deploy binary to all remote hosts ────────────────────────
 	phase("Deploying binary to remote hosts")
 	deployed := deployAll(hosts, displayNames, selfPath)
@@ -4429,7 +4485,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			logf("  [%s] collecting and uploading...", display)
-			err := uploadFromHost(host, display, selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID)
+			err := uploadFromHost(host, display, selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID, compression)
 			mu.Lock()
 			done++
 			n := done
@@ -4447,7 +4503,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 }
 
 // writeArchive performs a local collection and writes to outPath (or stdout).
-func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraManifests []HostManifest, extraCmds []CommandSpec) {
+func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraManifests []HostManifest, extraCmds []CommandSpec, compression string) {
 	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
@@ -4470,12 +4526,8 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 		outDesc = outPath
 	}
 
-	gz, err := gzip.NewWriterLevel(outWriter, gzip.BestCompression)
-	if err != nil {
-		errorf("gzip init: %v", err)
-		os.Exit(1)
-	}
-	tw := tar.NewWriter(gz)
+	cw, finalize, _ := newCompressedWriter(outWriter, compression, gzip.BestCompression)
+	tw := tar.NewWriter(cw)
 
 	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, nodeOnly, containerNames, extraCmds)
 
@@ -4488,8 +4540,8 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	if err := tw.Close(); err != nil {
 		errorf("Finalizing tar: %v", err)
 	}
-	if err := gz.Close(); err != nil {
-		errorf("Finalizing gzip: %v", err)
+	if err := finalize(); err != nil {
+		errorf("Finalizing archive: %v", err)
 	}
 
 	logf("\nCollection complete → %s", outDesc)
@@ -4504,7 +4556,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 }
 
 // writeMergedArchive merges results from all cluster hosts into a single archive.
-func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration, collectionStart time.Time, extraCmds []CommandSpec) {
+func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration, collectionStart time.Time, extraCmds []CommandSpec, compression string) {
 	clusterName := getClusterName()
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
@@ -4531,12 +4583,8 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	// data just like the per-node archives, compresses well at any level, and
 	// level 9 costs 3-4x more CPU for <5% size benefit — too expensive on a
 	// live Weka node receiving parallel SSH streams from the whole cluster.
-	gz, err := gzip.NewWriterLevel(outWriter, gzip.DefaultCompression)
-	if err != nil {
-		errorf("gzip init: %v", err)
-		os.Exit(1)
-	}
-	tw := tar.NewWriter(gz)
+	cw, finalize, _ := newCompressedWriter(outWriter, compression, gzip.DefaultCompression)
+	tw := tar.NewWriter(cw)
 
 	// ── run cluster-wide weka commands once on the orchestrator ───────────
 	// These commands produce identical output on every node; running them once
@@ -4661,8 +4709,8 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	if err := tw.Close(); err != nil {
 		errorf("Finalizing tar: %v", err)
 	}
-	if err := gz.Close(); err != nil {
-		errorf("Finalizing gzip: %v", err)
+	if err := finalize(); err != nil {
+		errorf("Finalizing archive: %v", err)
 	}
 
 	elapsed := time.Since(collectionStart).Round(time.Second)
@@ -4714,8 +4762,9 @@ OPTIONS
   --clients-only       Client nodes only; skip backends
   --local              This host only; no SSH
   --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
+  --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
-  --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.log/.txt/.json/.out)
+  --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
   --verbose            Detailed per-file/command progress
