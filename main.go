@@ -1900,8 +1900,10 @@ func getClusterName() string {
 				// "cluster: CST-LTS (8cfb113b-...)"
 				rest := strings.TrimPrefix(line, "cluster:")
 				rest = strings.TrimSpace(rest)
-				// Take everything before the first '(' (the UUID part)
-				if idx := strings.IndexByte(rest, '('); idx > 0 {
+				// Take everything before the first '(' (the UUID part).
+				// idx==0 means the cluster has no human name (bare UUID like "(18c13bfb-...)"),
+				// in which case rest[:0]="" and we fall through to the hostname fallback.
+				if idx := strings.IndexByte(rest, '('); idx >= 0 {
 					rest = strings.TrimSpace(rest[:idx])
 				}
 				if rest != "" {
@@ -4597,7 +4599,8 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 
 func sanitizeHostname(h string) string {
 	re := regexp.MustCompile(`[^a-zA-Z0-9_-]`)
-	return re.ReplaceAllString(h, "-")
+	result := re.ReplaceAllString(h, "-")
+	return strings.Trim(result, "-")
 }
 
 func usageFunc() {
