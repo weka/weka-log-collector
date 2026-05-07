@@ -8,7 +8,7 @@ Drop a single binary on any Weka node and collect a compressed archive of logs a
 
 ## Why this tool?
 
-For most support cases, `weka diags` is your starting point. This tool complements it for situations where you need more targeted or flexible collection.
+A single binary that collects exactly what you need from one node or the entire cluster — fast, flexible, and zero-dependency.
 
 - **Profile-based collection** — gather only what's relevant: default, full, perf, NFS, S3, SMB-W, or all
 - **Time-windowed journalctl** — scope `journalctl` to an incident window with `--start-time`/`--end-time`; all log files always collected in full
