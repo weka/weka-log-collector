@@ -457,7 +457,25 @@ var nfsCommands = []CommandSpec{
 	{Name: "showmount", Cmd: "showmount -e", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS, NodeLocal: true, JSON: true},
 	{Name: "nfs_ganesha_queue", Cmd: "weka local exec --container ganesha cat /proc/wekafs/frontend0/queue", Profile: ProfileNFS, NodeLocal: true},
-	{Name: "weka_stats_ops_nfsw", Cmd: "weka stats --category ops_nfsw --per-node -Z", Profile: ProfileNFS},
+	// ops_nfsw: --stat is required in Weka 4.4+; collect the most diagnostic NFS stats.
+	{Name: "weka_stats_nfsw_read_ops", Cmd: "weka stats --category ops_nfsw --stat READ_OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_read_latency", Cmd: "weka stats --category ops_nfsw --stat READ_LATENCY --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_read_bytes", Cmd: "weka stats --category ops_nfsw --stat READ_BYTES --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_write_ops", Cmd: "weka stats --category ops_nfsw --stat WRITE_OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_write_latency", Cmd: "weka stats --category ops_nfsw --stat WRITE_LATENCY --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_write_bytes", Cmd: "weka stats --category ops_nfsw --stat WRITE_BYTES --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_throughput", Cmd: "weka stats --category ops_nfsw --stat THROUGHPUT --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_ops", Cmd: "weka stats --category ops_nfsw --stat OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_getattr", Cmd: "weka stats --category ops_nfsw --stat GETATTR_OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_getattr_latency", Cmd: "weka stats --category ops_nfsw --stat GETATTR_LATENCY --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_lookup_ops", Cmd: "weka stats --category ops_nfsw --stat LOOKUP_OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_lookup_latency", Cmd: "weka stats --category ops_nfsw --stat LOOKUP_LATENCY --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_create_ops", Cmd: "weka stats --category ops_nfsw --stat CREATE_OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_create_latency", Cmd: "weka stats --category ops_nfsw --stat CREATE_LATENCY --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_remove_ops", Cmd: "weka stats --category ops_nfsw --stat REMOVE_OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_remove_latency", Cmd: "weka stats --category ops_nfsw --stat REMOVE_LATENCY --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_rename_ops", Cmd: "weka stats --category ops_nfsw --stat RENAME_OPS --per-node", Profile: ProfileNFS},
+	{Name: "weka_stats_nfsw_commit_latency", Cmd: "weka stats --category ops_nfsw --stat COMMIT_LATENCY --per-node", Profile: ProfileNFS},
 	{Name: "netstat_nfs", Cmd: "netstat -tupnl", Profile: ProfileNFS, NodeLocal: true},
 }
 
@@ -470,7 +488,10 @@ var s3Commands = []CommandSpec{
 	{Name: "weka_s3_policy_list", Cmd: "weka s3 policy list -J", Profile: ProfileS3, JSON: true},
 	{Name: "weka_s3_service_account", Cmd: "weka s3 service-account list -J", Profile: ProfileS3, JSON: true},
 	{Name: "weka_s3_containers_list", Cmd: "weka s3 cluster containers list -J", Profile: ProfileS3, JSON: true},
-	{Name: "weka_stats_ops_s3", Cmd: "weka stats --show-internal --category ops_s3 -Z", Profile: ProfileS3},
+	// ops_s3: --stat is required in Weka 4.4+; collect the rate stats (no per-dimension breakdown needed).
+	{Name: "weka_stats_s3_bucket_create_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_CREATE_OPS", Profile: ProfileS3},
+	{Name: "weka_stats_s3_bucket_delete_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_DELETE_OPS", Profile: ProfileS3},
+	{Name: "weka_stats_s3_bucket_list_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_LIST_OPS", Profile: ProfileS3},
 	{Name: "s3_cgroup_memory", Cmd: "cat /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes && cat /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes", Profile: ProfileS3, NodeLocal: true},
 	{Name: "netstat_s3", Cmd: "netstat -tuln | grep 9001", Profile: ProfileS3, NodeLocal: true},
 }
