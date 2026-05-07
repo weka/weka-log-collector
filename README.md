@@ -27,7 +27,7 @@ For most support cases, `weka diags` is your starting point. This tool complemen
 ## Installation
 
 ```bash
-git clone https://github.com/manmeet-weka/weka-log-collector
+git clone https://github.com/weka/weka-log-collector
 scp weka-log-collector/weka-log-collector root@<node-ip>:/opt/weka/weka-log-collector/weka-log-collector
 ```
 
@@ -57,8 +57,8 @@ weka-log-collector
 # Last 2 hours of journalctl, default profile
 weka-log-collector --start-time -2h
 
-# Specific incident window, full profile
-weka-log-collector --profile full --start-time 2026-03-20T14:00 --end-time 2026-03-20T16:00
+# Specific incident window, all profiles
+weka-log-collector --profile all --start-time 2026-03-20T14:00 --end-time 2026-03-20T16:00
 
 # Collect from a Weka-on-Kubernetes cluster
 weka-log-collector k8s --k8s-host jump.server.internal
@@ -218,6 +218,8 @@ Flags:
                        (default: auto-detect, fall back to weka-operator-system)
   --cluster-ns NS      Override auto-detected WekaCluster pod namespace
                        (default: auto-detect via WekaCluster CRD)
+  --cluster-name NAME  Target a specific WekaCluster CRD by name
+                       (required when multiple WekaCluster CRDs exist in the same namespace)
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
   --output PATH        Output .tar.gz path (default: ~/wlc-bundles/<cluster>-weka-logs-<ts>.tar.gz)
@@ -237,6 +239,9 @@ weka-log-collector k8s
 
 # Override namespaces when auto-detection fails
 weka-log-collector k8s --k8s-host jump.internal --cluster-ns my-weka --csi-ns my-csi
+
+# Target a specific WekaCluster when multiple exist
+weka-log-collector k8s --k8s-host jump.internal --cluster-name production-cluster
 
 # Save bundle to specific path
 weka-log-collector k8s --k8s-host jump.internal --output /tmp/k8s-bundle.tar.gz
