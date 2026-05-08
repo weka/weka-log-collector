@@ -82,6 +82,8 @@ Flags:
   --container-id       Collect from specific container IDs (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)
   --upload             Upload collected archive to Weka Home (requires 'weka cloud enable')
   --compression        Compression format: gzip|xz  (default: gzip; xz requires system xz binary, falls back to gzip if not found)
+  --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json.
+  --anonymize-key      Override path for the anonymization mapping JSON (default: alongside the bundle)
   --upload-file        Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
@@ -458,6 +460,38 @@ Any value whose key name contains a credential-like substring is automatically r
 - Kubernetes node names, namespace names, and pod names
 
 **Recommendation:** Review the bundle before sharing externally, especially if the cluster handles regulated data. The bundle can be inspected with `tar -tzf <bundle>.tar.gz` and individual files extracted for review.
+
+### Anonymization (`--anonymize`)
+
+For environments where bundles cannot leave the customer site without identifying information removed (Federal, regulated industries, dark sites), pass `--anonymize`. The tool replaces customer-identifying values with placeholders that preserve enough structure for support engineers to follow a single host across files:
+
+| Type | Original | Replacement |
+|---|---|---|
+| Hostname | `cst1` | `host-1` (trailing digits preserved) |
+| Hostname (no digits) | `mainnode` | `host-a` (a-z fallback) |
+| Hostname (collision) | `web-1`, `db-1` | `host-1`, `host-1b` |
+| IPv4 | `10.0.94.110` | `x.x.x.110` (last octet preserved) |
+| MAC | `1c:34:da:41:05:22` | `xx:xx:xx:41:05:22` (last 3 bytes preserved) |
+| Cluster name | `weka-cst` | `weka-cluster` |
+| Cluster GUID | `5ebea9ae-d1ed-...` | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
+| FQDN | `cst1.wekaad.net` | `host-1.example.invalid` |
+| AD domain | `cst.wekaad.net` | `example.invalid` |
+| Kerberos realm | `CST.WEKAAD.NET` | `EXAMPLE.INVALID` |
+| NetBIOS | `weka-smb` | `cluster-smb` |
+
+Container names (`drives0`, `compute0`, ...), PIDs, drive/node UIDs, and role/status strings are **not** changed — they don't identify the customer and are useful for debugging.
+
+The bundle filename gets an `-anon` suffix (`<cluster>-weka-logs-<ts>-anon.tar.gz`) and the in-archive top-level directory uses `weka-cluster` instead of the real cluster name. The cluster name does not appear anywhere in the archive.
+
+A mapping file is written **next to** the bundle (not inside it) as `<bundle-name>.anonymization-key.json`. The customer keeps this file at their site — it lists every original→placeholder transformation so they can decode references later when troubleshooting with support. Override the mapping path with `--anonymize-key`.
+
+```bash
+# Default — mapping next to bundle
+weka-log-collector --anonymize
+
+# Custom mapping path
+weka-log-collector --anonymize --anonymize-key /secure/cst-key.json
+```
 
 ---
 
