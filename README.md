@@ -448,13 +448,13 @@ This tool is designed to collect diagnostic data only — no credentials or secr
 - Environment variables from pods
 - Any files outside `/opt/weka/logs/` and `/opt/weka/data/`
 
-**Configmap redaction:**
-ConfigMap YAML content is collected (configmaps can contain useful config like proxy endpoints and boot scripts), but any key whose name matches a sensitive pattern is automatically redacted before writing to the archive. Redacted patterns include: `password`, `passwd`, `token`, `secret`, `api-key`, `auth`, `credential`, `private-key`, `access-key`, `signing-key`. The value is replaced with `[REDACTED]`.
+**Credential redaction (applied to every collected command output):**
+Any value whose key name contains a credential-like substring is automatically replaced with `[REDACTED]` before being written to the archive. This covers all weka CLI JSON outputs (e.g. `weka smb cluster info -J` → `pcsPass`), system command outputs, k8s ConfigMaps, and extra-command outputs. Patterns matched: `password`, `passwd`, `pwd`, `pass` (catches camelCase like `pcsPass`, `dbPass`), `token`, `secret`, `api-key` / `api_key`, `auth`, `credential`, `private-key`, `access-key`, `signing-key`. JSON formatting is preserved exactly (only the string value inside the quotes is replaced).
 
 **What IS in the bundle that you should be aware of:**
-- Pod logs — may contain hostnames, IP addresses, filesystem paths, and internal service URLs
+- Pod logs and container logs — may contain hostnames, IP addresses, filesystem paths, and internal service URLs
 - Weka cluster status — cluster name, node IPs, filesystem names, capacity figures
-- ConfigMap content (sensitive keys redacted as above)
+- ConfigMap content (credential keys redacted as above)
 - Kubernetes node names, namespace names, and pod names
 
 **Recommendation:** Review the bundle before sharing externally, especially if the cluster handles regulated data. The bundle can be inspected with `tar -tzf <bundle>.tar.gz` and individual files extracted for review.
