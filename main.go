@@ -53,9 +53,14 @@ var relativeTimeRe = regexp.MustCompile(
 )
 
 // rotatedFileSuffixRe matches filename suffixes that indicate a rotated/archived log file.
-// Matches: .1  .2  .gz  -20260301 (date-stamped rotation)
-// Does NOT match: .log  .json  (current active log extensions)
-var rotatedFileSuffixRe = regexp.MustCompile(`(\.\d+|\.gz|-\d{8})$`)
+// Matches: .1  .2  .gz  -20260301  -20251030T231050.log (dated build artifacts)
+// Does NOT match: .log  .json  (current active log extensions without an embedded timestamp)
+//
+// The -YYYYMMDDTHHMMSS.log case catches Weka driver build logs in
+// /opt/weka/data/driver/weka-driver/log/build-*.log — each is a one-shot
+// snapshot per kernel module rebuild, not an active tail, so they belong in
+// the rotation family and should be filtered by mtime against the time window.
+var rotatedFileSuffixRe = regexp.MustCompile(`(\.\d+|\.gz|-\d{8}|-\d{8}T\d{6}\.log)$`)
 
 // ansiEscape matches ANSI/VT100 escape sequences (e.g. ESC[32m, ESC[0m).
 // Some containers (e.g. the Weka operator manager) emit colored log output;
