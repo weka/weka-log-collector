@@ -11,7 +11,7 @@ Drop a single binary on any Weka node and collect a compressed archive of logs a
 A single binary that collects exactly what you need from one node or the entire cluster — fast, flexible, and zero-dependency.
 
 - **Profile-based collection** — gather only what's relevant: default, full, perf, NFS, S3, SMB-W, or all
-- **Time-windowed journalctl** — scope `journalctl` to an incident window with `--start-time`/`--end-time`; all log files always collected in full
+- **Time-windowed collection** — `--start-time`/`--end-time` scope `journalctl`, `weka stats` (perf profile), and rotated log files (filtered by mtime); active log files are always collected in full. Defaults to the last 8h if not specified.
 - **Full container log coverage** — all container log trees collected including rotated variants
 - **Cluster-wide in one shot** — auto-deploys itself to each node via SCP, collects in parallel, merges into a single archive
 - **Container-scoped collection** — target specific nodes by their Weka container ID (`--container-id`)
@@ -81,7 +81,8 @@ Flags:
   --host               Collect from this host by IP (repeatable; default: all cluster backends)
   --container-id       Collect from specific container IDs (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)
   --upload             Upload collected archive to Weka Home (requires 'weka cloud enable')
-  --upload-file        Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.log/.txt/.json/.out)
+  --compression        Compression format: gzip|xz  (default: gzip; xz requires system xz binary, falls back to gzip if not found)
+  --upload-file        Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands
@@ -139,12 +140,14 @@ weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
 
 | Profile | What's included |
 |---------|----------------|
-| `default` | Weka CLI status, events, cfgdump, hw info, system info, NIC/OFED/routing, all logs + journalctl — **scoped to last 8h by default** |
-| `perf` | + performance stats (CPU, SSD, ops, network, JRPC, latency) — scoped to `--start-time`/`--end-time` |
+| `default` | Weka CLI status, events, cfgdump, hw info, system info, NIC/OFED/routing, all logs + journalctl |
+| `perf` | + performance stats (CPU, SSD, ops, network, JRPC, latency) |
 | `nfs` | + NFS/Ganesha commands and ganesha container logs |
 | `s3` | + S3/envoy commands and S3 container logs |
 | `smbw` | + SMB-W commands and smbw/pacemaker/corosync logs |
-| `all` | Everything from all profiles, **no time limit** — collects full log history |
+| `all` | Everything from all profiles combined |
+
+> **All profiles default to the last 8h.** `--start-time`/`--end-time` scope journalctl, `weka stats` (perf profile), and rotated log files (filtered by mtime). For longer windows, pass `--start-time -24h`, `-7d`, etc.
 
 > NIC/OFED/routing info (`lshw`, `ofed_info`, `lsmod`, `modinfo`, `ip rule`, `ip neighbor`, `rp_filter`) is always collected on every node — backends and clients alike.
 
@@ -158,9 +161,9 @@ weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
 
 **Weka CLI commands** — weka status, alerts, cluster topology, filesystems, snapshots, debug traces, local container resources, and profile-specific commands (events, cfgdump, perf stats, NFS/S3/SMB-W commands)
 
-**System log files** — `/var/log/messages*`, `secure*`, `cron*`, `syslog*`, `kern.log*`, `audit/audit.log*`, `cloud-init*`, `dnf/yum.log*` — all rotated variants
+**System log files** — `/var/log/messages*`, `secure*`, `cron*`, `syslog*`, `kern.log*`, `audit/audit.log*`, `cloud-init*`, `dnf/yum.log*` — active files always; rotated variants kept only when their mtime falls inside the time window
 
-**Weka container logs** — full `/opt/weka/logs/` tree: syslog, output, events, shelld, trace-server, nginx, supervisord, pacemaker, corosync, pcsd, wtracer — all containers, all rotated variants
+**Weka container logs** — full `/opt/weka/logs/` tree: syslog, output, events, shelld, trace-server, nginx, supervisord, pacemaker, corosync, pcsd, wtracer — all containers; rotated variants windowed by mtime
 
 **Vendor/driver logs** — `/var/log/mlnx/*.log*`, Weka kernel driver build logs
 
