@@ -565,8 +565,10 @@ var systemCommands = []CommandSpec{
 }
 
 // LogFileSpec describes a set of log files to collect.
-// All matched files are always collected in full — no time-window filtering.
-// The --start-time/--end-time window applies only to journalctl, not to file collection.
+// Active (non-rotated) files like /var/log/messages, syslog.log, output.log are
+// always collected. Rotated variants (messages-20260301, syslog.log.1, *.gz) are
+// filtered by mtime against the --start-time/--end-time window — see
+// filterByTimeWindow above. Journalctl is windowed separately in CollectLocal.
 type LogFileSpec struct {
 	// SrcGlob is a shell glob pattern for source files
 	SrcGlob string
@@ -1397,9 +1399,10 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	}
 	_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl.txt"), out)
 
-	// weka-agent journal: scoped to time window when given, capped at 50k lines
-	// otherwise. No-cap collection caused OOM on memory-constrained nodes when
-	// running --profile all with no time window.
+	// weka-agent journal: scoped to the --start-time/--end-time window when given,
+	// capped at 50k lines otherwise. The line cap is a safety net — earlier
+	// versions allowed unbounded collection which caused OOM on memory-constrained
+	// nodes; today's 8h default makes that unlikely but the cap is kept defensively.
 	{
 		var agentCmd string
 		switch {
@@ -3928,9 +3931,10 @@ func main() {
 	}
 
 	// ── default time window ───────────────────────────────────────────────
-	// Unless --profile all is given (which means "collect everything"),
-	// default to the last 8 hours when no --start-time was specified.
-	defaultWindow := from.IsZero() && *profileStr != ProfileAll
+	// Default to the last 8 hours when no --start-time was specified, regardless
+	// of profile. For longer windows pass --start-time -24h, -7d, etc. The window
+	// scopes journalctl, weka stats (perf profile), and rotated log files (by mtime).
+	defaultWindow := from.IsZero()
 	if defaultWindow {
 		from = time.Now().Add(-8 * time.Hour)
 	}
@@ -3956,7 +3960,7 @@ func main() {
 	logf("Profile:  %s", *profileStr)
 	if !from.IsZero() {
 		if defaultWindow {
-			logf("From:     %s  (default: last 8h — use --profile all for no limit)", from.Format(time.RFC3339))
+			logf("From:     %s  (default: last 8h — pass --start-time -24h, -7d, etc. for longer)", from.Format(time.RFC3339))
 		} else {
 			logf("From:     %s", from.Format(time.RFC3339))
 		}
@@ -4749,7 +4753,7 @@ USAGE
 TIME
   --start-time TIME  Relative: -2h, -30m, -1d  |  Absolute: 2026-03-04T10:30[:00]
   --end-time   TIME  Default: now
-  Default window: last 8h. Use --profile all for no time limit.
+  Default window: last 8h. Pass --start-time -24h, -7d, etc. for longer windows.
 
 PROFILES  (--profile NAME)
   default  status, events, cfgdump, system info, NIC/OFED, logs + journalctl  [default]
@@ -4757,7 +4761,7 @@ PROFILES  (--profile NAME)
   nfs      + NFS/Ganesha commands and logs
   s3       + S3/envoy commands and logs
   smbw     + SMB-W/pacemaker/corosync commands and logs
-  all      everything, no time limit
+  all      everything (all profiles combined)
 
 OPTIONS
   --host IP            Target specific host(s) by IP (repeatable)
