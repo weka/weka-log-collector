@@ -1665,8 +1665,10 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 // addBytesToArchiveWithMtime is like addBytesToArchive but preserves the
 // source file's mtime — used for log files whose timestamps callers care about.
 func addBytesToArchiveWithMtime(tw *tar.Writer, name string, data []byte, mtime time.Time) error {
-	data = redactSensitive(data)
-	data = globalAnonymizer.Apply(data)
+	if isLikelyText(data) {
+		data = redactSensitive(data)
+		data = globalAnonymizer.Apply(data)
+	}
 	hdr := &tar.Header{
 		Name:    name,
 		Mode:    0644,
@@ -1680,13 +1682,28 @@ func addBytesToArchiveWithMtime(tw *tar.Writer, name string, data []byte, mtime 
 	return err
 }
 
+// isLikelyText returns true when the first 8 KB of b contains no NUL bytes.
+// Used to skip credential redaction and anonymization on binary content
+// (atop.stats files, etc.) — running text-oriented regexes on binary is slow
+// and can corrupt bytes that happen to match by chance (e.g. an IPv4-shaped
+// 4-byte sequence in a binary timestamp).
+func isLikelyText(b []byte) bool {
+	n := len(b)
+	if n > 8192 {
+		n = 8192
+	}
+	return !bytes.Contains(b[:n], []byte{0})
+}
+
 // addBytesToArchive adds in-memory bytes as a file in the tar archive.
-// All content passes through credential redaction and (when --anonymize is on)
-// the run-scoped anonymizer before being written. This makes every archive
-// write site automatically covered without each caller needing to remember.
+// Text content passes through credential redaction and (when --anonymize is on)
+// the run-scoped anonymizer before being written. Binary content (detected via
+// NUL bytes in the first 8 KB) is written through unchanged.
 func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
-	data = redactSensitive(data)
-	data = globalAnonymizer.Apply(data)
+	if isLikelyText(data) {
+		data = redactSensitive(data)
+		data = globalAnonymizer.Apply(data)
+	}
 	hdr := &tar.Header{
 		Name:    name,
 		Mode:    0644,
@@ -3081,16 +3098,17 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 		hdr.Name = filepath.Join(newRoot, rest)
 
 		if transform {
-			// Read entry into memory, apply redaction + anonymization, rewrite
-			// header with the post-transform size, and copy. Per-file memory
-			// cost is bounded by the largest file in any per-node archive
-			// (typically tens of MB).
+			// Read entry into memory, apply redaction + anonymization (text
+			// only — binary content like atop.stats is passed through), and
+			// rewrite header with the (possibly changed) size.
 			data, readErr := io.ReadAll(tr)
 			if readErr != nil {
 				return fmt.Errorf("tar read entry: %w", readErr)
 			}
-			data = redactSensitive(data)
-			data = globalAnonymizer.Apply(data)
+			if isLikelyText(data) {
+				data = redactSensitive(data)
+				data = globalAnonymizer.Apply(data)
+			}
 			hdr.Size = int64(len(data))
 			if err := tw.WriteHeader(hdr); err != nil {
 				return fmt.Errorf("tar write header: %w", err)
@@ -5224,6 +5242,10 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			continue
 		}
 		stat, _ := f.Stat()
+		if globalAnonymizer.enabled {
+			logf("  [%s] anonymizing and merging (%d KB) — this is CPU-bound, may take a moment...", r.Host, stat.Size()/1024)
+		}
+		mergeStart := time.Now()
 		mergeErr := mergeArchive(tw, f, archiveRoot)
 		f.Close()
 		os.Remove(r.TempFile)
@@ -5234,7 +5256,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			continue
 		}
 		succeeded++
-		logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
+		if globalAnonymizer.enabled {
+			logf("  [%s] merged OK (%d KB, %s)", r.Host, stat.Size()/1024, time.Since(mergeStart).Round(time.Second))
+		} else {
+			logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
+		}
 	}
 
 	// Write cluster-level summary
