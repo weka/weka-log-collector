@@ -70,12 +70,24 @@ var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
 func stripANSI(b []byte) []byte { return ansiEscape.ReplaceAll(b, nil) }
 
 // sensitiveKeyRe matches YAML/text keys that likely hold credentials or tokens.
-// Used to redact configmap values before archiving — secrets are never collected,
-// but some operators store tokens or API keys in configmaps.
+// Used by redactSensitiveYAML for line-based YAML/text redaction.
+//
+// Permissive on purpose: the bare "pass" alternative catches camelCase variants
+// (pcsPass, dbPass, ldapPass) and prefixed forms (pgpass, db_password). False
+// positives like "bypass:" or "compass:" are accepted — over-redacting a
+// non-secret is far less harmful than leaking a credential.
 var sensitiveKeyRe = regexp.MustCompile(
-	`(?i)(password|passwd|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\s*:`)
+	`(?i)(password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\s*:`)
 
-// redactSensitiveYAML replaces the value of any YAML key whose name matches
+// jsonSensitiveValueRe matches a JSON `"key": "value"` pair where the key
+// contains a credential-like substring. Captures the prefix (key + colon +
+// opening quote) so the replacement preserves quotes and only the value text
+// is replaced with [REDACTED]. Operates on raw JSON bytes (no parse / re-marshal)
+// so Weka's grep-friendly JSON formatting is preserved exactly.
+var jsonSensitiveValueRe = regexp.MustCompile(
+	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)"[^"]*"`)
+
+// redactSensitiveYAML replaces the value of any YAML/text line whose key matches
 // sensitiveKeyRe with [REDACTED]. Only single-line scalar values are redacted;
 // multiline blocks are left as-is (they do not contain credentials in practice).
 func redactSensitiveYAML(b []byte) []byte {
@@ -90,6 +102,25 @@ func redactSensitiveYAML(b []byte) []byte {
 		}
 	}
 	return bytes.Join(lines, []byte("\n"))
+}
+
+// redactSensitiveJSON replaces the string value of any JSON key whose name
+// contains a credential-like substring with "[REDACTED]". Preserves original
+// formatting (whitespace, indentation, key order).
+func redactSensitiveJSON(b []byte) []byte {
+	return jsonSensitiveValueRe.ReplaceAll(b, []byte(`$1"[REDACTED]"`))
+}
+
+// redactSensitive auto-detects JSON content (starts with `{` or `[` after
+// whitespace) and applies the JSON redactor; otherwise falls back to the
+// line-based YAML/text redactor. Safe to call on arbitrary command output —
+// content without sensitive keys is returned unchanged.
+func redactSensitive(b []byte) []byte {
+	trimmed := bytes.TrimLeft(b, " \t\r\n")
+	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		return redactSensitiveJSON(b)
+	}
+	return redactSensitiveYAML(b)
 }
 
 // isRotatedFile returns true when the filename looks like a rotated log archive.
@@ -1278,7 +1309,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			ext = ".json"
 		}
 		dest := filepath.Join(hostRoot, "system", spec.Name+ext)
-		if err := addBytesToArchive(tw, dest, content); err != nil {
+		if err := addBytesToArchive(tw, dest, redactSensitive(content)); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
 	}
@@ -1345,7 +1376,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			wekaSubdir = "weka/perf"
 		}
 		dest := filepath.Join(hostRoot, wekaSubdir, spec.Name+ext)
-		if err := addBytesToArchive(tw, dest, content); err != nil {
+		if err := addBytesToArchive(tw, dest, redactSensitive(content)); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
 		if spec.Name == "weka_version" && len(co.out) > 0 {
@@ -1513,7 +1544,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				warnf("[%s] extra command %q failed (exit %d): %s", hostname, spec.Cmd, co.result.ExitCode, co.result.Error)
 			}
 			dest := filepath.Join(hostRoot, "extra", spec.Name+".txt")
-			if err := addBytesToArchive(tw, dest, content); err != nil {
+			if err := addBytesToArchive(tw, dest, redactSensitive(content)); err != nil {
 				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 			}
 		}
@@ -3221,7 +3252,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
 				continue
 			}
-			_ = addBytesToArchive(tw, root+"/weka-cli/"+spec.name, out)
+			_ = addBytesToArchive(tw, root+"/weka-cli/"+spec.name, redactSensitive(out))
 			break // success — no need to try other pods
 		}
 	}
@@ -3243,7 +3274,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 					vlogf("k8s: exec %s %s: %v", pod, spec.cmd[0], err)
 					continue
 				}
-				_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, out)
+				_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, redactSensitive(out))
 			}
 			collectK8sOptWekaLogs(tw, kc, clusterNS, pod, podDir+"/opt-weka-logs", m)
 		}
