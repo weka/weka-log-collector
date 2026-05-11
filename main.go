@@ -359,14 +359,24 @@ func (a *anonymizer) Apply(content []byte) []byte {
 
 func (a *anonymizer) maskIPv4(b []byte) []byte {
 	s := string(b)
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return b
+	}
+	// Skip values that look like Weka release version strings rather than
+	// IP addresses. Weka major versions live in the 3..9 first-octet range
+	// (current is 4.x, historical 3.x); the IPv4 regex matches version
+	// strings like "4.4.10.118" identically to an IPv4. Preserving them
+	// is much more useful than masking; the trade-off is leaving public
+	// IPv4 addresses in 3.0.0.0/8..9.0.0.0/8 unmasked, which are rarely
+	// meaningful in customer logs that mostly use RFC1918 ranges.
+	if first, err := strconv.Atoi(parts[0]); err == nil && first >= 3 && first <= 9 {
+		return b
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if v, ok := a.mapIPs[s]; ok {
 		return []byte(v)
-	}
-	parts := strings.Split(s, ".")
-	if len(parts) != 4 {
-		return b
 	}
 	masked := "x.x.x." + parts[3]
 	a.mapIPs[s] = masked
