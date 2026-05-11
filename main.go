@@ -4289,6 +4289,15 @@ func listExtractedDirs() ([]os.DirEntry, error) {
 	return dirs, nil
 }
 
+// bundleKeyPath returns the anonymization-key.json path that pairs with a
+// bundle archive: foo.tar.gz → foo.anonymization-key.json. Key files are
+// written next to the bundle (not inside it) so --rm-bundle and
+// --clean-bundles need to clean them up alongside the archive.
+func bundleKeyPath(bundlePath string) string {
+	stem := strings.TrimSuffix(strings.TrimSuffix(bundlePath, ".tar.gz"), ".tar.xz")
+	return stem + ".anonymization-key.json"
+}
+
 // dirSize returns the total size of all files under path.
 func dirSize(path string) int64 {
 	var total int64
@@ -4403,6 +4412,15 @@ func handleRmBundle(name string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Removed %s (%d MB)\n", filepath.Base(target), sz/(1024*1024))
+	// If this was a tar bundle, also remove the paired anonymization key file.
+	if !fi.IsDir() {
+		keyPath := bundleKeyPath(target)
+		if _, err := os.Stat(keyPath); err == nil {
+			if rerr := os.Remove(keyPath); rerr == nil {
+				fmt.Printf("Removed %s\n", filepath.Base(keyPath))
+			}
+		}
+	}
 }
 
 func handleCleanBundles() {
@@ -4434,6 +4452,13 @@ func handleCleanBundles() {
 				errorf("  failed to remove %s: %v", fi.Name(), err)
 			} else {
 				fmt.Printf("  removed %s (%d MB)\n", fi.Name(), fi.Size()/(1024*1024))
+			}
+			// Also remove the paired anonymization key file if present.
+			keyPath := bundleKeyPath(path)
+			if _, statErr := os.Stat(keyPath); statErr == nil {
+				if rerr := os.Remove(keyPath); rerr == nil {
+					fmt.Printf("  removed %s\n", filepath.Base(keyPath))
+				}
 			}
 		}
 		for _, de := range dirs {
@@ -4477,7 +4502,7 @@ func handleCleanBundles() {
 		return
 	}
 	hostname, _ := os.Hostname()
-	cleanCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz", wlcBaseDir, wlcBaseDir, wlcBaseDir)
+	cleanCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz %s/bundles/*.anonymization-key.json", wlcBaseDir, wlcBaseDir, wlcBaseDir, wlcBaseDir)
 	fmt.Printf("Cleaning remote nodes...\n")
 	var remoteCount int
 	for _, n := range nodes {
