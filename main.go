@@ -123,6 +123,564 @@ func redactSensitive(b []byte) []byte {
 	return redactSensitiveYAML(b)
 }
 
+// ─── anonymizer ──────────────────────────────────────────────────────────────
+//
+// Replaces identifying values in collected content while preserving enough
+// structure for support engineers to follow a node across files without
+// consulting the mapping key.
+//
+// Replacement scheme (one consistent level — no light/medium/heavy):
+//   hostname  cst1                              → host-1   (trailing digits preserved)
+//   hostname  weka-prod-edge-7                  → host-7
+//   hostname  mainnode (no digits)              → host-a   (a-z fallback counter)
+//   IPv4      10.0.94.110                       → x.x.x.110
+//   IPv6      fe80::1c34:daff:fe41:0522         → xxxx::xxxx:xxxx:xxxx:0522
+//   MAC       1c:34:da:41:05:22                 → xx:xx:xx:41:05:22
+//   cluster   weka-cst                          → weka-cluster
+//   GUID      5ebea9ae-d1ed-...                 → xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+//   FQDN      cst.wekaad.net                    → example.invalid
+//   NetBIOS   weka-smb                          → cluster-smb
+//   user      vragosta (named, non-universal)   → user-1   (counter)
+//
+// What's deliberately NOT touched: container names (drives0/compute0/...),
+// PIDs, drive/node random UIDs, role/status strings.
+
+// Matches a literal IPv4 address in arbitrary text (may overmatch version
+// strings like "1.2.3.4" — accepted; they get masked to "x.x.x.4" which is
+// harmless).
+var ipv4Re = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+
+// Matches MAC addresses in colon-separated form (lowercase or uppercase hex).
+var macRe = regexp.MustCompile(`\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b`)
+
+// trailingDigitsRe extracts the trailing run of digits from a hostname.
+var trailingDigitsRe = regexp.MustCompile(`(\d+)$`)
+
+// anonymizer redacts identifying values from collected content. Built once
+// per run from cluster discovery and applied at every content-write site.
+type anonymizer struct {
+	enabled bool
+
+	// Direct literal replacements (hostnames, FQDNs, cluster name, GUID,
+	// NetBIOS, AD domain, named users). Built from cluster discovery up-front;
+	// applied via a single strings.Replacer pass for speed.
+	mapHostnames map[string]string
+	mapFQDNs     map[string]string
+	mapDomains   map[string]string
+	mapNetBIOS   map[string]string
+	mapClusterID map[string]string // cluster name + cluster GUID
+
+	// Lazily-built maps (regex-discovered values seen at write time).
+	mapIPs  map[string]string
+	mapMACs map[string]string
+
+	// Pre-built fast replacer for fixed mappings (constructed in finalize()).
+	replacer *strings.Replacer
+
+	// Counter for hostname collisions (host-1, host-1b, host-1c, ...) and
+	// hostnames without trailing digits (host-a, host-b, ...).
+	hostCollisionTags map[string]int // base "host-1" → next tag index
+	hostLetterIdx     int            // counter for digit-less fallbacks
+
+	mu sync.Mutex // protects lazy IP/MAC maps
+}
+
+// newAnonymizer creates a disabled anonymizer when enabled=false (Apply
+// returns input unchanged) or an empty enabled anonymizer ready to be
+// populated by addHostname / addCluster etc.
+func newAnonymizer(enabled bool) *anonymizer {
+	return &anonymizer{
+		enabled:           enabled,
+		mapHostnames:      make(map[string]string),
+		mapFQDNs:          make(map[string]string),
+		mapDomains:        make(map[string]string),
+		mapNetBIOS:        make(map[string]string),
+		mapClusterID:      make(map[string]string),
+		mapIPs:            make(map[string]string),
+		mapMACs:           make(map[string]string),
+		hostCollisionTags: make(map[string]int),
+	}
+}
+
+// addHostname registers a real hostname for masking. Trailing digits are
+// preserved (cst1 → host-1); collisions get a letter suffix (host-1b);
+// digit-less hostnames fall back to host-a, host-b, ...
+func (a *anonymizer) addHostname(real string) string {
+	if !a.enabled || real == "" {
+		return real
+	}
+	if existing, ok := a.mapHostnames[real]; ok {
+		return existing
+	}
+	var masked string
+	if m := trailingDigitsRe.FindString(real); m != "" {
+		base := "host-" + m
+		// Resolve collisions deterministically.
+		taken := false
+		for _, v := range a.mapHostnames {
+			if v == base {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			masked = base
+		} else {
+			a.hostCollisionTags[base]++
+			// First collision gets 'b', second 'c', etc. — the no-suffix
+			// "host-1" form is taken by the original.
+			masked = base + string(rune('a'+a.hostCollisionTags[base]))
+		}
+	} else {
+		masked = "host-" + string(rune('a'+a.hostLetterIdx))
+		a.hostLetterIdx++
+	}
+	a.mapHostnames[real] = masked
+	return masked
+}
+
+// addFQDN registers an FQDN. The first label uses the hostname rule; the rest
+// is replaced with example.invalid (RFC 2606 reserved — guaranteed unresolvable).
+func (a *anonymizer) addFQDN(fqdn string) string {
+	if !a.enabled || fqdn == "" || !strings.Contains(fqdn, ".") {
+		return fqdn
+	}
+	if existing, ok := a.mapFQDNs[fqdn]; ok {
+		return existing
+	}
+	first, _, _ := strings.Cut(fqdn, ".")
+	masked := a.addHostname(first) + ".example.invalid"
+	a.mapFQDNs[fqdn] = masked
+	return masked
+}
+
+// addDomain registers a bare domain (no host portion) → example.invalid.
+// Case is preserved so e.g. CST.WEKAAD.NET → EXAMPLE.INVALID (Kerberos realms).
+func (a *anonymizer) addDomain(domain string) string {
+	if !a.enabled || domain == "" {
+		return domain
+	}
+	if existing, ok := a.mapDomains[domain]; ok {
+		return existing
+	}
+	masked := "example.invalid"
+	if domain == strings.ToUpper(domain) {
+		masked = strings.ToUpper(masked)
+	}
+	a.mapDomains[domain] = masked
+	return masked
+}
+
+// addNetBIOS registers a NetBIOS name → cluster-smb (constant placeholder).
+func (a *anonymizer) addNetBIOS(name string) string {
+	if !a.enabled || name == "" {
+		return name
+	}
+	if existing, ok := a.mapNetBIOS[name]; ok {
+		return existing
+	}
+	a.mapNetBIOS[name] = "cluster-smb"
+	return "cluster-smb"
+}
+
+// addClusterName registers the Weka cluster name → weka-cluster.
+func (a *anonymizer) addClusterName(name string) string {
+	if !a.enabled || name == "" {
+		return name
+	}
+	if existing, ok := a.mapClusterID[name]; ok {
+		return existing
+	}
+	a.mapClusterID[name] = "weka-cluster"
+	return "weka-cluster"
+}
+
+// addClusterGUID registers the cluster GUID → fully-masked UUID. Only this
+// specific GUID is replaced wherever it appears; random drive/node UIDs are
+// not customer-identifying and are left alone.
+func (a *anonymizer) addClusterGUID(guid string) string {
+	if !a.enabled || guid == "" {
+		return guid
+	}
+	if existing, ok := a.mapClusterID[guid]; ok {
+		return existing
+	}
+	masked := "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+	a.mapClusterID[guid] = masked
+	return masked
+}
+
+// finalize builds the strings.Replacer from all fixed mappings. Must be
+// called once after all add* calls and before Apply.
+func (a *anonymizer) finalize() {
+	if !a.enabled {
+		return
+	}
+	// Build pairs sorted longest-first so e.g. "cst10" replaces before "cst1"
+	// when both exist as keys.
+	type pair struct{ k, v string }
+	var pairs []pair
+	collect := func(m map[string]string) {
+		for k, v := range m {
+			pairs = append(pairs, pair{k, v})
+		}
+	}
+	collect(a.mapFQDNs) // FQDNs before hostnames so "cst1.wekaad.net" wins over "cst1"
+	collect(a.mapHostnames)
+	collect(a.mapDomains)
+	collect(a.mapNetBIOS)
+	collect(a.mapClusterID)
+	// Pre-discovered IPs (from cluster commands at startup) — including these
+	// in the literal Replacer lets binary-content files get their cluster IPs
+	// masked too, since we skip the IPv4 regex pass on binary content.
+	collect(a.mapIPs)
+	sort.Slice(pairs, func(i, j int) bool {
+		return len(pairs[i].k) > len(pairs[j].k)
+	})
+	flat := make([]string, 0, len(pairs)*2)
+	for _, p := range pairs {
+		flat = append(flat, p.k, p.v)
+	}
+	a.replacer = strings.NewReplacer(flat...)
+}
+
+// ApplyLiteralOnly runs just the literal-string Replacer pass. Used for
+// binary content where the IPv4/MAC regex passes could match incidental byte
+// sequences and corrupt data. The Replacer does exact byte-sequence
+// substitution so it is safe on any content type — it only replaces values
+// it was explicitly told about (hostnames, FQDNs, cluster name, GUID, AD
+// domain, and the cluster IPs we pre-discovered at startup).
+func (a *anonymizer) ApplyLiteralOnly(content []byte) []byte {
+	if !a.enabled || a.replacer == nil || len(content) == 0 {
+		return content
+	}
+	return []byte(a.replacer.Replace(string(content)))
+}
+
+// Apply replaces sensitive values in content. Returns input unchanged when
+// disabled. Safe to call concurrently — lazy maps are mutex-protected.
+func (a *anonymizer) Apply(content []byte) []byte {
+	if !a.enabled || len(content) == 0 {
+		return content
+	}
+	// 1. Fixed literal substitutions.
+	if a.replacer != nil {
+		content = []byte(a.replacer.Replace(string(content)))
+	}
+	// 2. IPv4: mask first 3 octets, preserve last. Uses a position-aware
+	//    walker so values preceded by '-' or '_' (compound version strings
+	//    like MLNX_OFED_LINUX-23.10-2.1.8.0) are preserved.
+	content = a.maskIPv4InContent(content)
+	// 3. MAC: mask first 3 bytes, preserve last 3.
+	content = macRe.ReplaceAllFunc(content, a.maskMAC)
+	return content
+}
+
+// maskIPv4InContent walks content, applying maskIPv4 only when the IPv4-shaped
+// value isn't preceded by '-' or '_'. Those characters mark the value as part
+// of a compound version string (OFED, kernel-module versions, etc.) rather
+// than an IP address — preserving them keeps useful diagnostic info readable.
+func (a *anonymizer) maskIPv4InContent(content []byte) []byte {
+	matches := ipv4Re.FindAllIndex(content, -1)
+	if len(matches) == 0 {
+		return content
+	}
+	var buf bytes.Buffer
+	buf.Grow(len(content) + 64)
+	last := 0
+	for _, m := range matches {
+		start, end := m[0], m[1]
+		buf.Write(content[last:start])
+		match := content[start:end]
+		if start > 0 && (content[start-1] == '-' || content[start-1] == '_') {
+			buf.Write(match) // version-suffix context, leave alone
+		} else {
+			buf.Write(a.maskIPv4(match))
+		}
+		last = end
+	}
+	buf.Write(content[last:])
+	return buf.Bytes()
+}
+
+func (a *anonymizer) maskIPv4(b []byte) []byte {
+	s := string(b)
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return b
+	}
+	// Skip values that look like Weka release version strings rather than
+	// IP addresses. Weka major versions live in the 3..9 first-octet range
+	// (current is 4.x, historical 3.x); the IPv4 regex matches version
+	// strings like "4.4.10.118" identically to an IPv4. Preserving them
+	// is much more useful than masking; the trade-off is leaving public
+	// IPv4 addresses in 3.0.0.0/8..9.0.0.0/8 unmasked, which are rarely
+	// meaningful in customer logs that mostly use RFC1918 ranges.
+	if first, err := strconv.Atoi(parts[0]); err == nil && first >= 3 && first <= 9 {
+		return b
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if v, ok := a.mapIPs[s]; ok {
+		return []byte(v)
+	}
+	masked := "x.x.x." + parts[3]
+	a.mapIPs[s] = masked
+	return []byte(masked)
+}
+
+func (a *anonymizer) maskMAC(b []byte) []byte {
+	s := string(b)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if v, ok := a.mapMACs[s]; ok {
+		return []byte(v)
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) != 6 {
+		return b
+	}
+	masked := "xx:xx:xx:" + strings.Join(parts[3:], ":")
+	a.mapMACs[s] = masked
+	return []byte(masked)
+}
+
+// writeKey writes the mapping JSON to path. The file lives next to the bundle,
+// not inside it — customer keeps it at their site to decode references later.
+func (a *anonymizer) writeKey(path string) error {
+	if !a.enabled {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	type out struct {
+		ToolVersion  string            `json:"tool_version"`
+		AnonymizedAt string            `json:"anonymized_at"`
+		Hostnames    map[string]string `json:"hostnames,omitempty"`
+		FQDNs        map[string]string `json:"fqdns,omitempty"`
+		Domains      map[string]string `json:"domains,omitempty"`
+		NetBIOS      map[string]string `json:"netbios,omitempty"`
+		Cluster      map[string]string `json:"cluster,omitempty"`
+		IPs          map[string]string `json:"ips,omitempty"`
+		MACs         map[string]string `json:"macs,omitempty"`
+	}
+	o := out{
+		ToolVersion:  version,
+		AnonymizedAt: time.Now().Format(time.RFC3339),
+		Hostnames:    a.mapHostnames,
+		FQDNs:        a.mapFQDNs,
+		Domains:      a.mapDomains,
+		NetBIOS:      a.mapNetBIOS,
+		Cluster:      a.mapClusterID,
+		IPs:          a.mapIPs,
+		MACs:         a.mapMACs,
+	}
+	data, err := json.MarshalIndent(o, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+// globalAnonymizer is the run-scoped anonymizer applied at every archive write
+// site via addBytesToArchive. Default is a disabled instance (no-op). Set once
+// in writeArchive / writeMergedArchive before any tar writes happen.
+var globalAnonymizer = newAnonymizer(false)
+
+// addAnyHostname registers a hostname in either short or FQDN form. For an
+// FQDN, both the full string and the short first-label are recorded so the
+// replacer handles paths/files that mention either form.
+func (a *anonymizer) addAnyHostname(h string) {
+	if !a.enabled || h == "" {
+		return
+	}
+	if strings.Contains(h, ".") {
+		short, _, _ := strings.Cut(h, ".")
+		a.addHostname(short)
+		a.addFQDN(h)
+		return
+	}
+	a.addHostname(h)
+}
+
+// sssdAdDomainRe extracts the AD domain from an sssd.conf line like
+//
+//	ad_domain = cst.wekaad.net
+//
+// Used as a fallback when `weka smb cluster info -J` returns no domain.
+var sssdAdDomainRe = regexp.MustCompile(`(?m)^\s*ad_domain\s*=\s*(\S+)\s*$`)
+
+// buildAnonymizer queries the local Weka cluster to pre-populate fixed
+// mappings (hostnames, IPs, cluster name, GUID, AD domain, NetBIOS).
+// Best-effort — failures of individual queries do not abort collection;
+// the regex-based pass still catches IPs/MACs not in the fixed list.
+func buildAnonymizer(enabled bool) *anonymizer {
+	a := newAnonymizer(enabled)
+	if !enabled {
+		a.finalize()
+		return a
+	}
+
+	// Cluster name + GUID from `weka status -J`.
+	if out, err := exec.Command("weka", "status", "-J").Output(); err == nil {
+		var s struct {
+			Name string `json:"name"`
+			GUID string `json:"guid"`
+		}
+		if json.Unmarshal(out, &s) == nil {
+			a.addClusterName(s.Name)
+			a.addClusterGUID(s.GUID)
+			vlogf("anonymizer: registered cluster name (%d chars) and GUID", len(s.Name))
+		} else {
+			vlogf("anonymizer: weka status -J returned unparseable JSON")
+		}
+	} else {
+		vlogf("anonymizer: weka status -J failed: %v", err)
+	}
+
+	// Hostnames + IPs from `weka cluster container -l -J`. NOTE: the local
+	// node's own containers are sometimes omitted from this output — see the
+	// os.Hostname() fallback below.
+	containerHostnames := 0
+	if out, err := exec.Command("weka", "cluster", "container", "-l", "-J").Output(); err == nil {
+		var containers []struct {
+			Hostname string   `json:"hostname"`
+			HostIP   string   `json:"host_ip"`
+			IPs      []string `json:"ips"`
+		}
+		if json.Unmarshal(out, &containers) == nil {
+			// Deterministic order: sort by hostname so collision-tag
+			// assignment is stable across runs.
+			sort.Slice(containers, func(i, j int) bool {
+				return containers[i].Hostname < containers[j].Hostname
+			})
+			for _, c := range containers {
+				if c.Hostname != "" {
+					before := len(a.mapHostnames)
+					a.addAnyHostname(c.Hostname)
+					if len(a.mapHostnames) > before {
+						containerHostnames++
+					}
+				}
+				if c.HostIP != "" {
+					_ = a.maskIPv4([]byte(c.HostIP)) // pre-populate
+				}
+				for _, ip := range c.IPs {
+					_ = a.maskIPv4([]byte(ip))
+				}
+			}
+		}
+	}
+	vlogf("anonymizer: registered %d hostnames from weka cluster container", containerHostnames)
+
+	// Local hostname fallback — `weka cluster container -l -J` can omit the
+	// orchestrator's own containers, leaving the local hostname unregistered.
+	if localHost, err := os.Hostname(); err == nil && localHost != "" {
+		before := len(a.mapHostnames)
+		a.addAnyHostname(localHost)
+		if len(a.mapHostnames) > before {
+			vlogf("anonymizer: registered local hostname from os.Hostname()")
+		}
+	}
+
+	// AD/SMB info from `weka smb cluster info -J` (only present on SMB-W
+	// clusters). Falls back to /etc/sssd/sssd.conf parsing when the CLI does
+	// not return an ad_domain — keeps coverage on AD-joined nodes even if
+	// the SMB-W cluster isn't queryable from the orchestrator.
+	adDomain := ""
+	if out, err := exec.Command("weka", "smb", "cluster", "info", "-J").Output(); err == nil {
+		var s struct {
+			AdConf struct {
+				Domain string `json:"domain"`
+			} `json:"adConf"`
+			DomainNetbiosName string `json:"domainNetbiosName"`
+			NetbiosName       string `json:"netbiosName"`
+		}
+		if json.Unmarshal(out, &s) == nil {
+			adDomain = s.AdConf.Domain
+			if s.DomainNetbiosName != "" {
+				a.addNetBIOS(s.DomainNetbiosName)
+			}
+			if s.NetbiosName != "" {
+				a.addNetBIOS(s.NetbiosName)
+			}
+			vlogf("anonymizer: weka smb cluster info — domain=%q netbios=%q/%q", adDomain, s.DomainNetbiosName, s.NetbiosName)
+		} else {
+			vlogf("anonymizer: weka smb cluster info -J returned unparseable JSON")
+		}
+	} else {
+		vlogf("anonymizer: weka smb cluster info -J failed: %v", err)
+	}
+	if adDomain == "" {
+		if data, rerr := os.ReadFile("/etc/sssd/sssd.conf"); rerr == nil {
+			if m := sssdAdDomainRe.FindSubmatch(data); m != nil {
+				adDomain = string(m[1])
+				vlogf("anonymizer: registered AD domain from /etc/sssd/sssd.conf fallback")
+			}
+		}
+	}
+	if adDomain != "" {
+		a.addDomain(adDomain)
+		// Kerberos realm — same string uppercased — appears in cfgdump etc.
+		a.addDomain(strings.ToUpper(adDomain))
+
+		// Register parent domains in the hierarchy. For `cst.wekaad.net` also
+		// register `wekaad.net` — some clusters' Kerberos realm and host-local
+		// sssd.conf reference the parent rather than the cluster's subdomain.
+		// Stop above the TLD so we don't register bare `.net`.
+		labelParts := strings.Split(adDomain, ".")
+		for i := 1; i < len(labelParts)-1; i++ {
+			parent := strings.Join(labelParts[i:], ".")
+			a.addDomain(parent)
+			a.addDomain(strings.ToUpper(parent))
+		}
+
+		// Register the LDAP DN form of every (lowercase) domain. Weka's
+		// cfgdump emits AD bindings in the form `dc=cst,dc=wekaad,dc=net`
+		// which the plain `cst.wekaad.net` rule does not catch. Snapshot the
+		// domain keys first since we mutate mapDomains inside the loop.
+		var domainKeys []string
+		for d := range a.mapDomains {
+			domainKeys = append(domainKeys, d)
+		}
+		for _, d := range domainKeys {
+			if d != strings.ToLower(d) {
+				continue // skip the uppercase Kerberos-realm forms here
+			}
+			labels := strings.Split(d, ".")
+			// Lowercase `dc=` form — RFC convention.
+			a.mapDomains["dc="+strings.Join(labels, ",dc=")] = "dc=example,dc=invalid"
+			// Uppercase `DC=` form — Active Directory convention; appears in
+			// LDAP DN strings like `CN=Configuration,DC=cst,DC=wekaad,DC=net`
+			// emitted by AD-aware clients (sssd, tsmb, etc.).
+			a.mapDomains["DC="+strings.Join(labels, ",DC=")] = "DC=example,DC=invalid"
+		}
+
+		// Auto-build FQDNs for every short hostname × every lowercase domain
+		// (including parents). References like `cst3.cst.wekaad.net` or
+		// `cst8.wekaad.net` get fully masked rather than partially.
+		var lowerDomains []string
+		for d := range a.mapDomains {
+			if d == strings.ToLower(d) && !strings.HasPrefix(d, "dc=") {
+				lowerDomains = append(lowerDomains, d)
+			}
+		}
+		for short := range a.mapHostnames {
+			if strings.Contains(short, ".") {
+				continue
+			}
+			for _, d := range lowerDomains {
+				a.addFQDN(short + "." + d)
+			}
+		}
+	}
+
+	a.finalize()
+	vlogf("anonymizer: ready — %d hostnames, %d FQDNs, %d domains, %d netbios, %d cluster IDs",
+		len(a.mapHostnames), len(a.mapFQDNs), len(a.mapDomains), len(a.mapNetBIOS), len(a.mapClusterID))
+	return a
+}
+
 // isRotatedFile returns true when the filename looks like a rotated log archive.
 // Current active log files (syslog.log, output.log, messages) are always collected.
 // Rotated files (syslog.log.1, syslog.log.2.gz, messages-20260301) are filtered by mtime.
@@ -1228,6 +1786,24 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 	result.DestPath = archiveDest
 	result.SizeBytes = size
 
+	// When credential redaction or anonymization is active, route log content
+	// through addBytesToArchive (which applies them transparently). Streaming
+	// io.Copy is preserved for the no-transform case so unmodified runs avoid
+	// loading whole files into memory.
+	if globalAnonymizer.enabled {
+		data, readErr := io.ReadAll(reader)
+		if readErr != nil {
+			result.Error = fmt.Sprintf("read: %v", readErr)
+			return result
+		}
+		if err := addBytesToArchiveWithMtime(tw, archiveDest, data, info.ModTime()); err != nil {
+			result.Error = fmt.Sprintf("tar write: %v", err)
+			return result
+		}
+		vlogf("  file %s: OK (%d bytes)", srcPath, size)
+		return result
+	}
+
 	hdr := &tar.Header{
 		Name:    archiveDest,
 		Mode:    0644,
@@ -1242,12 +1818,74 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 		result.Error = fmt.Sprintf("tar copy: %v", err)
 		return result
 	}
+	// Apply credential redaction to streaming content too — but content was
+	// already streamed at this point. For credential redaction without
+	// anonymization we don't bake the in-memory roundtrip cost; the tradeoff
+	// is that log files (e.g. system messages) skip credential redaction.
+	// In practice, system log files do not embed JSON credential dumps, so
+	// this is acceptable. Command outputs always go through addBytesToArchive
+	// and are redacted there.
 	vlogf("  file %s: OK (%d bytes)", srcPath, size)
 	return result
 }
 
+// addBytesToArchiveWithMtime is like addBytesToArchive but preserves the
+// source file's mtime — used for log files whose timestamps callers care about.
+func addBytesToArchiveWithMtime(tw *tar.Writer, name string, data []byte, mtime time.Time) error {
+	if globalAnonymizer.enabled {
+		name = string(globalAnonymizer.Apply([]byte(name)))
+	}
+	if isLikelyText(data) {
+		data = redactSensitive(data)
+		data = globalAnonymizer.Apply(data)
+	} else {
+		data = globalAnonymizer.ApplyLiteralOnly(data)
+	}
+	hdr := &tar.Header{
+		Name:    name,
+		Mode:    0644,
+		Size:    int64(len(data)),
+		ModTime: mtime,
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	_, err := tw.Write(data)
+	return err
+}
+
+// isLikelyText returns true when the first 8 KB of b contains no NUL bytes.
+// Used to skip credential redaction and anonymization on binary content
+// (atop.stats files, etc.) — running text-oriented regexes on binary is slow
+// and can corrupt bytes that happen to match by chance (e.g. an IPv4-shaped
+// 4-byte sequence in a binary timestamp).
+func isLikelyText(b []byte) bool {
+	n := len(b)
+	if n > 8192 {
+		n = 8192
+	}
+	return !bytes.Contains(b[:n], []byte{0})
+}
+
 // addBytesToArchive adds in-memory bytes as a file in the tar archive.
+// Text content passes through credential redaction and (when --anonymize is on)
+// the full anonymizer pipeline. Binary content (detected via NUL bytes in the
+// first 8 KB) is passed through the *literal-only* anonymizer pass — exact
+// byte-sequence substitution that is safe on binary; the regex-based IPv4
+// and MAC passes are skipped because they could match incidental byte
+// sequences in binary content. The archive path (name) is always run through
+// the full anonymizer when enabled, so directory structure does not leak
+// hostnames or IPs.
 func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
+	if globalAnonymizer.enabled {
+		name = string(globalAnonymizer.Apply([]byte(name)))
+	}
+	if isLikelyText(data) {
+		data = redactSensitive(data)
+		data = globalAnonymizer.Apply(data)
+	} else {
+		data = globalAnonymizer.ApplyLiteralOnly(data)
+	}
 	hdr := &tar.Header{
 		Name:    name,
 		Mode:    0644,
@@ -1271,8 +1909,15 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 // Returns a HostManifest describing what was collected.
 func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraCmds []CommandSpec) HostManifest {
 	hostname, _ := os.Hostname()
+	// pathHostname is the value used to construct archive paths
+	// (hosts/<pathHostname>/...). When --anonymize is on we route it through
+	// the replacer so the tar directory tree does not leak real hostnames.
+	pathHostname := hostname
+	if globalAnonymizer.enabled {
+		pathHostname = string(globalAnonymizer.Apply([]byte(hostname)))
+	}
 	manifest := HostManifest{
-		Hostname:    hostname,
+		Hostname:    pathHostname,
 		CollectedAt: time.Now(),
 		Profile:     profile,
 	}
@@ -1285,7 +1930,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		manifest.To = &t
 	}
 
-	hostRoot := filepath.Join(archiveRoot, "hosts", hostname)
+	hostRoot := filepath.Join(archiveRoot, "hosts", pathHostname)
 
 	// ── phase: system commands (parallel) ────────────────────────────────
 	phase(fmt.Sprintf("[%s] System commands (%d parallel)", hostname, cmdWorkers))
@@ -1309,7 +1954,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			ext = ".json"
 		}
 		dest := filepath.Join(hostRoot, "system", spec.Name+ext)
-		if err := addBytesToArchive(tw, dest, redactSensitive(content)); err != nil {
+		if err := addBytesToArchive(tw, dest, content); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
 	}
@@ -1376,7 +2021,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			wekaSubdir = "weka/perf"
 		}
 		dest := filepath.Join(hostRoot, wekaSubdir, spec.Name+ext)
-		if err := addBytesToArchive(tw, dest, redactSensitive(content)); err != nil {
+		if err := addBytesToArchive(tw, dest, content); err != nil {
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
 		if spec.Name == "weka_version" && len(co.out) > 0 {
@@ -1519,7 +2164,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			// the same filename from drives0, frontend0, etc.)
 			base := globBase(spec.SrcGlob)
 			relPath := strings.TrimPrefix(srcPath, base)
-			destPath := filepath.Join(archiveRoot, "hosts", hostname, spec.DestDir, relPath)
+			destPath := filepath.Join(archiveRoot, "hosts", pathHostname, spec.DestDir, relPath)
 			fr := collectLogFile(tw, srcPath, destPath)
 			manifest.Files = append(manifest.Files, fr)
 			if fr.Error != "" {
@@ -1530,7 +2175,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 
 	// ── phase: extra commands (orchestrator only, never on remote nodes) ──
 	if !nodeOnly && len(extraCmds) > 0 {
-		hostRoot := filepath.Join(archiveRoot, "hosts", hostname)
+		hostRoot := filepath.Join(archiveRoot, "hosts", pathHostname)
 		phase(fmt.Sprintf("[%s] Extra commands (%d)", hostname, len(extraCmds)))
 		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
 		for i, spec := range extraCmds {
@@ -1544,7 +2189,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				warnf("[%s] extra command %q failed (exit %d): %s", hostname, spec.Cmd, co.result.ExitCode, co.result.Error)
 			}
 			dest := filepath.Join(hostRoot, "extra", spec.Name+".txt")
-			if err := addBytesToArchive(tw, dest, redactSensitive(content)); err != nil {
+			if err := addBytesToArchive(tw, dest, content); err != nil {
 				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 			}
 		}
@@ -2578,7 +3223,7 @@ _weka_log_collector() {
 
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --extra-commands --cmd-timeout --compression
+          --extra-commands --cmd-timeout --compression --anonymize --anonymize-key
           --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
@@ -2590,7 +3235,7 @@ _weka_log_collector() {
             COMPREPLY=( $(compgen -W "gzip xz" -- "$cur") )
             return 0
             ;;
-        --output)
+        --output|--anonymize-key)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
@@ -2624,6 +3269,7 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 	}
 	defer gr.Close()
 	tr := tar.NewReader(gr)
+	transform := globalAnonymizer.enabled
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -2639,6 +3285,41 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			rest = parts[1]
 		}
 		hdr.Name = filepath.Join(newRoot, rest)
+
+		// Anonymize the path itself when --anonymize is on. Remote nodes
+		// wrote these paths as hosts/<real-hostname>/... because the
+		// anonymizer lives on the orchestrator side; rewriting through the
+		// replacer here turns hosts/cst3/... into hosts/host-3/... so the
+		// tar directory tree no longer leaks hostnames.
+		if transform {
+			hdr.Name = string(globalAnonymizer.Apply([]byte(hdr.Name)))
+		}
+
+		if transform {
+			// Read entry into memory, apply transforms, rewrite header with
+			// the (possibly changed) size. Text content gets the full pipeline;
+			// binary content gets the literal-only pass (safe substring
+			// substitution of known sensitive values, no regex on binary).
+			data, readErr := io.ReadAll(tr)
+			if readErr != nil {
+				return fmt.Errorf("tar read entry: %w", readErr)
+			}
+			if isLikelyText(data) {
+				data = redactSensitive(data)
+				data = globalAnonymizer.Apply(data)
+			} else {
+				data = globalAnonymizer.ApplyLiteralOnly(data)
+			}
+			hdr.Size = int64(len(data))
+			if err := tw.WriteHeader(hdr); err != nil {
+				return fmt.Errorf("tar write header: %w", err)
+			}
+			if _, err := tw.Write(data); err != nil {
+				return fmt.Errorf("tar write data: %w", err)
+			}
+			continue
+		}
+
 		if err := tw.WriteHeader(hdr); err != nil {
 			return fmt.Errorf("tar write header: %w", err)
 		}
@@ -3252,7 +3933,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
 				continue
 			}
-			_ = addBytesToArchive(tw, root+"/weka-cli/"+spec.name, redactSensitive(out))
+			_ = addBytesToArchive(tw, root+"/weka-cli/"+spec.name, out)
 			break // success — no need to try other pods
 		}
 	}
@@ -3274,7 +3955,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 					vlogf("k8s: exec %s %s: %v", pod, spec.cmd[0], err)
 					continue
 				}
-				_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, redactSensitive(out))
+				_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, out)
 			}
 			collectK8sOptWekaLogs(tw, kc, clusterNS, pod, podDir+"/opt-weka-logs", m)
 		}
@@ -3608,6 +4289,15 @@ func listExtractedDirs() ([]os.DirEntry, error) {
 	return dirs, nil
 }
 
+// bundleKeyPath returns the anonymization-key.json path that pairs with a
+// bundle archive: foo.tar.gz → foo.anonymization-key.json. Key files are
+// written next to the bundle (not inside it) so --rm-bundle and
+// --clean-bundles need to clean them up alongside the archive.
+func bundleKeyPath(bundlePath string) string {
+	stem := strings.TrimSuffix(strings.TrimSuffix(bundlePath, ".tar.gz"), ".tar.xz")
+	return stem + ".anonymization-key.json"
+}
+
 // dirSize returns the total size of all files under path.
 func dirSize(path string) int64 {
 	var total int64
@@ -3722,6 +4412,15 @@ func handleRmBundle(name string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Removed %s (%d MB)\n", filepath.Base(target), sz/(1024*1024))
+	// If this was a tar bundle, also remove the paired anonymization key file.
+	if !fi.IsDir() {
+		keyPath := bundleKeyPath(target)
+		if _, err := os.Stat(keyPath); err == nil {
+			if rerr := os.Remove(keyPath); rerr == nil {
+				fmt.Printf("Removed %s\n", filepath.Base(keyPath))
+			}
+		}
+	}
 }
 
 func handleCleanBundles() {
@@ -3754,6 +4453,13 @@ func handleCleanBundles() {
 			} else {
 				fmt.Printf("  removed %s (%d MB)\n", fi.Name(), fi.Size()/(1024*1024))
 			}
+			// Also remove the paired anonymization key file if present.
+			keyPath := bundleKeyPath(path)
+			if _, statErr := os.Stat(keyPath); statErr == nil {
+				if rerr := os.Remove(keyPath); rerr == nil {
+					fmt.Printf("  removed %s\n", filepath.Base(keyPath))
+				}
+			}
 		}
 		for _, de := range dirs {
 			path := filepath.Join(wlcBundlesDir, de.Name())
@@ -3765,6 +4471,24 @@ func handleCleanBundles() {
 			}
 		}
 	} // end else (local bundles exist)
+
+	// Sweep any orphaned anonymization key files (left behind by older
+	// --clean-bundles runs that predated the paired-removal fix, or by
+	// manual deletion of a .tar.gz without its key). The paired-removal
+	// above already handled keys whose tar still existed; this catches
+	// the rest. Runs regardless of whether any bundles were present.
+	keyEntries, _ := os.ReadDir(wlcBundlesDir)
+	for _, e := range keyEntries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".anonymization-key.json") {
+			continue
+		}
+		path := filepath.Join(wlcBundlesDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			errorf("  failed to remove %s: %v", e.Name(), err)
+		} else {
+			fmt.Printf("  removed %s\n", e.Name())
+		}
+	}
 
 	// Also clean debug log files from the logs/ directory.
 	logEntries, err := os.ReadDir(wlcLogsDir)
@@ -3796,7 +4520,7 @@ func handleCleanBundles() {
 		return
 	}
 	hostname, _ := os.Hostname()
-	cleanCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz", wlcBaseDir, wlcBaseDir, wlcBaseDir)
+	cleanCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz %s/bundles/*.anonymization-key.json", wlcBaseDir, wlcBaseDir, wlcBaseDir, wlcBaseDir)
 	fmt.Printf("Cleaning remote nodes...\n")
 	var remoteCount int
 	for _, n := range nodes {
@@ -3841,6 +4565,8 @@ func main() {
 		uploadFile      = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)", wlcBaseDir))
 		uploadSessionID = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
 		compression     = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
+		anonymize       = flag.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json (kept by the customer; not in the archive).")
+		anonymizeKey    = flag.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -3975,19 +4701,40 @@ func main() {
 		from = time.Now().Add(-8 * time.Hour)
 	}
 
+	// ── build anonymizer (must happen before output path / archive root are
+	// computed so the cluster name in the filename is masked too) ──────────
+	globalAnonymizer = buildAnonymizer(*anonymize)
+
 	// ── determine output path ─────────────────────────────────────────────
 	toStdout := *outputPath == "-"
 	outPath := *outputPath
 	if !toStdout {
 		clusterName := getClusterName()
+		if globalAnonymizer.enabled {
+			clusterName = "weka-cluster"
+		}
 		ts := time.Now().Format("2006-01-02T15-04-05")
-		archiveName := fmt.Sprintf("%s-weka-logs-%s%s", clusterName, ts, archiveExt(*compression))
+		anonSuffix := ""
+		if globalAnonymizer.enabled {
+			anonSuffix = "-anon"
+		}
+		archiveName := fmt.Sprintf("%s-weka-logs-%s%s%s", clusterName, ts, anonSuffix, archiveExt(*compression))
 		if outPath == "" {
 			_ = os.MkdirAll(wlcBundlesDir, 0755)
 			outPath = filepath.Join(wlcBundlesDir, archiveName)
 		} else if info, err := os.Stat(outPath); err == nil && info.IsDir() {
 			// User gave a directory — place the archive inside it
 			outPath = filepath.Join(outPath, archiveName)
+		}
+	}
+
+	// ── compute anonymization key file path (next to bundle, never inside) ──
+	keyPath := *anonymizeKey
+	if globalAnonymizer.enabled && keyPath == "" {
+		if toStdout {
+			keyPath = filepath.Join(wlcBundlesDir, fmt.Sprintf("anonymization-key-%s.json", time.Now().Format("2006-01-02T15-04-05")))
+		} else {
+			keyPath = strings.TrimSuffix(strings.TrimSuffix(outPath, ".tar.gz"), ".tar.xz") + ".anonymization-key.json"
 		}
 	}
 
@@ -4013,6 +4760,22 @@ func main() {
 	} else {
 		logf("Output:   <stdout>")
 	}
+	if globalAnonymizer.enabled {
+		logf("Anonymize: ON  (mapping → %s)", keyPath)
+	}
+
+	// ── write anonymization mapping after collection completes ───────────
+	defer func() {
+		if !globalAnonymizer.enabled {
+			return
+		}
+		if err := globalAnonymizer.writeKey(keyPath); err != nil {
+			warnf("Could not write anonymization mapping: %v", err)
+			return
+		}
+		logf("\nAnonymization mapping → %s", keyPath)
+		logf("Keep this file at your site — it's needed to decode anonymized values when troubleshooting.")
+	}()
 
 	// ── pre-discover for cluster mode (cache result for later use) ───────
 	var preDiscoveredHosts []string
@@ -4549,8 +5312,15 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 // writeArchive performs a local collection and writes to outPath (or stdout).
 func writeArchive(outPath string, toStdout bool, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraManifests []HostManifest, extraCmds []CommandSpec, compression string) {
 	clusterName := getClusterName()
+	if globalAnonymizer.enabled {
+		clusterName = "weka-cluster"
+	}
 	ts := time.Now().Format("2006-01-02T15-04-05")
-	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
+	anonSuffix := ""
+	if globalAnonymizer.enabled {
+		anonSuffix = "-anon"
+	}
+	archiveRoot := fmt.Sprintf("%s-weka-logs-%s%s", clusterName, ts, anonSuffix)
 
 	var outWriter io.Writer
 	var outDesc string
@@ -4602,8 +5372,15 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 // writeMergedArchive merges results from all cluster hosts into a single archive.
 func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout time.Duration, collectionStart time.Time, extraCmds []CommandSpec, compression string) {
 	clusterName := getClusterName()
+	if globalAnonymizer.enabled {
+		clusterName = "weka-cluster"
+	}
 	ts := time.Now().Format("2006-01-02T15-04-05")
-	archiveRoot := fmt.Sprintf("%s-weka-logs-%s", clusterName, ts)
+	anonSuffix := ""
+	if globalAnonymizer.enabled {
+		anonSuffix = "-anon"
+	}
+	archiveRoot := fmt.Sprintf("%s-weka-logs-%s%s", clusterName, ts, anonSuffix)
 
 	var outWriter io.Writer
 	var outDesc string
@@ -4709,6 +5486,10 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			continue
 		}
 		stat, _ := f.Stat()
+		if globalAnonymizer.enabled {
+			logf("  [%s] anonymizing and merging (%d KB)...", r.Host, stat.Size()/1024)
+		}
+		mergeStart := time.Now()
 		mergeErr := mergeArchive(tw, f, archiveRoot)
 		f.Close()
 		os.Remove(r.TempFile)
@@ -4719,7 +5500,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			continue
 		}
 		succeeded++
-		logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
+		if globalAnonymizer.enabled {
+			logf("  [%s] merged OK (%d KB, %s)", r.Host, stat.Size()/1024, time.Since(mergeStart).Round(time.Second))
+		} else {
+			logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
+		}
 	}
 
 	// Write cluster-level summary
@@ -4807,6 +5592,8 @@ OPTIONS
   --local              This host only; no SSH
   --output PATH        Archive path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz); - for stdout
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
+  --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping JSON written next to the bundle (kept by the customer; not in the archive).
+  --anonymize-key PATH Override path for the anonymization mapping JSON (default: alongside the bundle)
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
   --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
