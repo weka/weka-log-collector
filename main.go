@@ -567,12 +567,49 @@ func buildAnonymizer(enabled bool) *anonymizer {
 		a.addDomain(adDomain)
 		// Kerberos realm — same string uppercased — appears in cfgdump etc.
 		a.addDomain(strings.ToUpper(adDomain))
-		// Auto-build FQDNs for every short hostname already registered, so
-		// references like `cst3.cst.wekaad.net` in /etc/hostname or process
-		// command lines get fully masked rather than partially.
+
+		// Register parent domains in the hierarchy. For `cst.wekaad.net` also
+		// register `wekaad.net` — some clusters' Kerberos realm and host-local
+		// sssd.conf reference the parent rather than the cluster's subdomain.
+		// Stop above the TLD so we don't register bare `.net`.
+		labelParts := strings.Split(adDomain, ".")
+		for i := 1; i < len(labelParts)-1; i++ {
+			parent := strings.Join(labelParts[i:], ".")
+			a.addDomain(parent)
+			a.addDomain(strings.ToUpper(parent))
+		}
+
+		// Register the LDAP DN form of every (lowercase) domain. Weka's
+		// cfgdump emits AD bindings in the form `dc=cst,dc=wekaad,dc=net`
+		// which the plain `cst.wekaad.net` rule does not catch. Snapshot the
+		// domain keys first since we mutate mapDomains inside the loop.
+		var domainKeys []string
+		for d := range a.mapDomains {
+			domainKeys = append(domainKeys, d)
+		}
+		for _, d := range domainKeys {
+			if d != strings.ToLower(d) {
+				continue // DN convention is lowercase; skip Kerberos-realm forms
+			}
+			dn := "dc=" + strings.Join(strings.Split(d, "."), ",dc=")
+			a.mapDomains[dn] = "dc=example,dc=invalid"
+		}
+
+		// Auto-build FQDNs for every short hostname × every lowercase domain
+		// (including parents). References like `cst3.cst.wekaad.net` or
+		// `cst8.wekaad.net` get fully masked rather than partially.
+		var lowerDomains []string
+		for d := range a.mapDomains {
+			if d == strings.ToLower(d) && !strings.HasPrefix(d, "dc=") {
+				lowerDomains = append(lowerDomains, d)
+			}
+		}
 		for short := range a.mapHostnames {
-			if !strings.Contains(short, ".") {
-				a.addFQDN(short + "." + adDomain)
+			if strings.Contains(short, ".") {
+				continue
+			}
+			for _, d := range lowerDomains {
+				a.addFQDN(short + "." + d)
 			}
 		}
 	}
