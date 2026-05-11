@@ -4823,11 +4823,19 @@ func main() {
 	// remote SSH state, disk-space checks, and signal-handler cleanups. The
 	// lock is released on normal exit (defer) and inside the cluster-mode
 	// signal handler below.
-	if err := acquireRunLock(*force); err != nil {
-		errorf("%v", err)
-		os.Exit(1)
+	//
+	// Skipped for --node-only invocations: those are SSH-launched sub-tasks
+	// of an orchestrator that already holds its own lock. Acquiring here too
+	// would deadlock whenever the orchestrator is itself a cluster member
+	// (the common case) — the orchestrator's lock would block its own
+	// --node-only run on the same host.
+	if !*nodeOnly {
+		if err := acquireRunLock(*force); err != nil {
+			errorf("%v", err)
+			os.Exit(1)
+		}
+		defer releaseRunLock()
 	}
-	defer releaseRunLock()
 
 	// ── open debug log file ───────────────────────────────────────────────
 	// Skip when output is stdout (--output -): this is a remote node collection
