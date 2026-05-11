@@ -43,6 +43,7 @@ const (
 	wlcBaseDir        = "/opt/weka/weka-log-collector"
 	wlcBundlesDir     = wlcBaseDir + "/bundles"
 	wlcLogsDir        = wlcBaseDir + "/logs"
+	wlcRunLock        = wlcBaseDir + "/.run.lock"
 	uploadFileMaxSize = 50 * 1024 * 1024 // 50 MB
 )
 
@@ -2657,6 +2658,58 @@ func isLocalIP(ip string) bool {
 // getClusterName returns the Weka cluster name by parsing `weka status`.
 // Falls back to the local hostname if weka is unavailable or the output
 // cannot be parsed.
+// ── concurrency lock ─────────────────────────────────────────────────────────
+//
+// A PID-file lock at wlcRunLock prevents two concurrent collection runs on the
+// same node from colliding on remote SSH state, disk space pre-checks, and
+// signal-handler cleanups (where one run's Ctrl+C would pkill the other run's
+// remote weka-log-collector processes). The lock contains the running PID and
+// start timestamp so the failure message is actionable.
+
+// isPIDAlive returns true if a process with the given PID exists.
+// On POSIX systems, signal 0 probes for existence without delivering anything.
+func isPIDAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// acquireRunLock attempts to acquire the run lock by writing the current PID
+// and start time to wlcRunLock. Returns an error describing the existing run
+// when a live lock is present and force is false. A stale lock (PID not alive)
+// is silently overwritten.
+func acquireRunLock(force bool) error {
+	if data, err := os.ReadFile(wlcRunLock); err == nil {
+		lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+		if len(lines) > 0 {
+			if pid, perr := strconv.Atoi(strings.TrimSpace(lines[0])); perr == nil && isPIDAlive(pid) {
+				if !force {
+					startedAt := "(unknown start time)"
+					if len(lines) > 1 && lines[1] != "" {
+						startedAt = "started " + lines[1]
+					}
+					return fmt.Errorf("another weka-log-collector run is in progress (PID %d, %s) — pass --force to override if you're certain the other run is hung", pid, startedAt)
+				}
+				warnf("Overriding live run lock (PID %d) — --force was passed", pid)
+			}
+		}
+	}
+	_ = os.MkdirAll(wlcBaseDir, 0755)
+	content := fmt.Sprintf("%d\n%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
+	return os.WriteFile(wlcRunLock, []byte(content), 0644)
+}
+
+// releaseRunLock removes the lock file. Safe to call when no lock was acquired
+// (idempotent — best-effort cleanup; missing or already-removed file is fine).
+func releaseRunLock() {
+	_ = os.Remove(wlcRunLock)
+}
+
 func getClusterName() string {
 	out, err := exec.Command("weka", "status").Output()
 	if err == nil {
@@ -3223,7 +3276,7 @@ _weka_log_collector() {
 
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --extra-commands --cmd-timeout --compression --anonymize --anonymize-key
+          --extra-commands --cmd-timeout --compression --anonymize --anonymize-key --force
           --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
@@ -4567,6 +4620,7 @@ func main() {
 		compression     = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
 		anonymize       = flag.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json (kept by the customer; not in the archive).")
 		anonymizeKey    = flag.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
+		force           = flag.Bool("force", false, "Override the run lock at /opt/weka/weka-log-collector/.run.lock (use only when an earlier run is known to be hung)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -4637,6 +4691,17 @@ func main() {
 		}
 		return
 	}
+
+	// ── acquire run lock ─────────────────────────────────────────────────
+	// Prevents two concurrent collections on the same node from colliding on
+	// remote SSH state, disk-space checks, and signal-handler cleanups. The
+	// lock is released on normal exit (defer) and inside the cluster-mode
+	// signal handler below.
+	if err := acquireRunLock(*force); err != nil {
+		errorf("%v", err)
+		os.Exit(1)
+	}
+	defer releaseRunLock()
 
 	// ── open debug log file ───────────────────────────────────────────────
 	// Skip when output is stdout (--output -): this is a remote node collection
@@ -4963,6 +5028,7 @@ func main() {
 			return true
 		})
 		cleanupWg.Wait()
+		releaseRunLock()
 		logf("Cleanup complete.")
 		os.Exit(1)
 	}()
@@ -5598,6 +5664,7 @@ OPTIONS
   --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
+  --force              Override the run lock (use only when an earlier run is known to be hung)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
 
