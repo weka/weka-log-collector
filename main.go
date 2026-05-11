@@ -350,11 +350,40 @@ func (a *anonymizer) Apply(content []byte) []byte {
 	if a.replacer != nil {
 		content = []byte(a.replacer.Replace(string(content)))
 	}
-	// 2. IPv4: mask first 3 octets, preserve last.
-	content = ipv4Re.ReplaceAllFunc(content, a.maskIPv4)
+	// 2. IPv4: mask first 3 octets, preserve last. Uses a position-aware
+	//    walker so values preceded by '-' or '_' (compound version strings
+	//    like MLNX_OFED_LINUX-23.10-2.1.8.0) are preserved.
+	content = a.maskIPv4InContent(content)
 	// 3. MAC: mask first 3 bytes, preserve last 3.
 	content = macRe.ReplaceAllFunc(content, a.maskMAC)
 	return content
+}
+
+// maskIPv4InContent walks content, applying maskIPv4 only when the IPv4-shaped
+// value isn't preceded by '-' or '_'. Those characters mark the value as part
+// of a compound version string (OFED, kernel-module versions, etc.) rather
+// than an IP address — preserving them keeps useful diagnostic info readable.
+func (a *anonymizer) maskIPv4InContent(content []byte) []byte {
+	matches := ipv4Re.FindAllIndex(content, -1)
+	if len(matches) == 0 {
+		return content
+	}
+	var buf bytes.Buffer
+	buf.Grow(len(content) + 64)
+	last := 0
+	for _, m := range matches {
+		start, end := m[0], m[1]
+		buf.Write(content[last:start])
+		match := content[start:end]
+		if start > 0 && (content[start-1] == '-' || content[start-1] == '_') {
+			buf.Write(match) // version-suffix context, leave alone
+		} else {
+			buf.Write(a.maskIPv4(match))
+		}
+		last = end
+	}
+	buf.Write(content[last:])
+	return buf.Bytes()
 }
 
 func (a *anonymizer) maskIPv4(b []byte) []byte {
