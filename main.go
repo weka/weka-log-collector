@@ -330,6 +330,10 @@ func (a *anonymizer) finalize() {
 	collect(a.mapDomains)
 	collect(a.mapNetBIOS)
 	collect(a.mapClusterID)
+	// Pre-discovered IPs (from cluster commands at startup) — including these
+	// in the literal Replacer lets binary-content files get their cluster IPs
+	// masked too, since we skip the IPv4 regex pass on binary content.
+	collect(a.mapIPs)
 	sort.Slice(pairs, func(i, j int) bool {
 		return len(pairs[i].k) > len(pairs[j].k)
 	})
@@ -338,6 +342,19 @@ func (a *anonymizer) finalize() {
 		flat = append(flat, p.k, p.v)
 	}
 	a.replacer = strings.NewReplacer(flat...)
+}
+
+// ApplyLiteralOnly runs just the literal-string Replacer pass. Used for
+// binary content where the IPv4/MAC regex passes could match incidental byte
+// sequences and corrupt data. The Replacer does exact byte-sequence
+// substitution so it is safe on any content type — it only replaces values
+// it was explicitly told about (hostnames, FQDNs, cluster name, GUID, AD
+// domain, and the cluster IPs we pre-discovered at startup).
+func (a *anonymizer) ApplyLiteralOnly(content []byte) []byte {
+	if !a.enabled || a.replacer == nil || len(content) == 0 {
+		return content
+	}
+	return []byte(a.replacer.Replace(string(content)))
 }
 
 // Apply replaces sensitive values in content. Returns input unchanged when
@@ -628,10 +645,15 @@ func buildAnonymizer(enabled bool) *anonymizer {
 		}
 		for _, d := range domainKeys {
 			if d != strings.ToLower(d) {
-				continue // DN convention is lowercase; skip Kerberos-realm forms
+				continue // skip the uppercase Kerberos-realm forms here
 			}
-			dn := "dc=" + strings.Join(strings.Split(d, "."), ",dc=")
-			a.mapDomains[dn] = "dc=example,dc=invalid"
+			labels := strings.Split(d, ".")
+			// Lowercase `dc=` form — RFC convention.
+			a.mapDomains["dc="+strings.Join(labels, ",dc=")] = "dc=example,dc=invalid"
+			// Uppercase `DC=` form — Active Directory convention; appears in
+			// LDAP DN strings like `CN=Configuration,DC=cst,DC=wekaad,DC=net`
+			// emitted by AD-aware clients (sssd, tsmb, etc.).
+			a.mapDomains["DC="+strings.Join(labels, ",DC=")] = "DC=example,DC=invalid"
 		}
 
 		// Auto-build FQDNs for every short hostname × every lowercase domain
@@ -1816,6 +1838,8 @@ func addBytesToArchiveWithMtime(tw *tar.Writer, name string, data []byte, mtime 
 	if isLikelyText(data) {
 		data = redactSensitive(data)
 		data = globalAnonymizer.Apply(data)
+	} else {
+		data = globalAnonymizer.ApplyLiteralOnly(data)
 	}
 	hdr := &tar.Header{
 		Name:    name,
@@ -1845,10 +1869,13 @@ func isLikelyText(b []byte) bool {
 
 // addBytesToArchive adds in-memory bytes as a file in the tar archive.
 // Text content passes through credential redaction and (when --anonymize is on)
-// the run-scoped anonymizer before being written. Binary content (detected via
-// NUL bytes in the first 8 KB) is written through unchanged. The archive path
-// (name) is also run through the anonymizer when enabled, so directory
-// structure does not leak hostnames or IPs.
+// the full anonymizer pipeline. Binary content (detected via NUL bytes in the
+// first 8 KB) is passed through the *literal-only* anonymizer pass — exact
+// byte-sequence substitution that is safe on binary; the regex-based IPv4
+// and MAC passes are skipped because they could match incidental byte
+// sequences in binary content. The archive path (name) is always run through
+// the full anonymizer when enabled, so directory structure does not leak
+// hostnames or IPs.
 func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 	if globalAnonymizer.enabled {
 		name = string(globalAnonymizer.Apply([]byte(name)))
@@ -1856,6 +1883,8 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 	if isLikelyText(data) {
 		data = redactSensitive(data)
 		data = globalAnonymizer.Apply(data)
+	} else {
+		data = globalAnonymizer.ApplyLiteralOnly(data)
 	}
 	hdr := &tar.Header{
 		Name:    name,
@@ -3267,9 +3296,10 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 		}
 
 		if transform {
-			// Read entry into memory, apply redaction + anonymization (text
-			// only — binary content like atop.stats is passed through), and
-			// rewrite header with the (possibly changed) size.
+			// Read entry into memory, apply transforms, rewrite header with
+			// the (possibly changed) size. Text content gets the full pipeline;
+			// binary content gets the literal-only pass (safe substring
+			// substitution of known sensitive values, no regex on binary).
 			data, readErr := io.ReadAll(tr)
 			if readErr != nil {
 				return fmt.Errorf("tar read entry: %w", readErr)
@@ -3277,6 +3307,8 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			if isLikelyText(data) {
 				data = redactSensitive(data)
 				data = globalAnonymizer.Apply(data)
+			} else {
+				data = globalAnonymizer.ApplyLiteralOnly(data)
 			}
 			hdr.Size = int64(len(data))
 			if err := tw.WriteHeader(hdr); err != nil {
