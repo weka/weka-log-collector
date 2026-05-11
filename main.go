@@ -4472,6 +4472,24 @@ func handleCleanBundles() {
 		}
 	} // end else (local bundles exist)
 
+	// Sweep any orphaned anonymization key files (left behind by older
+	// --clean-bundles runs that predated the paired-removal fix, or by
+	// manual deletion of a .tar.gz without its key). The paired-removal
+	// above already handled keys whose tar still existed; this catches
+	// the rest. Runs regardless of whether any bundles were present.
+	keyEntries, _ := os.ReadDir(wlcBundlesDir)
+	for _, e := range keyEntries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".anonymization-key.json") {
+			continue
+		}
+		path := filepath.Join(wlcBundlesDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			errorf("  failed to remove %s: %v", e.Name(), err)
+		} else {
+			fmt.Printf("  removed %s\n", e.Name())
+		}
+	}
+
 	// Also clean debug log files from the logs/ directory.
 	logEntries, err := os.ReadDir(wlcLogsDir)
 	if err != nil && !os.IsNotExist(err) {
