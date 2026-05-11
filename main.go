@@ -5469,7 +5469,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		}
 		stat, _ := f.Stat()
 		if globalAnonymizer.enabled {
-			logf("  [%s] anonymizing and merging (%d KB) — this is CPU-bound, may take a moment...", r.Host, stat.Size()/1024)
+			logf("  [%s] anonymizing and merging (%d KB)...", r.Host, stat.Size()/1024)
 		}
 		mergeStart := time.Now()
 		mergeErr := mergeArchive(tw, f, archiveRoot)
