@@ -170,6 +170,8 @@ type anonymizer struct {
 	mapDomains   map[string]string
 	mapNetBIOS   map[string]string
 	mapClusterID map[string]string // cluster name + cluster GUID
+	mapFSNames   map[string]string // weka filesystem names
+	mapUsers     map[string]string // AD admin + S3 service accounts (non-universal only)
 
 	// Lazily-built maps (regex-discovered values seen at write time).
 	mapIPs  map[string]string
@@ -182,6 +184,11 @@ type anonymizer struct {
 	// hostnames without trailing digits (host-a, host-b, ...).
 	hostCollisionTags map[string]int // base "host-1" → next tag index
 	hostLetterIdx     int            // counter for digit-less fallbacks
+
+	// Counters for fs-N and user-N pools.
+	fsCollisionTags map[string]int
+	fsLetterIdx     int
+	userCounter     int
 
 	mu sync.Mutex // protects lazy IP/MAC maps
 }
@@ -197,9 +204,12 @@ func newAnonymizer(enabled bool) *anonymizer {
 		mapDomains:        make(map[string]string),
 		mapNetBIOS:        make(map[string]string),
 		mapClusterID:      make(map[string]string),
+		mapFSNames:        make(map[string]string),
+		mapUsers:          make(map[string]string),
 		mapIPs:            make(map[string]string),
 		mapMACs:           make(map[string]string),
 		hostCollisionTags: make(map[string]int),
+		fsCollisionTags:   make(map[string]int),
 	}
 }
 
@@ -311,6 +321,71 @@ func (a *anonymizer) addClusterGUID(guid string) string {
 	return masked
 }
 
+// universalAccounts are usernames that exist on every Linux/AD system and
+// are not customer-identifying. Kept as-is when discovered as the AD admin
+// or an S3 service account name. Custom names (weka-admin, svc_join,
+// pipeline-svc, etc.) get registered like any other user.
+var universalAccounts = map[string]bool{
+	"administrator": true, "admin": true,
+	"root": true, "nobody": true, "daemon": true,
+	"systemd-network": true, "systemd-resolve": true, "systemd-timesync": true,
+	"sshd": true, "weka": true, "nfsnobody": true, "polkitd": true,
+	"chrony": true, "dbus": true, "tcpdump": true, "operator": true,
+}
+
+// addFSName registers a Weka filesystem name for masking. Trailing digits
+// are preserved (production-2 → fs-2); collisions get a letter suffix
+// (fs-2, fs-2b); names without trailing digits fall back to fs-a, fs-b, ...
+func (a *anonymizer) addFSName(real string) string {
+	if !a.enabled || real == "" {
+		return real
+	}
+	if existing, ok := a.mapFSNames[real]; ok {
+		return existing
+	}
+	var masked string
+	if m := trailingDigitsRe.FindString(real); m != "" {
+		base := "fs-" + m
+		taken := false
+		for _, v := range a.mapFSNames {
+			if v == base {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			masked = base
+		} else {
+			a.fsCollisionTags[base]++
+			masked = base + string(rune('a'+a.fsCollisionTags[base]))
+		}
+	} else {
+		masked = "fs-" + string(rune('a'+a.fsLetterIdx))
+		a.fsLetterIdx++
+	}
+	a.mapFSNames[real] = masked
+	return masked
+}
+
+// addUser registers a username (AD admin or S3 service account) for masking
+// unless it's a universal account name (root, administrator, etc., which
+// exist on every system and aren't customer-identifying).
+func (a *anonymizer) addUser(real string) string {
+	if !a.enabled || real == "" {
+		return real
+	}
+	if universalAccounts[strings.ToLower(real)] {
+		return real
+	}
+	if existing, ok := a.mapUsers[real]; ok {
+		return existing
+	}
+	a.userCounter++
+	masked := fmt.Sprintf("user-%d", a.userCounter)
+	a.mapUsers[real] = masked
+	return masked
+}
+
 // finalize builds the strings.Replacer from all fixed mappings. Must be
 // called once after all add* calls and before Apply.
 func (a *anonymizer) finalize() {
@@ -331,6 +406,8 @@ func (a *anonymizer) finalize() {
 	collect(a.mapDomains)
 	collect(a.mapNetBIOS)
 	collect(a.mapClusterID)
+	collect(a.mapFSNames)
+	collect(a.mapUsers)
 	// Pre-discovered IPs (from cluster commands at startup) — including these
 	// in the literal Replacer lets binary-content files get their cluster IPs
 	// masked too, since we skip the IPv4 regex pass on binary content.
@@ -462,6 +539,8 @@ func (a *anonymizer) writeKey(path string) error {
 		Domains      map[string]string `json:"domains,omitempty"`
 		NetBIOS      map[string]string `json:"netbios,omitempty"`
 		Cluster      map[string]string `json:"cluster,omitempty"`
+		Filesystems  map[string]string `json:"filesystems,omitempty"`
+		Users        map[string]string `json:"users,omitempty"`
 		IPs          map[string]string `json:"ips,omitempty"`
 		MACs         map[string]string `json:"macs,omitempty"`
 	}
@@ -473,6 +552,8 @@ func (a *anonymizer) writeKey(path string) error {
 		Domains:      a.mapDomains,
 		NetBIOS:      a.mapNetBIOS,
 		Cluster:      a.mapClusterID,
+		Filesystems:  a.mapFSNames,
+		Users:        a.mapUsers,
 		IPs:          a.mapIPs,
 		MACs:         a.mapMACs,
 	}
@@ -592,7 +673,8 @@ func buildAnonymizer(enabled bool) *anonymizer {
 	if out, err := exec.Command("weka", "smb", "cluster", "info", "-J").Output(); err == nil {
 		var s struct {
 			AdConf struct {
-				Domain string `json:"domain"`
+				Domain        string `json:"domain"`
+				AdminUsername string `json:"adminUsername"`
 			} `json:"adConf"`
 			DomainNetbiosName string `json:"domainNetbiosName"`
 			NetbiosName       string `json:"netbiosName"`
@@ -605,13 +687,57 @@ func buildAnonymizer(enabled bool) *anonymizer {
 			if s.NetbiosName != "" {
 				a.addNetBIOS(s.NetbiosName)
 			}
-			vlogf("anonymizer: weka smb cluster info — domain=%q netbios=%q/%q", adDomain, s.DomainNetbiosName, s.NetbiosName)
+			if s.AdConf.AdminUsername != "" {
+				a.addUser(s.AdConf.AdminUsername)
+			}
+			vlogf("anonymizer: weka smb cluster info — domain=%q netbios=%q/%q adminUser=%q", adDomain, s.DomainNetbiosName, s.NetbiosName, s.AdConf.AdminUsername)
 		} else {
 			vlogf("anonymizer: weka smb cluster info -J returned unparseable JSON")
 		}
 	} else {
 		vlogf("anonymizer: weka smb cluster info -J failed: %v", err)
 	}
+
+	// Filesystem names from `weka fs -J`. Customer-named filesystems (e.g.
+	// "production_data", "research") are masked to fs-N placeholders.
+	fsCount := 0
+	if out, err := exec.Command("weka", "fs", "-J").Output(); err == nil {
+		var fsList []struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(out, &fsList) == nil {
+			for _, fs := range fsList {
+				if fs.Name != "" {
+					a.addFSName(fs.Name)
+					fsCount++
+				}
+			}
+		}
+	}
+	vlogf("anonymizer: registered %d filesystem name(s)", fsCount)
+
+	// S3 service accounts from `weka s3 service-account list -J`. Customer-
+	// named accounts (e.g. "pipeline-svc", "analytics-team") are masked to
+	// user-N placeholders alongside the AD admin (if any). Universal account
+	// names (root, administrator, etc.) pass through unchanged.
+	s3UserCount := 0
+	if out, err := exec.Command("weka", "s3", "service-account", "list", "-J").Output(); err == nil {
+		var accounts []struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(out, &accounts) == nil {
+			for _, acc := range accounts {
+				if acc.Name != "" {
+					before := len(a.mapUsers)
+					a.addUser(acc.Name)
+					if len(a.mapUsers) > before {
+						s3UserCount++
+					}
+				}
+			}
+		}
+	}
+	vlogf("anonymizer: registered %d S3 service account(s)", s3UserCount)
 	if adDomain == "" {
 		if data, rerr := os.ReadFile("/etc/sssd/sssd.conf"); rerr == nil {
 			if m := sssdAdDomainRe.FindSubmatch(data); m != nil {
@@ -677,8 +803,8 @@ func buildAnonymizer(enabled bool) *anonymizer {
 	}
 
 	a.finalize()
-	vlogf("anonymizer: ready — %d hostnames, %d FQDNs, %d domains, %d netbios, %d cluster IDs",
-		len(a.mapHostnames), len(a.mapFQDNs), len(a.mapDomains), len(a.mapNetBIOS), len(a.mapClusterID))
+	vlogf("anonymizer: ready — %d hostnames, %d FQDNs, %d domains, %d netbios, %d cluster IDs, %d fs names, %d users",
+		len(a.mapHostnames), len(a.mapFQDNs), len(a.mapDomains), len(a.mapNetBIOS), len(a.mapClusterID), len(a.mapFSNames), len(a.mapUsers))
 	return a
 }
 
