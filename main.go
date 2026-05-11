@@ -431,6 +431,29 @@ func (a *anonymizer) writeKey(path string) error {
 // in writeArchive / writeMergedArchive before any tar writes happen.
 var globalAnonymizer = newAnonymizer(false)
 
+// addAnyHostname registers a hostname in either short or FQDN form. For an
+// FQDN, both the full string and the short first-label are recorded so the
+// replacer handles paths/files that mention either form.
+func (a *anonymizer) addAnyHostname(h string) {
+	if !a.enabled || h == "" {
+		return
+	}
+	if strings.Contains(h, ".") {
+		short, _, _ := strings.Cut(h, ".")
+		a.addHostname(short)
+		a.addFQDN(h)
+		return
+	}
+	a.addHostname(h)
+}
+
+// sssdAdDomainRe extracts the AD domain from an sssd.conf line like
+//
+//	ad_domain = cst.wekaad.net
+//
+// Used as a fallback when `weka smb cluster info -J` returns no domain.
+var sssdAdDomainRe = regexp.MustCompile(`(?m)^\s*ad_domain\s*=\s*(\S+)\s*$`)
+
 // buildAnonymizer queries the local Weka cluster to pre-populate fixed
 // mappings (hostnames, IPs, cluster name, GUID, AD domain, NetBIOS).
 // Best-effort — failures of individual queries do not abort collection;
@@ -451,11 +474,18 @@ func buildAnonymizer(enabled bool) *anonymizer {
 		if json.Unmarshal(out, &s) == nil {
 			a.addClusterName(s.Name)
 			a.addClusterGUID(s.GUID)
+			vlogf("anonymizer: registered cluster name (%d chars) and GUID", len(s.Name))
+		} else {
+			vlogf("anonymizer: weka status -J returned unparseable JSON")
 		}
+	} else {
+		vlogf("anonymizer: weka status -J failed: %v", err)
 	}
 
-	// Hostnames + IPs from `weka cluster servers list -J` (or container list).
-	// Use container list because it includes IPs per container.
+	// Hostnames + IPs from `weka cluster container -l -J`. NOTE: the local
+	// node's own containers are sometimes omitted from this output — see the
+	// os.Hostname() fallback below.
+	containerHostnames := 0
 	if out, err := exec.Command("weka", "cluster", "container", "-l", "-J").Output(); err == nil {
 		var containers []struct {
 			Hostname string   `json:"hostname"`
@@ -470,9 +500,10 @@ func buildAnonymizer(enabled bool) *anonymizer {
 			})
 			for _, c := range containers {
 				if c.Hostname != "" {
-					a.addHostname(c.Hostname)
-					if strings.Contains(c.Hostname, ".") {
-						a.addFQDN(c.Hostname)
+					before := len(a.mapHostnames)
+					a.addAnyHostname(c.Hostname)
+					if len(a.mapHostnames) > before {
+						containerHostnames++
 					}
 				}
 				if c.HostIP != "" {
@@ -484,9 +515,23 @@ func buildAnonymizer(enabled bool) *anonymizer {
 			}
 		}
 	}
+	vlogf("anonymizer: registered %d hostnames from weka cluster container", containerHostnames)
+
+	// Local hostname fallback — `weka cluster container -l -J` can omit the
+	// orchestrator's own containers, leaving the local hostname unregistered.
+	if localHost, err := os.Hostname(); err == nil && localHost != "" {
+		before := len(a.mapHostnames)
+		a.addAnyHostname(localHost)
+		if len(a.mapHostnames) > before {
+			vlogf("anonymizer: registered local hostname from os.Hostname()")
+		}
+	}
 
 	// AD/SMB info from `weka smb cluster info -J` (only present on SMB-W
-	// clusters; ignore failures for non-SMB clusters).
+	// clusters). Falls back to /etc/sssd/sssd.conf parsing when the CLI does
+	// not return an ad_domain — keeps coverage on AD-joined nodes even if
+	// the SMB-W cluster isn't queryable from the orchestrator.
+	adDomain := ""
 	if out, err := exec.Command("weka", "smb", "cluster", "info", "-J").Output(); err == nil {
 		var s struct {
 			AdConf struct {
@@ -496,21 +541,45 @@ func buildAnonymizer(enabled bool) *anonymizer {
 			NetbiosName       string `json:"netbiosName"`
 		}
 		if json.Unmarshal(out, &s) == nil {
-			if s.AdConf.Domain != "" {
-				a.addDomain(s.AdConf.Domain)
-				// AD realm is the domain uppercased — register it too.
-				a.addDomain(strings.ToUpper(s.AdConf.Domain))
-			}
+			adDomain = s.AdConf.Domain
 			if s.DomainNetbiosName != "" {
 				a.addNetBIOS(s.DomainNetbiosName)
 			}
 			if s.NetbiosName != "" {
 				a.addNetBIOS(s.NetbiosName)
 			}
+			vlogf("anonymizer: weka smb cluster info — domain=%q netbios=%q/%q", adDomain, s.DomainNetbiosName, s.NetbiosName)
+		} else {
+			vlogf("anonymizer: weka smb cluster info -J returned unparseable JSON")
+		}
+	} else {
+		vlogf("anonymizer: weka smb cluster info -J failed: %v", err)
+	}
+	if adDomain == "" {
+		if data, rerr := os.ReadFile("/etc/sssd/sssd.conf"); rerr == nil {
+			if m := sssdAdDomainRe.FindSubmatch(data); m != nil {
+				adDomain = string(m[1])
+				vlogf("anonymizer: registered AD domain from /etc/sssd/sssd.conf fallback")
+			}
+		}
+	}
+	if adDomain != "" {
+		a.addDomain(adDomain)
+		// Kerberos realm — same string uppercased — appears in cfgdump etc.
+		a.addDomain(strings.ToUpper(adDomain))
+		// Auto-build FQDNs for every short hostname already registered, so
+		// references like `cst3.cst.wekaad.net` in /etc/hostname or process
+		// command lines get fully masked rather than partially.
+		for short := range a.mapHostnames {
+			if !strings.Contains(short, ".") {
+				a.addFQDN(short + "." + adDomain)
+			}
 		}
 	}
 
 	a.finalize()
+	vlogf("anonymizer: ready — %d hostnames, %d FQDNs, %d domains, %d netbios, %d cluster IDs",
+		len(a.mapHostnames), len(a.mapFQDNs), len(a.mapDomains), len(a.mapNetBIOS), len(a.mapClusterID))
 	return a
 }
 
@@ -1665,6 +1734,9 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 // addBytesToArchiveWithMtime is like addBytesToArchive but preserves the
 // source file's mtime — used for log files whose timestamps callers care about.
 func addBytesToArchiveWithMtime(tw *tar.Writer, name string, data []byte, mtime time.Time) error {
+	if globalAnonymizer.enabled {
+		name = string(globalAnonymizer.Apply([]byte(name)))
+	}
 	if isLikelyText(data) {
 		data = redactSensitive(data)
 		data = globalAnonymizer.Apply(data)
@@ -1698,8 +1770,13 @@ func isLikelyText(b []byte) bool {
 // addBytesToArchive adds in-memory bytes as a file in the tar archive.
 // Text content passes through credential redaction and (when --anonymize is on)
 // the run-scoped anonymizer before being written. Binary content (detected via
-// NUL bytes in the first 8 KB) is written through unchanged.
+// NUL bytes in the first 8 KB) is written through unchanged. The archive path
+// (name) is also run through the anonymizer when enabled, so directory
+// structure does not leak hostnames or IPs.
 func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
+	if globalAnonymizer.enabled {
+		name = string(globalAnonymizer.Apply([]byte(name)))
+	}
 	if isLikelyText(data) {
 		data = redactSensitive(data)
 		data = globalAnonymizer.Apply(data)
@@ -1727,8 +1804,15 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 // Returns a HostManifest describing what was collected.
 func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration, nodeOnly bool, containerNames []string, extraCmds []CommandSpec) HostManifest {
 	hostname, _ := os.Hostname()
+	// pathHostname is the value used to construct archive paths
+	// (hosts/<pathHostname>/...). When --anonymize is on we route it through
+	// the replacer so the tar directory tree does not leak real hostnames.
+	pathHostname := hostname
+	if globalAnonymizer.enabled {
+		pathHostname = string(globalAnonymizer.Apply([]byte(hostname)))
+	}
 	manifest := HostManifest{
-		Hostname:    hostname,
+		Hostname:    pathHostname,
 		CollectedAt: time.Now(),
 		Profile:     profile,
 	}
@@ -1741,7 +1825,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		manifest.To = &t
 	}
 
-	hostRoot := filepath.Join(archiveRoot, "hosts", hostname)
+	hostRoot := filepath.Join(archiveRoot, "hosts", pathHostname)
 
 	// ── phase: system commands (parallel) ────────────────────────────────
 	phase(fmt.Sprintf("[%s] System commands (%d parallel)", hostname, cmdWorkers))
@@ -1975,7 +2059,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			// the same filename from drives0, frontend0, etc.)
 			base := globBase(spec.SrcGlob)
 			relPath := strings.TrimPrefix(srcPath, base)
-			destPath := filepath.Join(archiveRoot, "hosts", hostname, spec.DestDir, relPath)
+			destPath := filepath.Join(archiveRoot, "hosts", pathHostname, spec.DestDir, relPath)
 			fr := collectLogFile(tw, srcPath, destPath)
 			manifest.Files = append(manifest.Files, fr)
 			if fr.Error != "" {
@@ -1986,7 +2070,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 
 	// ── phase: extra commands (orchestrator only, never on remote nodes) ──
 	if !nodeOnly && len(extraCmds) > 0 {
-		hostRoot := filepath.Join(archiveRoot, "hosts", hostname)
+		hostRoot := filepath.Join(archiveRoot, "hosts", pathHostname)
 		phase(fmt.Sprintf("[%s] Extra commands (%d)", hostname, len(extraCmds)))
 		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
 		for i, spec := range extraCmds {
@@ -3096,6 +3180,15 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			rest = parts[1]
 		}
 		hdr.Name = filepath.Join(newRoot, rest)
+
+		// Anonymize the path itself when --anonymize is on. Remote nodes
+		// wrote these paths as hosts/<real-hostname>/... because the
+		// anonymizer lives on the orchestrator side; rewriting through the
+		// replacer here turns hosts/cst3/... into hosts/host-3/... so the
+		// tar directory tree no longer leaks hostnames.
+		if transform {
+			hdr.Name = string(globalAnonymizer.Apply([]byte(hdr.Name)))
+		}
 
 		if transform {
 			// Read entry into memory, apply redaction + anonymization (text
