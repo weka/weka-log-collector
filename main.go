@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -2259,6 +2260,21 @@ type HostResult struct {
 // Used by the signal handler to kill orphaned remote processes on interrupt.
 var activeRemoteHosts sync.Map
 
+// sshUser returns the username to use for SSH connections: whoever ran this
+// binary. If the running user has the required permissions on remote hosts
+// (e.g. ubuntu with passwordless sudo), that works without being root.
+func sshUser() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return "root"
+}
+
+// sshTarget returns user@host for SSH/SCP calls.
+func sshTarget(host string) string {
+	return sshUser() + "@" + host
+}
+
 // sshArgs returns the common SSH option flags used for all SSH/SCP calls.
 func sshArgs() []string {
 	return []string{
@@ -2266,6 +2282,28 @@ func sshArgs() []string {
 		"-o", "ConnectTimeout=30",
 		"-o", "BatchMode=yes",
 	}
+}
+
+// probeSSHAccess runs a no-op SSH command on host with a short timeout to
+// check whether passwordless access is available before committing to the
+// full deploy+collect cycle. Returns nil if access works, otherwise a
+// descriptive error (permission denied, wrong user, unreachable, etc.).
+func probeSSHAccess(host string) error {
+	args := []string{
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "ConnectTimeout=5",
+		"-o", "BatchMode=yes",
+		sshTarget(host), "true",
+	}
+	out, err := exec.Command("ssh", args...).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 // remoteBinPath returns the path used for the self-deployed binary on remote hosts.
@@ -2277,7 +2315,7 @@ func remoteBinPath() string {
 
 // deployToHost copies the running binary to a remote host via SCP.
 func deployToHost(host, selfPath string) error {
-	sshTarget := "root@" + host
+	sshTarget := sshTarget(host)
 	remoteBin := remoteBinPath()
 	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
 	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
@@ -2296,11 +2334,18 @@ const deployWorkers = 20
 
 // deployAll copies the running binary to all hosts in parallel.
 // Returns the subset of hosts that were successfully deployed to.
-// Failed hosts are logged immediately and excluded from collection.
+// Errors are collected and printed as a grouped summary after all attempts
+// complete, deduplicating identical messages to avoid repeating the same
+// error N times when all hosts share the same root cause.
 func deployAll(hosts []string, displayNames map[string]string, selfPath string) []string {
+	type deployErr struct {
+		display string
+		msg     string
+	}
 	sem := make(chan struct{}, deployWorkers)
 	var mu sync.Mutex
 	var succeeded []string
+	var failures []deployErr
 	var wg sync.WaitGroup
 
 	for _, host := range hosts {
@@ -2315,16 +2360,33 @@ func deployAll(hosts []string, displayNames map[string]string, selfPath string) 
 				display = host
 			}
 			if err := deployToHost(host, selfPath); err != nil {
-				errorf("  [%s] deploy failed: %v", display, err)
+				mu.Lock()
+				failures = append(failures, deployErr{display, err.Error()})
+				mu.Unlock()
 				return
 			}
-			logf("  [%s] deployed", display)
 			mu.Lock()
 			succeeded = append(succeeded, host)
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
+
+	// Group failures by error message so N identical errors print as one line.
+	if len(failures) > 0 {
+		byMsg := make(map[string][]string)
+		var msgOrder []string
+		for _, f := range failures {
+			if _, seen := byMsg[f.msg]; !seen {
+				msgOrder = append(msgOrder, f.msg)
+			}
+			byMsg[f.msg] = append(byMsg[f.msg], f.display)
+		}
+		for _, msg := range msgOrder {
+			displays := byMsg[msg]
+			errorf("  Deploy failed on %d host(s): %s\n    %s", len(displays), msg, strings.Join(displays, ", "))
+		}
+	}
 	return succeeded
 }
 
@@ -2337,7 +2399,7 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 		displayName = host
 	}
 
-	sshTarget := "root@" + host
+	sshTarget := sshTarget(host)
 	remoteBin := remoteBinPath()
 
 	// Register this host as active so the signal handler can kill it on interrupt.
@@ -3427,7 +3489,7 @@ func (k *kubectlRunner) run(args ...string) ([]byte, error) {
 			parts[i] = shellQuote(a)
 		}
 		remoteCmd := "kubectl " + strings.Join(parts, " ")
-		sshOpts := append(sshArgs(), "root@"+k.jumpHost, remoteCmd)
+		sshOpts := append(sshArgs(), sshTarget(k.jumpHost), remoteCmd)
 		cmd = exec.CommandContext(ctx, "ssh", sshOpts...)
 	} else {
 		cmd = exec.CommandContext(ctx, "kubectl", kcArgs...)
@@ -3492,7 +3554,7 @@ func (k *kubectlRunner) copyFileToPod(ns, pod, localPath, remotePath string) err
 			parts[i] = shellQuote(a)
 		}
 		sshCmd := "kubectl " + strings.Join(parts, " ")
-		sshOpts := append(sshArgs(), "root@"+k.jumpHost, sshCmd)
+		sshOpts := append(sshArgs(), sshTarget(k.jumpHost), sshCmd)
 		cmd = exec.CommandContext(ctx, "ssh", sshOpts...)
 	} else {
 		cmd = exec.CommandContext(ctx, "kubectl", kcArgs...)
@@ -4369,7 +4431,7 @@ func handleListBundles() {
 		if n.IP == hostname || n.Hostname == hostname {
 			continue
 		}
-		out, _ := exec.Command("ssh", append(sshArgs(), "root@"+n.IP, listCmd)...).Output()
+		out, _ := exec.Command("ssh", append(sshArgs(), sshTarget(n.IP), listCmd)...).Output()
 		lines := strings.TrimSpace(string(out))
 		if lines == "" {
 			continue // skip nodes with nothing
@@ -4529,7 +4591,7 @@ func handleCleanBundles() {
 		if n.IP == hostname || n.Hostname == hostname {
 			continue
 		}
-		cmd := exec.Command("ssh", append(sshArgs(), "root@"+n.IP, cleanCmd)...)
+		cmd := exec.Command("ssh", append(sshArgs(), sshTarget(n.IP), cleanCmd)...)
 		if err := cmd.Run(); err != nil {
 			errorf("  [%s] cleanup failed: %v", display, err)
 		} else {
@@ -4957,7 +5019,7 @@ func main() {
 			cleanupWg.Add(1)
 			go func() {
 				defer cleanupWg.Done()
-				args := append(sshArgs(), "root@"+host, killCmd)
+				args := append(sshArgs(), sshTarget(host), killCmd)
 				exec.Command("ssh", args...).Run() //nolint:errcheck // best-effort cleanup
 			}()
 			return true
@@ -5004,7 +5066,7 @@ func main() {
 				if isLocalIP(host) {
 					di, err = checkDiskSpace(remoteSpaceCheckPath)
 				} else {
-					di, err = checkRemoteDiskSpace("root@"+host, remoteSpaceCheckPath)
+					di, err = checkRemoteDiskSpace(sshTarget(host), remoteSpaceCheckPath)
 				}
 				spaceMu.Lock()
 				spaceResults = append(spaceResults, nodeSpaceResult{display, di, err})
@@ -5096,20 +5158,27 @@ func main() {
 			}
 		}
 		if len(remoteHosts) > 0 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames, sharedSessionID, *compression)
-				mu.Lock()
-				for _, r := range remoteResults {
-					display := nodeDisplayMap[r.Host]
-					if display == "" {
-						display = r.Host
+			// Pre-flight: probe one host before committing to the full deploy
+			// cycle. Fail fast if SSH access is unavailable — no point queuing
+			// 30-second timeouts per host or showing errors after local upload.
+			if err := probeSSHAccess(remoteHosts[0]); err != nil {
+				warnf("SSH access check failed on %s (%s) — skipping distributed collection.\n  Only this node's data will be collected.\n  Fix: ensure passwordless SSH is configured from this node to all cluster nodes, then re-run.", nodeDisplayMap[remoteHosts[0]], err)
+			} else {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					remoteResults := uploadCluster(remoteHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames, sharedSessionID, *compression)
+					mu.Lock()
+					for _, r := range remoteResults {
+						display := nodeDisplayMap[r.Host]
+						if display == "" {
+							display = r.Host
+						}
+						allResults = append(allResults, nodeUploadResult{display, r.Err})
 					}
-					allResults = append(allResults, nodeUploadResult{display, r.Err})
-				}
-				mu.Unlock()
-			}()
+					mu.Unlock()
+				}()
+			}
 		}
 
 		wg.Wait()
@@ -5200,7 +5269,7 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	if displayName == "" {
 		displayName = host
 	}
-	sshTarget := "root@" + host
+	sshTarget := sshTarget(host)
 	remoteBin := remoteBinPath()
 
 	// Register this host as active so the signal handler can kill it on interrupt.
