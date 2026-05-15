@@ -620,11 +620,12 @@ func buildAnonymizer(enabled bool) *anonymizer {
 		vlogf("anonymizer: weka status -J failed: %v", err)
 	}
 
-	// Hostnames + IPs from `weka cluster container -l -J`. NOTE: the local
-	// node's own containers are sometimes omitted from this output — see the
-	// os.Hostname() fallback below.
+	// Hostnames + IPs from `weka cluster container -J` (all containers, not
+	// just leaders). The -l flag restricts to the leadership quorum only and
+	// would leave non-leader nodes (e.g. cst5 when not in quorum, client nodes)
+	// unregistered — causing their hostnames to leak through unanonymized.
 	containerHostnames := 0
-	if out, err := exec.Command("weka", "cluster", "container", "-l", "-J").Output(); err == nil {
+	if out, err := exec.Command("weka", "cluster", "container", "-J").Output(); err == nil {
 		var containers []struct {
 			Hostname string   `json:"hostname"`
 			HostIP   string   `json:"host_ip"`
@@ -989,7 +990,7 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_cloud_status", Cmd: "weka cloud status -J", JSON: true},
 	// ── cluster topology ──────────────────────────────────────────
 	{Name: "weka_cluster_servers", Cmd: "weka cluster servers list -J", JSON: true},
-	{Name: "weka_cluster_container", Cmd: "weka cluster container -l -J", JSON: true},
+	{Name: "weka_cluster_container", Cmd: "weka cluster container -J", JSON: true},
 	{Name: "weka_cluster_container_net", Cmd: "weka cluster container net -J", JSON: true},
 	{Name: "weka_cluster_process", Cmd: "weka cluster process -J", JSON: true},
 	{Name: "weka_cluster_drive", Cmd: "weka cluster drive -J", JSON: true},
