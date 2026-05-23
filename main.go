@@ -1805,6 +1805,25 @@ type cmdOutput struct {
 }
 
 // runCommandsParallel runs specs concurrently (up to cmdWorkers at a time) and
+// commandFileContent builds the bytes written to a collected output file.
+// For text files: always prepends "# command: <cmd>\n" so the file is
+// self-documenting, then appends the error line if the command failed.
+// For JSON files: returns raw output unchanged (a comment header would break
+// JSON parsers); on error with no output falls back to a comment block.
+func commandFileContent(spec CommandSpec, out []byte, errStr string) []byte {
+	if spec.JSON {
+		if errStr != "" && len(out) == 0 {
+			return []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, errStr))
+		}
+		return out
+	}
+	header := "# command: " + spec.Cmd + "\n"
+	if errStr != "" {
+		header += "# error: " + errStr + "\n"
+	}
+	return append([]byte(header), out...)
+}
+
 // returns results in the same order as specs. It is safe to call from a single
 // goroutine; tar writes happen after this returns.
 func runCommandsParallel(specs []CommandSpec, timeout time.Duration) []cmdOutput {
@@ -2152,10 +2171,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
 			}
 		}
-		content := co.out
-		if co.result.Error != "" && len(co.out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-		}
+		content := commandFileContent(spec, co.out, co.result.Error)
 		ext := ".txt"
 		if spec.JSON {
 			ext = ".json"
@@ -2217,10 +2233,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
 			}
 		}
-		content := co.out
-		if co.result.Error != "" && len(co.out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-		}
+		content := commandFileContent(spec, co.out, co.result.Error)
 		ext := ".txt"
 		if spec.JSON {
 			ext = ".json"
@@ -2271,10 +2284,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			if result.Error != "" {
 				warnf("[%s] weka local resources -C %s failed: %s", hostname, name, result.Error)
 			}
-			content := out
-			if result.Error != "" && len(out) == 0 {
-				content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, result.Error))
-			}
+			content := commandFileContent(spec, out, result.Error)
 			dest := filepath.Join(hostRoot, "weka", spec.Name+".json")
 			if err := addBytesToArchive(tw, dest, content); err != nil {
 				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
@@ -5775,10 +5785,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 				warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
 			}
 		}
-		content := co.out
-		if co.result.Error != "" && len(co.out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-		}
+		content := commandFileContent(spec, co.out, co.result.Error)
 		ext := ".txt"
 		if spec.JSON {
 			ext = ".json"
