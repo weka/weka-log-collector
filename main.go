@@ -1016,6 +1016,7 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_security_kms", Cmd: "weka security kms -J", JSON: true},
 	// ── local container info (node-local: different per host) ─────────────
 	{Name: "weka_local_ps", Cmd: "weka local ps -v -J", NodeLocal: true, LocalOnly: true, JSON: true},
+	{Name: "weka_local_status", Cmd: "weka local status -v", NodeLocal: true, LocalOnly: true},
 	// weka local resources collected dynamically per container in CollectLocal
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
@@ -1285,6 +1286,82 @@ var systemCommands = []CommandSpec{
 	// fails gracefully on Intel/other NIC nodes
 	{Name: "mst_status", Cmd: "mst status -v"},
 	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
+	// ── SELinux / secure boot ─────────────────────────────────────────────────
+	{Name: "getenforce", Cmd: "getenforce", NodeOptional: true},
+	{Name: "sestatus", Cmd: "sestatus", NodeOptional: true},
+	{Name: "selinux_config", Cmd: "cat /etc/selinux/config", NodeOptional: true},
+	{Name: "secureboot_state", Cmd: "mokutil --sb-state", NodeOptional: true},
+	// ── boot configuration ────────────────────────────────────────────────────
+	{Name: "proc_cmdline", Cmd: "cat /proc/cmdline"},
+	{Name: "iommu_state", Cmd: "ls /sys/class/iommu/ 2>/dev/null; ls /sys/kernel/iommu_groups/ 2>/dev/null", NodeOptional: true},
+	// ── CPU / memory detail ───────────────────────────────────────────────────
+	{Name: "proc_cpuinfo", Cmd: "cat /proc/cpuinfo"},
+	{Name: "cpuinfo_aes", Cmd: "grep -m1 aes /proc/cpuinfo", NodeOptional: true},
+	{Name: "proc_meminfo", Cmd: "cat /proc/meminfo"},
+	{Name: "smt_active", Cmd: "cat /sys/devices/system/cpu/smt/active", NodeOptional: true},
+	{Name: "numa_balancing", Cmd: "cat /proc/sys/kernel/numa_balancing"},
+	{Name: "numa_meminfo", Cmd: "grep MemTotal /sys/devices/system/node/node*/meminfo", NodeOptional: true},
+	{Name: "numa_nodes", Cmd: "ls -d /sys/devices/system/node/node*", NodeOptional: true},
+	// ── hugepages ─────────────────────────────────────────────────────────────
+	{Name: "hugepages_1g", Cmd: "cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages", NodeOptional: true},
+	{Name: "hugepages_2m", Cmd: "cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages", NodeOptional: true},
+	// scoped to weka procs only — avoids scanning all of /proc/*/numa_maps
+	{Name: "weka_hugepages_numa_maps", Cmd: "pgrep -f weka | head -1 | xargs -I{} grep -E 'huge' /proc/{}/numa_maps 2>/dev/null", NodeOptional: true},
+	// ── firewall (both iptables and nftables — one will produce output per distro) ─
+	{Name: "iptables_rules", Cmd: "iptables -L -v -n", NodeOptional: true},
+	{Name: "iptables_nat", Cmd: "iptables -L -n -t nat", NodeOptional: true},
+	{Name: "iptables_save", Cmd: "iptables-save", NodeOptional: true},
+	{Name: "nft_ruleset", Cmd: "nft list ruleset", NodeOptional: true},
+	{Name: "firewalld_status", Cmd: "systemctl status firewalld --no-pager", NodeOptional: true},
+	// ── mount / filesystem config ─────────────────────────────────────────────
+	{Name: "mount", Cmd: "mount"},
+	{Name: "fstab", Cmd: "cat /etc/fstab"},
+	{Name: "mtab", Cmd: "cat /etc/mtab", NodeOptional: true},
+	{Name: "resolv_conf", Cmd: "cat /etc/resolv.conf"},
+	// ── package list (rpm on RHEL family, dpkg on Debian/Ubuntu) ─────────────
+	{Name: "pkg_list", Cmd: "rpm -qa 2>/dev/null || dpkg -l 2>/dev/null", NodeOptional: true},
+	// ── NVMe namespace details ────────────────────────────────────────────────
+	{Name: "nvme_list", Cmd: "nvme list", NodeOptional: true},
+	{Name: "nvme_id_ns", Cmd: `for dev in /dev/nvme*n*; do [ -e "$dev" ] || continue; echo "=== $dev ==="; nvme id-ns "$dev" 2>&1; done`, NodeOptional: true},
+	// ── kernel modules / modprobe ─────────────────────────────────────────────
+	{Name: "modprobe_squashfs", Cmd: "grep squashfs /etc/modprobe.d/* 2>/dev/null", NodeOptional: true},
+	{Name: "modprobe_d_listing", Cmd: "ls /etc/modprobe.d/"},
+	// ── bonding ───────────────────────────────────────────────────────────────
+	{Name: "bonding_info", Cmd: "cat /proc/net/bonding/* 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_modes", Cmd: "cat /sys/class/net/*/bonding/mode 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_slaves", Cmd: "cat /sys/class/net/*/bonding/slaves 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_hash_policy", Cmd: "cat /sys/class/net/*/bonding/xmit_hash_policy 2>/dev/null", NodeOptional: true},
+	// ── InfiniBand / network device sysfs ─────────────────────────────────────
+	{Name: "net_device_types", Cmd: "cat /sys/class/net/*/type 2>/dev/null", NodeOptional: true},
+	{Name: "ib_device_modes", Cmd: "cat /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
+	{Name: "ib_lid_values", Cmd: "cat /sys/class/net/*/device/infiniband/*/ports/*/lid 2>/dev/null", NodeOptional: true},
+	{Name: "ib_uverbs_module", Cmd: "grep ib_uverbs /proc/modules", NodeOptional: true},
+	{Name: "pci_net_mtu", Cmd: "cat /sys/bus/pci/devices/*/net/*/mtu 2>/dev/null", NodeOptional: true},
+	// ── IP address / route (JSON for programmatic analysis) ───────────────────
+	{Name: "ip_addr_json", Cmd: "ip -j -o addr show", JSON: true},
+	{Name: "ip_route_json", Cmd: "ip -4 --json route", JSON: true},
+	// ── cgroup state ──────────────────────────────────────────────────────────
+	{Name: "cgroup_type", Cmd: "stat -fc %T /sys/fs/cgroup", NodeOptional: true},
+	{Name: "cgroup_cpuset", Cmd: "cat /sys/fs/cgroup/weka-*/cpuset.cpus.effective 2>/dev/null", NodeOptional: true},
+	// ── software RAID ─────────────────────────────────────────────────────────
+	{Name: "mdstat", Cmd: "cat /proc/mdstat", NodeOptional: true},
+	{Name: "mdadm_detail", Cmd: `for md in /dev/md*; do [ -b "$md" ] || continue; echo "=== $md ==="; mdadm --detail --test "$md" 2>&1; done`, NodeOptional: true},
+	// ── NetworkManager ────────────────────────────────────────────────────────
+	{Name: "nm_config", Cmd: "NetworkManager --print-config", NodeOptional: true},
+	{Name: "nmcli_dev_status", Cmd: "nmcli dev status", NodeOptional: true},
+	// ── Weka-specific system state ────────────────────────────────────────────
+	{Name: "weka_agent_enabled", Cmd: "systemctl is-enabled weka-agent", NodeOptional: true},
+	{Name: "weka_service_conf", Cmd: "cat /etc/wekaio/service.conf", NodeOptional: true},
+	{Name: "weka_release_spec", Cmd: "cat /opt/weka/dist/release/*.spec 2>/dev/null", NodeOptional: true},
+	{Name: "xfs_loop_info", Cmd: "xfs_info /opt/weka/*.loop 2>/dev/null", NodeOptional: true},
+	{Name: "weka_hugepage_files", Cmd: "ls -la /opt/weka/data/agent/containers/state/*/huge*/* 2>/dev/null", NodeOptional: true},
+	{Name: "wekanode_rss", Cmd: "ps -o rsz -C wekanode", NodeOptional: true},
+	{Name: "weka_init_pids", Cmd: "ps -eo pid,comm | grep weka_init", NodeOptional: true},
+	// ── NFS / IPv6 ────────────────────────────────────────────────────────────
+	{Name: "ipv6_interfaces", Cmd: "cat /proc/net/if_inet6", NodeOptional: true},
+	{Name: "nfs_tcp_connections", Cmd: "ss -Hnt 'sport = :2049'", NodeOptional: true},
+	// ── security software ─────────────────────────────────────────────────────
+	{Name: "falcon_sensor_status", Cmd: "systemctl status falcon-sensor --no-pager", NodeOptional: true},
 	// weka-agent journal — collected separately in CollectLocal with time window support
 }
 
