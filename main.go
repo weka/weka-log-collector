@@ -44,6 +44,7 @@ const (
 	wlcBaseDir        = "/opt/weka/weka-log-collector"
 	wlcBundlesDir     = wlcBaseDir + "/bundles"
 	wlcLogsDir        = wlcBaseDir + "/logs"
+	wlcRunLock        = wlcBaseDir + "/.run.lock"
 	uploadFileMaxSize = 50 * 1024 * 1024 // 50 MB
 )
 
@@ -170,6 +171,8 @@ type anonymizer struct {
 	mapDomains   map[string]string
 	mapNetBIOS   map[string]string
 	mapClusterID map[string]string // cluster name + cluster GUID
+	mapFSNames   map[string]string // weka filesystem names
+	mapUsers     map[string]string // AD admin + S3 service accounts (non-universal only)
 
 	// Lazily-built maps (regex-discovered values seen at write time).
 	mapIPs  map[string]string
@@ -182,6 +185,11 @@ type anonymizer struct {
 	// hostnames without trailing digits (host-a, host-b, ...).
 	hostCollisionTags map[string]int // base "host-1" → next tag index
 	hostLetterIdx     int            // counter for digit-less fallbacks
+
+	// Counters for fs-N and user-N pools.
+	fsCollisionTags map[string]int
+	fsLetterIdx     int
+	userCounter     int
 
 	mu sync.Mutex // protects lazy IP/MAC maps
 }
@@ -197,9 +205,12 @@ func newAnonymizer(enabled bool) *anonymizer {
 		mapDomains:        make(map[string]string),
 		mapNetBIOS:        make(map[string]string),
 		mapClusterID:      make(map[string]string),
+		mapFSNames:        make(map[string]string),
+		mapUsers:          make(map[string]string),
 		mapIPs:            make(map[string]string),
 		mapMACs:           make(map[string]string),
 		hostCollisionTags: make(map[string]int),
+		fsCollisionTags:   make(map[string]int),
 	}
 }
 
@@ -311,6 +322,71 @@ func (a *anonymizer) addClusterGUID(guid string) string {
 	return masked
 }
 
+// universalAccounts are usernames that exist on every Linux/AD system and
+// are not customer-identifying. Kept as-is when discovered as the AD admin
+// or an S3 service account name. Custom names (weka-admin, svc_join,
+// pipeline-svc, etc.) get registered like any other user.
+var universalAccounts = map[string]bool{
+	"administrator": true, "admin": true,
+	"root": true, "nobody": true, "daemon": true,
+	"systemd-network": true, "systemd-resolve": true, "systemd-timesync": true,
+	"sshd": true, "weka": true, "nfsnobody": true, "polkitd": true,
+	"chrony": true, "dbus": true, "tcpdump": true, "operator": true,
+}
+
+// addFSName registers a Weka filesystem name for masking. Trailing digits
+// are preserved (production-2 → fs-2); collisions get a letter suffix
+// (fs-2, fs-2b); names without trailing digits fall back to fs-a, fs-b, ...
+func (a *anonymizer) addFSName(real string) string {
+	if !a.enabled || real == "" {
+		return real
+	}
+	if existing, ok := a.mapFSNames[real]; ok {
+		return existing
+	}
+	var masked string
+	if m := trailingDigitsRe.FindString(real); m != "" {
+		base := "fs-" + m
+		taken := false
+		for _, v := range a.mapFSNames {
+			if v == base {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			masked = base
+		} else {
+			a.fsCollisionTags[base]++
+			masked = base + string(rune('a'+a.fsCollisionTags[base]))
+		}
+	} else {
+		masked = "fs-" + string(rune('a'+a.fsLetterIdx))
+		a.fsLetterIdx++
+	}
+	a.mapFSNames[real] = masked
+	return masked
+}
+
+// addUser registers a username (AD admin or S3 service account) for masking
+// unless it's a universal account name (root, administrator, etc., which
+// exist on every system and aren't customer-identifying).
+func (a *anonymizer) addUser(real string) string {
+	if !a.enabled || real == "" {
+		return real
+	}
+	if universalAccounts[strings.ToLower(real)] {
+		return real
+	}
+	if existing, ok := a.mapUsers[real]; ok {
+		return existing
+	}
+	a.userCounter++
+	masked := fmt.Sprintf("user-%d", a.userCounter)
+	a.mapUsers[real] = masked
+	return masked
+}
+
 // finalize builds the strings.Replacer from all fixed mappings. Must be
 // called once after all add* calls and before Apply.
 func (a *anonymizer) finalize() {
@@ -331,6 +407,8 @@ func (a *anonymizer) finalize() {
 	collect(a.mapDomains)
 	collect(a.mapNetBIOS)
 	collect(a.mapClusterID)
+	collect(a.mapFSNames)
+	collect(a.mapUsers)
 	// Pre-discovered IPs (from cluster commands at startup) — including these
 	// in the literal Replacer lets binary-content files get their cluster IPs
 	// masked too, since we skip the IPv4 regex pass on binary content.
@@ -462,6 +540,8 @@ func (a *anonymizer) writeKey(path string) error {
 		Domains      map[string]string `json:"domains,omitempty"`
 		NetBIOS      map[string]string `json:"netbios,omitempty"`
 		Cluster      map[string]string `json:"cluster,omitempty"`
+		Filesystems  map[string]string `json:"filesystems,omitempty"`
+		Users        map[string]string `json:"users,omitempty"`
 		IPs          map[string]string `json:"ips,omitempty"`
 		MACs         map[string]string `json:"macs,omitempty"`
 	}
@@ -473,6 +553,8 @@ func (a *anonymizer) writeKey(path string) error {
 		Domains:      a.mapDomains,
 		NetBIOS:      a.mapNetBIOS,
 		Cluster:      a.mapClusterID,
+		Filesystems:  a.mapFSNames,
+		Users:        a.mapUsers,
 		IPs:          a.mapIPs,
 		MACs:         a.mapMACs,
 	}
@@ -539,11 +621,12 @@ func buildAnonymizer(enabled bool) *anonymizer {
 		vlogf("anonymizer: weka status -J failed: %v", err)
 	}
 
-	// Hostnames + IPs from `weka cluster container -l -J`. NOTE: the local
-	// node's own containers are sometimes omitted from this output — see the
-	// os.Hostname() fallback below.
+	// Hostnames + IPs from `weka cluster container -J` (all containers, not
+	// just leaders). The -l flag restricts to the leadership quorum only and
+	// would leave non-leader nodes (e.g. cst5 when not in quorum, client nodes)
+	// unregistered — causing their hostnames to leak through unanonymized.
 	containerHostnames := 0
-	if out, err := exec.Command("weka", "cluster", "container", "-l", "-J").Output(); err == nil {
+	if out, err := exec.Command("weka", "cluster", "container", "-J").Output(); err == nil {
 		var containers []struct {
 			Hostname string   `json:"hostname"`
 			HostIP   string   `json:"host_ip"`
@@ -592,7 +675,8 @@ func buildAnonymizer(enabled bool) *anonymizer {
 	if out, err := exec.Command("weka", "smb", "cluster", "info", "-J").Output(); err == nil {
 		var s struct {
 			AdConf struct {
-				Domain string `json:"domain"`
+				Domain        string `json:"domain"`
+				AdminUsername string `json:"adminUsername"`
 			} `json:"adConf"`
 			DomainNetbiosName string `json:"domainNetbiosName"`
 			NetbiosName       string `json:"netbiosName"`
@@ -605,13 +689,57 @@ func buildAnonymizer(enabled bool) *anonymizer {
 			if s.NetbiosName != "" {
 				a.addNetBIOS(s.NetbiosName)
 			}
-			vlogf("anonymizer: weka smb cluster info — domain=%q netbios=%q/%q", adDomain, s.DomainNetbiosName, s.NetbiosName)
+			if s.AdConf.AdminUsername != "" {
+				a.addUser(s.AdConf.AdminUsername)
+			}
+			vlogf("anonymizer: weka smb cluster info — domain=%q netbios=%q/%q adminUser=%q", adDomain, s.DomainNetbiosName, s.NetbiosName, s.AdConf.AdminUsername)
 		} else {
 			vlogf("anonymizer: weka smb cluster info -J returned unparseable JSON")
 		}
 	} else {
 		vlogf("anonymizer: weka smb cluster info -J failed: %v", err)
 	}
+
+	// Filesystem names from `weka fs -J`. Customer-named filesystems (e.g.
+	// "production_data", "research") are masked to fs-N placeholders.
+	fsCount := 0
+	if out, err := exec.Command("weka", "fs", "-J").Output(); err == nil {
+		var fsList []struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(out, &fsList) == nil {
+			for _, fs := range fsList {
+				if fs.Name != "" {
+					a.addFSName(fs.Name)
+					fsCount++
+				}
+			}
+		}
+	}
+	vlogf("anonymizer: registered %d filesystem name(s)", fsCount)
+
+	// S3 service accounts from `weka s3 service-account list -J`. Customer-
+	// named accounts (e.g. "pipeline-svc", "analytics-team") are masked to
+	// user-N placeholders alongside the AD admin (if any). Universal account
+	// names (root, administrator, etc.) pass through unchanged.
+	s3UserCount := 0
+	if out, err := exec.Command("weka", "s3", "service-account", "list", "-J").Output(); err == nil {
+		var accounts []struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(out, &accounts) == nil {
+			for _, acc := range accounts {
+				if acc.Name != "" {
+					before := len(a.mapUsers)
+					a.addUser(acc.Name)
+					if len(a.mapUsers) > before {
+						s3UserCount++
+					}
+				}
+			}
+		}
+	}
+	vlogf("anonymizer: registered %d S3 service account(s)", s3UserCount)
 	if adDomain == "" {
 		if data, rerr := os.ReadFile("/etc/sssd/sssd.conf"); rerr == nil {
 			if m := sssdAdDomainRe.FindSubmatch(data); m != nil {
@@ -677,8 +805,8 @@ func buildAnonymizer(enabled bool) *anonymizer {
 	}
 
 	a.finalize()
-	vlogf("anonymizer: ready — %d hostnames, %d FQDNs, %d domains, %d netbios, %d cluster IDs",
-		len(a.mapHostnames), len(a.mapFQDNs), len(a.mapDomains), len(a.mapNetBIOS), len(a.mapClusterID))
+	vlogf("anonymizer: ready — %d hostnames, %d FQDNs, %d domains, %d netbios, %d cluster IDs, %d fs names, %d users",
+		len(a.mapHostnames), len(a.mapFQDNs), len(a.mapDomains), len(a.mapNetBIOS), len(a.mapClusterID), len(a.mapFSNames), len(a.mapUsers))
 	return a
 }
 
@@ -864,7 +992,7 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_cloud_status", Cmd: "weka cloud status -J", JSON: true},
 	// ── cluster topology ──────────────────────────────────────────
 	{Name: "weka_cluster_servers", Cmd: "weka cluster servers list -J", JSON: true},
-	{Name: "weka_cluster_container", Cmd: "weka cluster container -l -J", JSON: true},
+	{Name: "weka_cluster_container", Cmd: "weka cluster container -J", JSON: true},
 	{Name: "weka_cluster_container_net", Cmd: "weka cluster container net -J", JSON: true},
 	{Name: "weka_cluster_process", Cmd: "weka cluster process -J", JSON: true},
 	{Name: "weka_cluster_drive", Cmd: "weka cluster drive -J", JSON: true},
@@ -2724,6 +2852,58 @@ func isLocalIP(ip string) bool {
 // getClusterName returns the Weka cluster name by parsing `weka status`.
 // Falls back to the local hostname if weka is unavailable or the output
 // cannot be parsed.
+// ── concurrency lock ─────────────────────────────────────────────────────────
+//
+// A PID-file lock at wlcRunLock prevents two concurrent collection runs on the
+// same node from colliding on remote SSH state, disk space pre-checks, and
+// signal-handler cleanups (where one run's Ctrl+C would pkill the other run's
+// remote weka-log-collector processes). The lock contains the running PID and
+// start timestamp so the failure message is actionable.
+
+// isPIDAlive returns true if a process with the given PID exists.
+// On POSIX systems, signal 0 probes for existence without delivering anything.
+func isPIDAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// acquireRunLock attempts to acquire the run lock by writing the current PID
+// and start time to wlcRunLock. Returns an error describing the existing run
+// when a live lock is present and force is false. A stale lock (PID not alive)
+// is silently overwritten.
+func acquireRunLock(force bool) error {
+	if data, err := os.ReadFile(wlcRunLock); err == nil {
+		lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+		if len(lines) > 0 {
+			if pid, perr := strconv.Atoi(strings.TrimSpace(lines[0])); perr == nil && isPIDAlive(pid) {
+				if !force {
+					startedAt := "(unknown start time)"
+					if len(lines) > 1 && lines[1] != "" {
+						startedAt = "started " + lines[1]
+					}
+					return fmt.Errorf("another weka-log-collector run is in progress (PID %d, %s) — pass --force to override if you're certain the other run is hung", pid, startedAt)
+				}
+				warnf("Overriding live run lock (PID %d) — --force was passed", pid)
+			}
+		}
+	}
+	_ = os.MkdirAll(wlcBaseDir, 0755)
+	content := fmt.Sprintf("%d\n%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
+	return os.WriteFile(wlcRunLock, []byte(content), 0644)
+}
+
+// releaseRunLock removes the lock file. Safe to call when no lock was acquired
+// (idempotent — best-effort cleanup; missing or already-removed file is fine).
+func releaseRunLock() {
+	_ = os.Remove(wlcRunLock)
+}
+
 func getClusterName() string {
 	out, err := exec.Command("weka", "status").Output()
 	if err == nil {
@@ -3290,7 +3470,7 @@ _weka_log_collector() {
 
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --extra-commands --cmd-timeout --compression --anonymize --anonymize-key
+          --extra-commands --cmd-timeout --compression --anonymize --anonymize-key --force
           --list-bundles --rm-bundle --clean-bundles"
 
     case "$prev" in
@@ -4634,6 +4814,7 @@ func main() {
 		compression     = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
 		anonymize       = flag.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json (kept by the customer; not in the archive).")
 		anonymizeKey    = flag.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
+		force           = flag.Bool("force", false, "Override the run lock at /opt/weka/weka-log-collector/.run.lock (use only when an earlier run is known to be hung)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -4703,6 +4884,25 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+
+	// ── acquire run lock ─────────────────────────────────────────────────
+	// Prevents two concurrent collections on the same node from colliding on
+	// remote SSH state, disk-space checks, and signal-handler cleanups. The
+	// lock is released on normal exit (defer) and inside the cluster-mode
+	// signal handler below.
+	//
+	// Skipped for --node-only invocations: those are SSH-launched sub-tasks
+	// of an orchestrator that already holds its own lock. Acquiring here too
+	// would deadlock whenever the orchestrator is itself a cluster member
+	// (the common case) — the orchestrator's lock would block its own
+	// --node-only run on the same host.
+	if !*nodeOnly {
+		if err := acquireRunLock(*force); err != nil {
+			errorf("%v", err)
+			os.Exit(1)
+		}
+		defer releaseRunLock()
 	}
 
 	// ── open debug log file ───────────────────────────────────────────────
@@ -5030,6 +5230,7 @@ func main() {
 			return true
 		})
 		cleanupWg.Wait()
+		releaseRunLock()
 		logf("Cleanup complete.")
 		os.Exit(1)
 	}()
@@ -5672,6 +5873,7 @@ OPTIONS
   --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
+  --force              Override the run lock (use only when an earlier run is known to be hung)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
 
