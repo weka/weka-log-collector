@@ -1217,7 +1217,7 @@ var s3Commands = []CommandSpec{
 	{Name: "weka_stats_s3_bucket_create_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_CREATE_OPS", Profile: ProfileS3},
 	{Name: "weka_stats_s3_bucket_delete_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_DELETE_OPS", Profile: ProfileS3},
 	{Name: "weka_stats_s3_bucket_list_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_LIST_OPS", Profile: ProfileS3},
-	{Name: "s3_cgroup_memory", Cmd: "cat /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes && cat /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes", Profile: ProfileS3, NodeLocal: true},
+	{Name: "s3_cgroup_memory", Cmd: "grep \"\" /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes 2>/dev/null", Profile: ProfileS3, NodeLocal: true},
 	{Name: "netstat_s3", Cmd: "netstat -tuln | grep 9001", Profile: ProfileS3, NodeLocal: true},
 }
 
@@ -1240,13 +1240,13 @@ var smbwCommands = []CommandSpec{
 var systemCommands = []CommandSpec{
 	// ── identity & hardware ───────────────────────────────────────────────
 	{Name: "uname", Cmd: "uname -a"},
-	{Name: "os_release", Cmd: "cat /etc/*release*"},
+	{Name: "os_release", Cmd: "grep \"\" /etc/*release* 2>/dev/null"},
 	{Name: "hostname", Cmd: "hostname -f"},
 	{Name: "uptime", Cmd: "uptime"},
 	{Name: "free_mem", Cmd: "free -h"},
 	{Name: "lscpu", Cmd: "lscpu"},
 	{Name: "lspci", Cmd: "lspci"},
-	{Name: "lsblk", Cmd: "lsblk -d"},
+	{Name: "lsblk", Cmd: "lsblk -o NAME,SIZE,TYPE,ROTA,TRAN,VENDOR,MODEL,SERIAL,STATE,MOUNTPOINT"},
 	{Name: "numactl_hardware", Cmd: "numactl -H"},
 	// ── processes & disk ─────────────────────────────────────────────────
 	{Name: "ps_elf", Cmd: "ps -elf"},
@@ -1293,7 +1293,7 @@ var systemCommands = []CommandSpec{
 	{Name: "secureboot_state", Cmd: "mokutil --sb-state", NodeOptional: true},
 	// ── boot configuration ────────────────────────────────────────────────────
 	{Name: "proc_cmdline", Cmd: "cat /proc/cmdline"},
-	{Name: "iommu_state", Cmd: "ls /sys/class/iommu/ 2>/dev/null; ls /sys/kernel/iommu_groups/ 2>/dev/null", NodeOptional: true},
+	{Name: "iommu_state", Cmd: "ls /sys/class/iommu/ /sys/kernel/iommu_groups/ 2>/dev/null", NodeOptional: true},
 	// ── CPU / memory detail ───────────────────────────────────────────────────
 	{Name: "proc_cpuinfo", Cmd: "cat /proc/cpuinfo"},
 	{Name: "cpuinfo_aes", Cmd: "grep -m1 aes /proc/cpuinfo", NodeOptional: true},
@@ -1327,22 +1327,22 @@ var systemCommands = []CommandSpec{
 	{Name: "modprobe_squashfs", Cmd: "grep squashfs /etc/modprobe.d/* 2>/dev/null", NodeOptional: true},
 	{Name: "modprobe_d_listing", Cmd: "ls /etc/modprobe.d/"},
 	// ── bonding ───────────────────────────────────────────────────────────────
-	{Name: "bonding_info", Cmd: "cat /proc/net/bonding/* 2>/dev/null", NodeOptional: true},
-	{Name: "bonding_modes", Cmd: "cat /sys/class/net/*/bonding/mode 2>/dev/null", NodeOptional: true},
-	{Name: "bonding_slaves", Cmd: "cat /sys/class/net/*/bonding/slaves 2>/dev/null", NodeOptional: true},
-	{Name: "bonding_hash_policy", Cmd: "cat /sys/class/net/*/bonding/xmit_hash_policy 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_info", Cmd: `for f in /proc/net/bonding/*; do [ -f "$f" ] || continue; echo "=== $f ==="; cat "$f"; done 2>/dev/null`, NodeOptional: true},
+	{Name: "bonding_modes", Cmd: "grep \"\" /sys/class/net/*/bonding/mode 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_slaves", Cmd: "grep \"\" /sys/class/net/*/bonding/slaves 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_hash_policy", Cmd: "grep \"\" /sys/class/net/*/bonding/xmit_hash_policy 2>/dev/null", NodeOptional: true},
 	// ── InfiniBand / network device sysfs ─────────────────────────────────────
-	{Name: "net_device_types", Cmd: "cat /sys/class/net/*/type 2>/dev/null", NodeOptional: true},
-	{Name: "ib_device_modes", Cmd: "cat /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
-	{Name: "ib_lid_values", Cmd: "cat /sys/class/net/*/device/infiniband/*/ports/*/lid 2>/dev/null", NodeOptional: true},
+	{Name: "net_device_types", Cmd: "grep \"\" /sys/class/net/*/type 2>/dev/null", NodeOptional: true},
+	{Name: "ib_device_modes", Cmd: "grep \"\" /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
+	{Name: "ib_lid_values", Cmd: "grep \"\" /sys/class/net/*/device/infiniband/*/ports/*/lid 2>/dev/null", NodeOptional: true},
 	{Name: "ib_uverbs_module", Cmd: "grep ib_uverbs /proc/modules", NodeOptional: true},
-	{Name: "pci_net_mtu", Cmd: "cat /sys/bus/pci/devices/*/net/*/mtu 2>/dev/null", NodeOptional: true},
+	{Name: "pci_net_mtu", Cmd: "grep \"\" /sys/bus/pci/devices/*/net/*/mtu 2>/dev/null", NodeOptional: true},
 	// ── IP address / route (JSON for programmatic analysis) ───────────────────
 	{Name: "ip_addr_json", Cmd: "ip -j -o addr show", JSON: true},
 	{Name: "ip_route_json", Cmd: "ip -4 --json route", JSON: true},
 	// ── cgroup state ──────────────────────────────────────────────────────────
 	{Name: "cgroup_type", Cmd: "stat -fc %T /sys/fs/cgroup", NodeOptional: true},
-	{Name: "cgroup_cpuset", Cmd: "cat /sys/fs/cgroup/weka-*/cpuset.cpus.effective 2>/dev/null", NodeOptional: true},
+	{Name: "cgroup_cpuset", Cmd: "grep \"\" /sys/fs/cgroup/weka-*/cpuset.cpus.effective 2>/dev/null", NodeOptional: true},
 	// ── software RAID ─────────────────────────────────────────────────────────
 	{Name: "mdstat", Cmd: "cat /proc/mdstat", NodeOptional: true},
 	{Name: "mdadm_detail", Cmd: `for md in /dev/md*; do [ -b "$md" ] || continue; echo "=== $md ==="; mdadm --detail --test "$md" 2>&1; done`, NodeOptional: true},
@@ -1352,14 +1352,14 @@ var systemCommands = []CommandSpec{
 	// ── Weka-specific system state ────────────────────────────────────────────
 	{Name: "weka_agent_enabled", Cmd: "systemctl is-enabled weka-agent", NodeOptional: true},
 	{Name: "weka_service_conf", Cmd: "cat /etc/wekaio/service.conf", NodeOptional: true},
-	{Name: "weka_release_spec", Cmd: "cat /opt/weka/dist/release/*.spec 2>/dev/null", NodeOptional: true},
+	{Name: "weka_release_spec", Cmd: "grep \"\" /opt/weka/dist/release/*.spec 2>/dev/null", NodeOptional: true},
 	{Name: "xfs_loop_info", Cmd: "xfs_info /opt/weka/*.loop 2>/dev/null", NodeOptional: true},
 	{Name: "weka_hugepage_files", Cmd: "ls -la /opt/weka/data/agent/containers/state/*/huge*/* 2>/dev/null", NodeOptional: true},
-	{Name: "wekanode_rss", Cmd: "ps -o rsz -C wekanode", NodeOptional: true},
-	{Name: "weka_init_pids", Cmd: "ps -eo pid,comm | grep weka_init", NodeOptional: true},
+	{Name: "wekanode_ps", Cmd: "ps -C wekanode -o pid,ppid,user,rsz,vsz,pcpu,pmem,stat,etime,comm,args", NodeOptional: true},
+	{Name: "weka_init_ps", Cmd: "ps -C weka_init -o pid,ppid,user,rsz,vsz,pcpu,pmem,stat,etime,comm,args", NodeOptional: true},
 	// ── NFS / IPv6 ────────────────────────────────────────────────────────────
 	{Name: "ipv6_interfaces", Cmd: "cat /proc/net/if_inet6", NodeOptional: true},
-	{Name: "nfs_tcp_connections", Cmd: "ss -Hnt 'sport = :2049'", NodeOptional: true},
+	{Name: "nfs_tcp_connections", Cmd: "ss -nt 'sport = :2049'", NodeOptional: true},
 	// ── security software ─────────────────────────────────────────────────────
 	{Name: "falcon_sensor_status", Cmd: "systemctl status falcon-sensor --no-pager", NodeOptional: true},
 	// weka-agent journal — collected separately in CollectLocal with time window support
