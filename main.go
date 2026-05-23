@@ -849,6 +849,7 @@ type CommandSpec struct {
 	NodeLocal    bool   // if true, output varies per node (weka local *); otherwise cluster-wide
 	JSON         bool   // if true, command outputs JSON; archive entry uses .json extension
 	NodeOptional bool   // if true, failure is expected on some nodes/distros — logged at verbose only, not WARN
+	LocalOnly    bool   // if true, run even when cluster auth is unavailable (weka local commands only)
 }
 
 // defaultCommands are run on every node that has the weka CLI available.
@@ -886,7 +887,7 @@ var defaultCommands = []CommandSpec{
 	// ── security ───────────────────────────────────────────────────
 	{Name: "weka_security_kms", Cmd: "weka security kms -J", JSON: true},
 	// ── local container info (node-local: different per host) ─────────────
-	{Name: "weka_local_ps", Cmd: "weka local ps -v -J", NodeLocal: true, JSON: true},
+	{Name: "weka_local_ps", Cmd: "weka local ps -v -J", NodeLocal: true, LocalOnly: true, JSON: true},
 	// weka local resources collected dynamically per container in CollectLocal
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
@@ -1971,18 +1972,20 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		probeResult, _ := runCommand(probe, cmdTimeout)
 		if probeResult.ExitCode == 41 {
 			wekaAvailable = false
-			warnf("[%s] Weka authentication required — run 'weka user login' first. Skipping all Weka CLI commands.", hostname)
+			warnf("[%s] Weka authentication required — run 'weka user login' first. Skipping cluster-wide Weka commands (weka local ps/resources still collected).", hostname)
 		}
 	}
 
 	allWekaCmds := append(append([]CommandSpec{}, defaultCommands...), buildProfileCommands(profile, from, to)...)
 
 	// Filter to the commands we'll actually run on this node before parallelising.
+	// LocalOnly commands (weka local ps/resources) bypass the auth gate — they talk
+	// to the local agent only and work even when cluster auth is unavailable.
 	var wekaToRun []CommandSpec
 	var skippedClusterCmds int
 	for _, spec := range allWekaCmds {
-		if !wekaAvailable {
-			break
+		if !wekaAvailable && !spec.LocalOnly {
+			continue
 		}
 		if nodeOnly && !spec.NodeLocal {
 			skippedClusterCmds++
@@ -2034,7 +2037,9 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// Parse weka local ps output to discover which containers exist on this
 	// node (differs between backends: drives0/compute0/frontend0, and clients:
 	// client), then collect resources for each.
-	if wekaAvailable {
+	// weka local ps/resources talk to the local agent only — run regardless of
+	// cluster auth availability.
+	{
 		var localPSOut []byte
 		for i, spec := range wekaToRun {
 			if spec.Name == "weka_local_ps" {
