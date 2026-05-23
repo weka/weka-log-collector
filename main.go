@@ -2299,7 +2299,8 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	if result.Error != "" {
 		warnf("[%s] journalctl failed: %s", hostname, result.Error)
 	}
-	_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl.txt"), out)
+	jctlSpec := CommandSpec{Name: "journalctl", Cmd: result.Command}
+	_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl.txt"), commandFileContent(jctlSpec, out, result.Error))
 
 	// weka-agent journal: scoped to the --start-time/--end-time window when given,
 	// capped at 50k lines otherwise. The line cap is a safety net — earlier
@@ -2317,12 +2318,13 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		default:
 			agentCmd = "journalctl -u weka-agent --no-pager -n 50000"
 		}
-		agentResult, agentOut := runCommand(CommandSpec{Name: "journalctl_weka_agent", Cmd: agentCmd}, 2*cmdTimeout)
+		agentSpec := CommandSpec{Name: "journalctl_weka_agent", Cmd: agentCmd}
+		agentResult, agentOut := runCommand(agentSpec, 2*cmdTimeout)
 		manifest.Commands = append(manifest.Commands, agentResult)
 		if agentResult.Error != "" {
 			warnf("[%s] journalctl weka-agent failed: %s", hostname, agentResult.Error)
 		}
-		_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl_weka_agent.txt"), agentOut)
+		_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl_weka_agent.txt"), commandFileContent(agentSpec, agentOut, agentResult.Error))
 	}
 
 	// ── phase: log files ──────────────────────────────────────────────────
@@ -2402,15 +2404,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		for i, spec := range extraCmds {
 			co := extraOutputs[i]
 			manifest.Commands = append(manifest.Commands, co.result)
-			content := co.out
 			if co.result.Error != "" {
-				if len(co.out) == 0 {
-					content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-				}
 				warnf("[%s] extra command %q failed (exit %d): %s", hostname, spec.Cmd, co.result.ExitCode, co.result.Error)
 			}
 			dest := filepath.Join(hostRoot, "extra", spec.Name+".txt")
-			if err := addBytesToArchive(tw, dest, content); err != nil {
+			if err := addBytesToArchive(tw, dest, commandFileContent(spec, co.out, co.result.Error)); err != nil {
 				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 			}
 		}
@@ -5806,15 +5804,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
 		for i, spec := range extraCmds {
 			co := extraOutputs[i]
-			content := co.out
 			if co.result.Error != "" {
-				if len(co.out) == 0 {
-					content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-				}
 				warnf("extra command %q failed (exit %d): %s", spec.Cmd, co.result.ExitCode, co.result.Error)
 			}
 			dest := filepath.Join(archiveRoot, "cluster", "extra", spec.Name+".txt")
-			if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
+			if addErr := addBytesToArchive(tw, dest, commandFileContent(spec, co.out, co.result.Error)); addErr != nil {
 				warnf("could not add extra/%s to archive: %v", spec.Name, addErr)
 			}
 		}
