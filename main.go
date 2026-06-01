@@ -44,7 +44,7 @@ const (
 	wlcBaseDir        = "/opt/weka/weka-log-collector"
 	wlcBundlesDir     = wlcBaseDir + "/bundles"
 	wlcLogsDir        = wlcBaseDir + "/logs"
-	wlcRunLock        = wlcBaseDir + "/.run.lock"
+	wlcRunLock        = "/tmp/weka-log-collector.lock"
 	uploadFileMaxSize = 50 * 1024 * 1024 // 50 MB
 )
 
@@ -2478,10 +2478,15 @@ type HostResult struct {
 // Used by the signal handler to kill orphaned remote processes on interrupt.
 var activeRemoteHosts sync.Map
 
-// sshUser returns the username to use for SSH connections: whoever ran this
-// binary. If the running user has the required permissions on remote hosts
-// (e.g. ubuntu with passwordless sudo), that works without being root.
+// sshUserOverride is set by the --ssh-user flag. Empty means "use the default".
+var sshUserOverride string
+
+// sshUser returns the username to use for SSH connections.
+// Priority: --ssh-user flag > current OS user > "root" (fallback).
 func sshUser() string {
+	if sshUserOverride != "" {
+		return sshUserOverride
+	}
 	if u, err := user.Current(); err == nil && u.Username != "" {
 		return u.Username
 	}
@@ -2531,17 +2536,53 @@ func remoteBinPath() string {
 	return fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
 }
 
+// remoteNeedsSudo reports whether remote SSH commands need sudo.
+// When the SSH user is not root, weka commands and writes to /opt/weka/
+// require privilege escalation. Assumes passwordless sudo (standard on
+// Weka cloud nodes: OCI ubuntu, EC2 ubuntu/ec2-user, etc.).
+func remoteNeedsSudo() bool {
+	return sshUser() != "root"
+}
+
+// maybeRemoteSudo prefixes cmd with "sudo " when the SSH user is not root.
+func maybeRemoteSudo(cmd string) string {
+	if remoteNeedsSudo() {
+		return "sudo " + cmd
+	}
+	return cmd
+}
+
 // deployToHost copies the running binary to a remote host via SCP.
+// When the SSH user is non-root, it copies to /tmp first then sudo-moves
+// into place, since /opt/weka/weka-log-collector/ is root-owned.
 func deployToHost(host, selfPath string) error {
-	sshTarget := sshTarget(host)
+	target := sshTarget(host)
 	remoteBin := remoteBinPath()
-	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
+
+	mkdirArgs := append(sshArgs(), target, maybeRemoteSudo("mkdir -p "+wlcBaseDir))
 	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
 	}
-	scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
+
+	if !remoteNeedsSudo() {
+		scpArgs := append(sshArgs(), selfPath, target+":"+remoteBin)
+		if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+
+	// Non-root SSH user: SCP to /tmp, then sudo-move into the wlc directory.
+	tmpRemote := fmt.Sprintf("/tmp/wlc-deploy-%d", os.Getpid())
+	scpArgs := append(sshArgs(), selfPath, target+":"+tmpRemote)
 	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	installCmd := fmt.Sprintf("sudo mv %s %s && sudo chmod +x %s", tmpRemote, remoteBin, remoteBin)
+	installArgs := append(sshArgs(), target, installCmd)
+	if out, err := exec.Command("ssh", installArgs...).CombinedOutput(); err != nil {
+		exec.Command("ssh", append(sshArgs(), target, "rm -f "+tmpRemote)...).Run() //nolint
+		return fmt.Errorf("install %s: %v: %s", remoteBin, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -2555,7 +2596,15 @@ const deployWorkers = 20
 // Errors are collected and printed as a grouped summary after all attempts
 // complete, deduplicating identical messages to avoid repeating the same
 // error N times when all hosts share the same root cause.
+//
+// If all hosts reject the current SSH user with a "Please login as user X"
+// message (common on OCI/EC2 where root SSH is blocked), deployAll
+// automatically retries once with the suggested user.
 func deployAll(hosts []string, displayNames map[string]string, selfPath string) []string {
+	return deployAllInner(hosts, displayNames, selfPath, false)
+}
+
+func deployAllInner(hosts []string, displayNames map[string]string, selfPath string, isRetry bool) []string {
 	type deployErr struct {
 		display string
 		msg     string
@@ -2590,20 +2639,51 @@ func deployAll(hosts []string, displayNames map[string]string, selfPath string) 
 	}
 	wg.Wait()
 
+	if len(failures) == 0 {
+		return succeeded
+	}
+
+	// Check whether all failures are SSH user rejections pointing to the same user.
+	loginHintRe := regexp.MustCompile(`(?i)please login as the user "([^"]+)"`)
+	suggestedUsers := map[string]struct{}{}
+	for _, f := range failures {
+		if m := loginHintRe.FindStringSubmatch(f.msg); m != nil {
+			suggestedUsers[m[1]] = struct{}{}
+		}
+	}
+
+	// Auto-retry: if every failure is a user-rejection pointing to one user,
+	// switch to that user and try again — no manual --ssh-user flag needed.
+	if !isRetry && len(suggestedUsers) == 1 && len(succeeded) == 0 {
+		var autoUser string
+		for u := range suggestedUsers {
+			autoUser = u
+		}
+		warnf("SSH rejected '%s' on all hosts — retrying as '%s' (sudo will be used for privileged ops)", sshUser(), autoUser)
+		sshUserOverride = autoUser
+		return deployAllInner(hosts, displayNames, selfPath, true)
+	}
+
 	// Group failures by error message so N identical errors print as one line.
-	if len(failures) > 0 {
-		byMsg := make(map[string][]string)
-		var msgOrder []string
-		for _, f := range failures {
-			if _, seen := byMsg[f.msg]; !seen {
-				msgOrder = append(msgOrder, f.msg)
-			}
-			byMsg[f.msg] = append(byMsg[f.msg], f.display)
+	byMsg := make(map[string][]string)
+	var msgOrder []string
+	for _, f := range failures {
+		if _, seen := byMsg[f.msg]; !seen {
+			msgOrder = append(msgOrder, f.msg)
 		}
-		for _, msg := range msgOrder {
-			displays := byMsg[msg]
-			errorf("  Deploy failed on %d host(s): %s\n    %s", len(displays), msg, strings.Join(displays, ", "))
+		byMsg[f.msg] = append(byMsg[f.msg], f.display)
+	}
+	for _, msg := range msgOrder {
+		displays := byMsg[msg]
+		errorf("  Deploy failed on %d host(s): %s\n    %s", len(displays), msg, strings.Join(displays, ", "))
+	}
+	if len(suggestedUsers) > 0 {
+		users := make([]string, 0, len(suggestedUsers))
+		for u := range suggestedUsers {
+			users = append(users, u)
 		}
+		sort.Strings(users)
+		warnf("SSH user rejected — re-run with: --ssh-user %s", strings.Join(users, " or "))
 	}
 	return succeeded
 }
@@ -2654,8 +2734,11 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 
 	timeoutSecs := int(sshTimeout.Seconds())
 	remoteShellCmd := fmt.Sprintf(
-		"chmod +x %s; trap 'rm -f %s' EXIT; timeout %d %s",
-		remoteBin, remoteBin, timeoutSecs, collectionCmd,
+		"%s; trap '%s' EXIT; timeout %d %s",
+		maybeRemoteSudo("chmod +x "+remoteBin),
+		maybeRemoteSudo("rm -f "+remoteBin),
+		timeoutSecs,
+		maybeRemoteSudo(collectionCmd),
 	)
 
 	// ── run collection via SSH, streaming output to a temp file ──────────
@@ -2753,7 +2836,10 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 	// id,ips: first IP for each container (take everything up to first comma).
 	ipsOut, err := query2("ips")
 	if err != nil {
-		return nil, fmt.Errorf("weka cluster container list failed: %v", err)
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 41 {
+			return nil, fmt.Errorf("weka cluster container requires authentication — run 'weka user login' first")
+		}
+		return nil, fmt.Errorf("weka cluster container failed: %v", err)
 	}
 	hostOut, _ := query2("hostname") // best-effort
 	statusOut, _ := query2("status") // best-effort; missing → treated as UP
@@ -2980,7 +3066,13 @@ func acquireRunLock(force bool) error {
 	}
 	_ = os.MkdirAll(wlcBaseDir, 0755)
 	content := fmt.Sprintf("%d\n%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
-	return os.WriteFile(wlcRunLock, []byte(content), 0644)
+	if err := os.WriteFile(wlcRunLock, []byte(content), 0666); err != nil {
+		// Lock is a safety net, not a hard requirement. If we can't write it
+		// (e.g. stale file owned by another user, restricted /tmp), warn and
+		// continue — the collection still works, just without concurrency protection.
+		warnf("Cannot write run lock %s: %v — skipping lock (concurrent runs not protected)", wlcRunLock, err)
+	}
+	return nil
 }
 
 // releaseRunLock removes the lock file. Safe to call when no lock was acquired
@@ -4899,7 +4991,7 @@ func main() {
 		compression     = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
 		anonymize       = flag.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json (kept by the customer; not in the archive).")
 		anonymizeKey    = flag.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
-		force           = flag.Bool("force", false, "Override the run lock at /opt/weka/weka-log-collector/.run.lock (use only when an earlier run is known to be hung)")
+		force           = flag.Bool("force", false, "Override the run lock (use only when an earlier run is known to be hung)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -4908,6 +5000,7 @@ func main() {
 	clientsOnly := flag.Bool("clients-only", false, "Collect from client nodes only (skip backends)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
 	flag.Var(&hosts, "host", "Collect only from these hosts (repeatable; accepts hostname or any IP; default: all cluster backends)")
+	flag.StringVar(&sshUserOverride, "ssh-user", "", "Username for SSH connections to cluster nodes (default: current OS user)")
 	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)")
 	flag.Var(&containerNamesFlag, "container-name", "Internal: restrict /opt/weka/logs/ collection to these container names (set by orchestrator when --container-id is used)")
 	flag.Usage = usageFunc
@@ -5590,8 +5683,11 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	collectionCmd := strings.Join(args, " ")
 	timeoutSecs := int(sshTimeout.Seconds())
 	remoteShellCmd := fmt.Sprintf(
-		"chmod +x %s; trap 'rm -f %s' EXIT; timeout %d %s",
-		remoteBin, remoteBin, timeoutSecs, collectionCmd,
+		"%s; trap '%s' EXIT; timeout %d %s",
+		maybeRemoteSudo("chmod +x "+remoteBin),
+		maybeRemoteSudo("rm -f "+remoteBin),
+		timeoutSecs,
+		maybeRemoteSudo(collectionCmd),
 	)
 
 	var stderrBuf bytes.Buffer
@@ -5939,6 +6035,7 @@ PROFILES  (--profile NAME)
 
 OPTIONS
   --host IP            Target specific host(s) by IP (repeatable)
+  --ssh-user USER      SSH username for remote hosts (default: current OS user)
   --container-id N     Target specific container ID(s) (repeatable)
   --clients            Include client nodes (default: backends only)
   --clients-only       Client nodes only; skip backends
