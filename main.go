@@ -44,7 +44,7 @@ const (
 	wlcBaseDir        = "/opt/weka/weka-log-collector"
 	wlcBundlesDir     = wlcBaseDir + "/bundles"
 	wlcLogsDir        = wlcBaseDir + "/logs"
-	wlcRunLock        = wlcBaseDir + "/.run.lock"
+	wlcRunLock        = "/tmp/weka-log-collector.lock"
 	uploadFileMaxSize = 50 * 1024 * 1024 // 50 MB
 )
 
@@ -2393,10 +2393,15 @@ type HostResult struct {
 // Used by the signal handler to kill orphaned remote processes on interrupt.
 var activeRemoteHosts sync.Map
 
-// sshUser returns the username to use for SSH connections: whoever ran this
-// binary. If the running user has the required permissions on remote hosts
-// (e.g. ubuntu with passwordless sudo), that works without being root.
+// sshUserOverride is set by the --ssh-user flag. Empty means "use the default".
+var sshUserOverride string
+
+// sshUser returns the username to use for SSH connections.
+// Priority: --ssh-user flag > current OS user > "root" (fallback).
 func sshUser() string {
+	if sshUserOverride != "" {
+		return sshUserOverride
+	}
 	if u, err := user.Current(); err == nil && u.Username != "" {
 		return u.Username
 	}
@@ -2668,7 +2673,10 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 	// id,ips: first IP for each container (take everything up to first comma).
 	ipsOut, err := query2("ips")
 	if err != nil {
-		return nil, fmt.Errorf("weka cluster container list failed: %v", err)
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 41 {
+			return nil, fmt.Errorf("weka cluster container requires authentication — run 'weka user login' first")
+		}
+		return nil, fmt.Errorf("weka cluster container failed: %v", err)
 	}
 	hostOut, _ := query2("hostname") // best-effort
 	statusOut, _ := query2("status") // best-effort; missing → treated as UP
@@ -2895,7 +2903,7 @@ func acquireRunLock(force bool) error {
 	}
 	_ = os.MkdirAll(wlcBaseDir, 0755)
 	content := fmt.Sprintf("%d\n%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
-	return os.WriteFile(wlcRunLock, []byte(content), 0644)
+	return os.WriteFile(wlcRunLock, []byte(content), 0666)
 }
 
 // releaseRunLock removes the lock file. Safe to call when no lock was acquired
@@ -4814,7 +4822,7 @@ func main() {
 		compression     = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
 		anonymize       = flag.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json (kept by the customer; not in the archive).")
 		anonymizeKey    = flag.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
-		force           = flag.Bool("force", false, "Override the run lock at /opt/weka/weka-log-collector/.run.lock (use only when an earlier run is known to be hung)")
+		force           = flag.Bool("force", false, "Override the run lock (use only when an earlier run is known to be hung)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -4823,6 +4831,7 @@ func main() {
 	clientsOnly := flag.Bool("clients-only", false, "Collect from client nodes only (skip backends)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
 	flag.Var(&hosts, "host", "Collect only from these hosts (repeatable; accepts hostname or any IP; default: all cluster backends)")
+	flag.StringVar(&sshUserOverride, "ssh-user", "", "Username for SSH connections to cluster nodes (default: current OS user)")
 	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)")
 	flag.Var(&containerNamesFlag, "container-name", "Internal: restrict /opt/weka/logs/ collection to these container names (set by orchestrator when --container-id is used)")
 	flag.Usage = usageFunc
@@ -5861,6 +5870,7 @@ PROFILES  (--profile NAME)
 
 OPTIONS
   --host IP            Target specific host(s) by IP (repeatable)
+  --ssh-user USER      SSH username for remote hosts (default: current OS user)
   --container-id N     Target specific container ID(s) (repeatable)
   --clients            Include client nodes (default: backends only)
   --clients-only       Client nodes only; skip backends
