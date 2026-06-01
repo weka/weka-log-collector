@@ -1016,6 +1016,7 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_security_kms", Cmd: "weka security kms -J", JSON: true},
 	// ── local container info (node-local: different per host) ─────────────
 	{Name: "weka_local_ps", Cmd: "weka local ps -v -J", NodeLocal: true, LocalOnly: true, JSON: true},
+	{Name: "weka_local_status", Cmd: "weka local status -v", NodeLocal: true, LocalOnly: true},
 	// weka local resources collected dynamically per container in CollectLocal
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
@@ -1216,7 +1217,7 @@ var s3Commands = []CommandSpec{
 	{Name: "weka_stats_s3_bucket_create_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_CREATE_OPS", Profile: ProfileS3},
 	{Name: "weka_stats_s3_bucket_delete_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_DELETE_OPS", Profile: ProfileS3},
 	{Name: "weka_stats_s3_bucket_list_ops", Cmd: "weka stats --category ops_s3 --stat TOTAL_BUCKET_LIST_OPS", Profile: ProfileS3},
-	{Name: "s3_cgroup_memory", Cmd: "cat /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes && cat /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes", Profile: ProfileS3, NodeLocal: true},
+	{Name: "s3_cgroup_memory", Cmd: "grep \"\" /sys/fs/cgroup/memory/weka-s3/memory.limit_in_bytes /sys/fs/cgroup/memory/weka-s3/memory.usage_in_bytes 2>/dev/null", Profile: ProfileS3, NodeLocal: true},
 	{Name: "netstat_s3", Cmd: "netstat -tuln | grep 9001", Profile: ProfileS3, NodeLocal: true},
 }
 
@@ -1239,13 +1240,13 @@ var smbwCommands = []CommandSpec{
 var systemCommands = []CommandSpec{
 	// ── identity & hardware ───────────────────────────────────────────────
 	{Name: "uname", Cmd: "uname -a"},
-	{Name: "os_release", Cmd: "cat /etc/*release*"},
+	{Name: "os_release", Cmd: "grep \"\" /etc/*release* 2>/dev/null"},
 	{Name: "hostname", Cmd: "hostname -f"},
 	{Name: "uptime", Cmd: "uptime"},
 	{Name: "free_mem", Cmd: "free -h"},
 	{Name: "lscpu", Cmd: "lscpu"},
 	{Name: "lspci", Cmd: "lspci"},
-	{Name: "lsblk", Cmd: "lsblk -d"},
+	{Name: "lsblk", Cmd: "lsblk -o NAME,SIZE,TYPE,ROTA,TRAN,VENDOR,MODEL,SERIAL,STATE,MOUNTPOINT"},
 	{Name: "numactl_hardware", Cmd: "numactl -H"},
 	// ── processes & disk ─────────────────────────────────────────────────
 	{Name: "ps_elf", Cmd: "ps -elf"},
@@ -1285,6 +1286,82 @@ var systemCommands = []CommandSpec{
 	// fails gracefully on Intel/other NIC nodes
 	{Name: "mst_status", Cmd: "mst status -v"},
 	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
+	// ── SELinux / secure boot ─────────────────────────────────────────────────
+	{Name: "getenforce", Cmd: "getenforce", NodeOptional: true},
+	{Name: "sestatus", Cmd: "sestatus", NodeOptional: true},
+	{Name: "selinux_config", Cmd: "cat /etc/selinux/config", NodeOptional: true},
+	{Name: "secureboot_state", Cmd: "mokutil --sb-state", NodeOptional: true},
+	// ── boot configuration ────────────────────────────────────────────────────
+	{Name: "proc_cmdline", Cmd: "cat /proc/cmdline"},
+	{Name: "iommu_state", Cmd: "ls /sys/class/iommu/ /sys/kernel/iommu_groups/ 2>/dev/null", NodeOptional: true},
+	// ── CPU / memory detail ───────────────────────────────────────────────────
+	{Name: "proc_cpuinfo", Cmd: "cat /proc/cpuinfo"},
+	{Name: "cpuinfo_aes", Cmd: "grep -m1 aes /proc/cpuinfo", NodeOptional: true},
+	{Name: "proc_meminfo", Cmd: "cat /proc/meminfo"},
+	{Name: "smt_active", Cmd: "cat /sys/devices/system/cpu/smt/active", NodeOptional: true},
+	{Name: "numa_balancing", Cmd: "cat /proc/sys/kernel/numa_balancing"},
+	{Name: "numa_meminfo", Cmd: "grep MemTotal /sys/devices/system/node/node*/meminfo", NodeOptional: true},
+	{Name: "numa_nodes", Cmd: "ls -d /sys/devices/system/node/node*", NodeOptional: true},
+	// ── hugepages ─────────────────────────────────────────────────────────────
+	{Name: "hugepages_1g", Cmd: "cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages", NodeOptional: true},
+	{Name: "hugepages_2m", Cmd: "cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages", NodeOptional: true},
+	// scoped to weka procs only — avoids scanning all of /proc/*/numa_maps
+	{Name: "weka_hugepages_numa_maps", Cmd: "pgrep -f weka | head -1 | xargs -I{} grep -E 'huge' /proc/{}/numa_maps 2>/dev/null", NodeOptional: true},
+	// ── firewall (both iptables and nftables — one will produce output per distro) ─
+	{Name: "iptables_rules", Cmd: "iptables -L -v -n", NodeOptional: true},
+	{Name: "iptables_nat", Cmd: "iptables -L -n -t nat", NodeOptional: true},
+	{Name: "iptables_save", Cmd: "iptables-save", NodeOptional: true},
+	{Name: "nft_ruleset", Cmd: "nft list ruleset", NodeOptional: true},
+	{Name: "firewalld_status", Cmd: "systemctl status firewalld --no-pager", NodeOptional: true},
+	// ── mount / filesystem config ─────────────────────────────────────────────
+	{Name: "mount", Cmd: "mount"},
+	{Name: "fstab", Cmd: "cat /etc/fstab"},
+	{Name: "mtab", Cmd: "cat /etc/mtab", NodeOptional: true},
+	{Name: "resolv_conf", Cmd: "cat /etc/resolv.conf"},
+	// ── package list (rpm on RHEL family, dpkg on Debian/Ubuntu) ─────────────
+	{Name: "pkg_list", Cmd: "rpm -qa 2>/dev/null || dpkg -l 2>/dev/null", NodeOptional: true},
+	// ── NVMe namespace details ────────────────────────────────────────────────
+	{Name: "nvme_list", Cmd: "nvme list", NodeOptional: true},
+	{Name: "nvme_id_ns", Cmd: `for dev in /dev/nvme*n*; do [ -e "$dev" ] || continue; echo "=== $dev ==="; nvme id-ns "$dev" 2>&1; done`, NodeOptional: true},
+	// ── kernel modules / modprobe ─────────────────────────────────────────────
+	{Name: "modprobe_squashfs", Cmd: "grep squashfs /etc/modprobe.d/* 2>/dev/null", NodeOptional: true},
+	{Name: "modprobe_d_listing", Cmd: "ls /etc/modprobe.d/"},
+	// ── bonding ───────────────────────────────────────────────────────────────
+	{Name: "bonding_info", Cmd: `for f in /proc/net/bonding/*; do [ -f "$f" ] || continue; echo "=== $f ==="; cat "$f"; done 2>/dev/null`, NodeOptional: true},
+	{Name: "bonding_modes", Cmd: "grep \"\" /sys/class/net/*/bonding/mode 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_slaves", Cmd: "grep \"\" /sys/class/net/*/bonding/slaves 2>/dev/null", NodeOptional: true},
+	{Name: "bonding_hash_policy", Cmd: "grep \"\" /sys/class/net/*/bonding/xmit_hash_policy 2>/dev/null", NodeOptional: true},
+	// ── InfiniBand / network device sysfs ─────────────────────────────────────
+	{Name: "net_device_types", Cmd: "grep \"\" /sys/class/net/*/type 2>/dev/null", NodeOptional: true},
+	{Name: "ib_device_modes", Cmd: "grep \"\" /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
+	{Name: "ib_lid_values", Cmd: "grep \"\" /sys/class/net/*/device/infiniband/*/ports/*/lid 2>/dev/null", NodeOptional: true},
+	{Name: "ib_uverbs_module", Cmd: "grep ib_uverbs /proc/modules", NodeOptional: true},
+	{Name: "pci_net_mtu", Cmd: "grep \"\" /sys/bus/pci/devices/*/net/*/mtu 2>/dev/null", NodeOptional: true},
+	// ── IP address / route (JSON for programmatic analysis) ───────────────────
+	{Name: "ip_addr_json", Cmd: "ip -j -o addr show", JSON: true},
+	{Name: "ip_route_json", Cmd: "ip -4 --json route", JSON: true},
+	// ── cgroup state ──────────────────────────────────────────────────────────
+	{Name: "cgroup_type", Cmd: "stat -fc %T /sys/fs/cgroup", NodeOptional: true},
+	{Name: "cgroup_cpuset", Cmd: "grep \"\" /sys/fs/cgroup/weka-*/cpuset.cpus.effective 2>/dev/null", NodeOptional: true},
+	// ── software RAID ─────────────────────────────────────────────────────────
+	{Name: "mdstat", Cmd: "cat /proc/mdstat", NodeOptional: true},
+	{Name: "mdadm_detail", Cmd: `for md in /dev/md*; do [ -b "$md" ] || continue; echo "=== $md ==="; mdadm --detail --test "$md" 2>&1; done`, NodeOptional: true},
+	// ── NetworkManager ────────────────────────────────────────────────────────
+	{Name: "nm_config", Cmd: "NetworkManager --print-config", NodeOptional: true},
+	{Name: "nmcli_dev_status", Cmd: "nmcli dev status", NodeOptional: true},
+	// ── Weka-specific system state ────────────────────────────────────────────
+	{Name: "weka_agent_enabled", Cmd: "systemctl is-enabled weka-agent", NodeOptional: true},
+	{Name: "weka_service_conf", Cmd: "cat /etc/wekaio/service.conf", NodeOptional: true},
+	{Name: "weka_release_spec", Cmd: "grep \"\" /opt/weka/dist/release/*.spec 2>/dev/null", NodeOptional: true},
+	{Name: "xfs_loop_info", Cmd: "xfs_info /opt/weka/*.loop 2>/dev/null", NodeOptional: true},
+	{Name: "weka_hugepage_files", Cmd: "ls -la /opt/weka/data/agent/containers/state/*/huge*/* 2>/dev/null", NodeOptional: true},
+	{Name: "wekanode_ps", Cmd: "ps -C wekanode -o pid,ppid,user,rsz,vsz,pcpu,pmem,stat,etime,comm,args", NodeOptional: true},
+	{Name: "weka_init_ps", Cmd: "ps -C weka_init -o pid,ppid,user,rsz,vsz,pcpu,pmem,stat,etime,comm,args", NodeOptional: true},
+	// ── NFS / IPv6 ────────────────────────────────────────────────────────────
+	{Name: "ipv6_interfaces", Cmd: "cat /proc/net/if_inet6", NodeOptional: true},
+	{Name: "nfs_tcp_connections", Cmd: "ss -nt 'sport = :2049'", NodeOptional: true},
+	// ── security software ─────────────────────────────────────────────────────
+	{Name: "falcon_sensor_status", Cmd: "systemctl status falcon-sensor --no-pager", NodeOptional: true},
 	// weka-agent journal — collected separately in CollectLocal with time window support
 }
 
@@ -1728,6 +1805,25 @@ type cmdOutput struct {
 }
 
 // runCommandsParallel runs specs concurrently (up to cmdWorkers at a time) and
+// commandFileContent builds the bytes written to a collected output file.
+// For text files: always prepends "# command: <cmd>\n" so the file is
+// self-documenting, then appends the error line if the command failed.
+// For JSON files: returns raw output unchanged (a comment header would break
+// JSON parsers); on error with no output falls back to a comment block.
+func commandFileContent(spec CommandSpec, out []byte, errStr string) []byte {
+	if spec.JSON {
+		if errStr != "" && len(out) == 0 {
+			return []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, errStr))
+		}
+		return out
+	}
+	header := "# command: " + spec.Cmd + "\n"
+	if errStr != "" {
+		header += "# error: " + errStr + "\n"
+	}
+	return append([]byte(header), out...)
+}
+
 // returns results in the same order as specs. It is safe to call from a single
 // goroutine; tar writes happen after this returns.
 func runCommandsParallel(specs []CommandSpec, timeout time.Duration) []cmdOutput {
@@ -2075,10 +2171,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
 			}
 		}
-		content := co.out
-		if co.result.Error != "" && len(co.out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-		}
+		content := commandFileContent(spec, co.out, co.result.Error)
 		ext := ".txt"
 		if spec.JSON {
 			ext = ".json"
@@ -2140,10 +2233,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
 			}
 		}
-		content := co.out
-		if co.result.Error != "" && len(co.out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-		}
+		content := commandFileContent(spec, co.out, co.result.Error)
 		ext := ".txt"
 		if spec.JSON {
 			ext = ".json"
@@ -2194,10 +2284,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			if result.Error != "" {
 				warnf("[%s] weka local resources -C %s failed: %s", hostname, name, result.Error)
 			}
-			content := out
-			if result.Error != "" && len(out) == 0 {
-				content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, result.Error))
-			}
+			content := commandFileContent(spec, out, result.Error)
 			dest := filepath.Join(hostRoot, "weka", spec.Name+".json")
 			if err := addBytesToArchive(tw, dest, content); err != nil {
 				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
@@ -2212,7 +2299,8 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	if result.Error != "" {
 		warnf("[%s] journalctl failed: %s", hostname, result.Error)
 	}
-	_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl.txt"), out)
+	jctlSpec := CommandSpec{Name: "journalctl", Cmd: result.Command}
+	_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl.txt"), commandFileContent(jctlSpec, out, result.Error))
 
 	// weka-agent journal: scoped to the --start-time/--end-time window when given,
 	// capped at 50k lines otherwise. The line cap is a safety net — earlier
@@ -2230,12 +2318,13 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		default:
 			agentCmd = "journalctl -u weka-agent --no-pager -n 50000"
 		}
-		agentResult, agentOut := runCommand(CommandSpec{Name: "journalctl_weka_agent", Cmd: agentCmd}, 2*cmdTimeout)
+		agentSpec := CommandSpec{Name: "journalctl_weka_agent", Cmd: agentCmd}
+		agentResult, agentOut := runCommand(agentSpec, 2*cmdTimeout)
 		manifest.Commands = append(manifest.Commands, agentResult)
 		if agentResult.Error != "" {
 			warnf("[%s] journalctl weka-agent failed: %s", hostname, agentResult.Error)
 		}
-		_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl_weka_agent.txt"), agentOut)
+		_ = addBytesToArchive(tw, filepath.Join(hostRoot, "system", "journalctl_weka_agent.txt"), commandFileContent(agentSpec, agentOut, agentResult.Error))
 	}
 
 	// ── phase: log files ──────────────────────────────────────────────────
@@ -2315,15 +2404,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		for i, spec := range extraCmds {
 			co := extraOutputs[i]
 			manifest.Commands = append(manifest.Commands, co.result)
-			content := co.out
 			if co.result.Error != "" {
-				if len(co.out) == 0 {
-					content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-				}
 				warnf("[%s] extra command %q failed (exit %d): %s", hostname, spec.Cmd, co.result.ExitCode, co.result.Error)
 			}
 			dest := filepath.Join(hostRoot, "extra", spec.Name+".txt")
-			if err := addBytesToArchive(tw, dest, content); err != nil {
+			if err := addBytesToArchive(tw, dest, commandFileContent(spec, co.out, co.result.Error)); err != nil {
 				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 			}
 		}
@@ -5794,10 +5879,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 				warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
 			}
 		}
-		content := co.out
-		if co.result.Error != "" && len(co.out) == 0 {
-			content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-		}
+		content := commandFileContent(spec, co.out, co.result.Error)
 		ext := ".txt"
 		if spec.JSON {
 			ext = ".json"
@@ -5818,15 +5900,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
 		for i, spec := range extraCmds {
 			co := extraOutputs[i]
-			content := co.out
 			if co.result.Error != "" {
-				if len(co.out) == 0 {
-					content = []byte(fmt.Sprintf("# command: %s\n# error: %s\n", spec.Cmd, co.result.Error))
-				}
 				warnf("extra command %q failed (exit %d): %s", spec.Cmd, co.result.ExitCode, co.result.Error)
 			}
 			dest := filepath.Join(archiveRoot, "cluster", "extra", spec.Name+".txt")
-			if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
+			if addErr := addBytesToArchive(tw, dest, commandFileContent(spec, co.out, co.result.Error)); addErr != nil {
 				warnf("could not add extra/%s to archive: %v", spec.Name, addErr)
 			}
 		}
