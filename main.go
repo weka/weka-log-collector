@@ -1404,28 +1404,29 @@ var logFileSpecs = []LogFileSpec{
 	{SrcGlob: "/opt/weka/logs/default*/*/*.log*", DestDir: "weka/containers"},
 	{SrcGlob: "/opt/weka/logs/default*/*/*.stats*", DestDir: "weka/containers"},
 
-	// ── NFS / Ganesha container logs (profile: nfs) ───────────────────────
-	{SrcGlob: "/opt/weka/logs/ganesha*/*.log*", DestDir: "weka/containers", Profile: ProfileNFS},
-	{SrcGlob: "/opt/weka/logs/ganesha*/*.json", DestDir: "weka/containers", Profile: ProfileNFS},
-	{SrcGlob: "/opt/weka/logs/ganesha*/*.conf", DestDir: "weka/containers", Profile: ProfileNFS},
-	{SrcGlob: "/opt/weka/logs/ganesha*/*.out", DestDir: "weka/containers", Profile: ProfileNFS},
-	{SrcGlob: "/opt/weka/logs/ganesha*/*.stats*", DestDir: "weka/containers", Profile: ProfileNFS},
-	{SrcGlob: "/opt/weka/logs/ganesha*/*/*.log*", DestDir: "weka/containers", Profile: ProfileNFS},
+	// ── Protocol container logs — always collected if the container exists ──
+	// Profile gates the CLI commands for these protocols; log files are
+	// collected unconditionally because a glob that matches nothing is free,
+	// and you always want the logs if the container is actually running.
+	{SrcGlob: "/opt/weka/logs/ganesha*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/ganesha*/*.json", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/ganesha*/*.conf", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/ganesha*/*.out", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/ganesha*/*.stats*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/ganesha*/*/*.log*", DestDir: "weka/containers"},
 
-	// ── S3 / Envoy container logs (profile: s3) ───────────────────────────
-	{SrcGlob: "/opt/weka/logs/s3*/*.log*", DestDir: "weka/containers", Profile: ProfileS3},
-	{SrcGlob: "/opt/weka/logs/s3*/*.json", DestDir: "weka/containers", Profile: ProfileS3},
-	{SrcGlob: "/opt/weka/logs/s3*/*.stats*", DestDir: "weka/containers", Profile: ProfileS3},
-	{SrcGlob: "/opt/weka/logs/s3*/*/*.log*", DestDir: "weka/containers", Profile: ProfileS3},
-	{SrcGlob: "/opt/weka/logs/s3*/*/*.stats*", DestDir: "weka/containers", Profile: ProfileS3},
-	{SrcGlob: "/opt/weka/logs/envoy*/*.log*", DestDir: "weka/containers", Profile: ProfileS3},
-	{SrcGlob: "/opt/weka/logs/envoy*/*/*.log*", DestDir: "weka/containers", Profile: ProfileS3},
+	{SrcGlob: "/opt/weka/logs/s3*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/s3*/*.json", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/s3*/*.stats*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/s3*/*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/s3*/*/*.stats*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/envoy*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/envoy*/*/*.log*", DestDir: "weka/containers"},
 
-	// ── SMB-W / Pacemaker / Corosync container logs (profile: smbw) ──────
-	{SrcGlob: "/opt/weka/logs/smbw*/*.log*", DestDir: "weka/containers", Profile: ProfileSMBW},
-	{SrcGlob: "/opt/weka/logs/smbw*/*.json", DestDir: "weka/containers", Profile: ProfileSMBW},
-	{SrcGlob: "/opt/weka/logs/smbw*/*.stats*", DestDir: "weka/containers", Profile: ProfileSMBW},
-	{SrcGlob: "/opt/weka/logs/smbw*/*/*.log*", DestDir: "weka/containers", Profile: ProfileSMBW},
+	{SrcGlob: "/opt/weka/logs/smbw*/*.log*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/smbw*/*.json", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/smbw*/*.stats*", DestDir: "weka/containers"},
+	{SrcGlob: "/opt/weka/logs/smbw*/*/*.log*", DestDir: "weka/containers"},
 
 	// ── vendor/driver logs ────────────────────────────────────────────────
 	{SrcGlob: "/var/log/mlnx/*.log", DestDir: "vendor/mlnx"},
