@@ -2477,11 +2477,7 @@ func deployToHost(host, selfPath string) error {
 
 	mkdirArgs := append(sshArgs(), target, maybeRemoteSudo("mkdir -p "+wlcBaseDir))
 	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
-		msg := strings.TrimSpace(string(out))
-		if m := regexp.MustCompile(`(?i)please login as the user ["\x60]?(\S+?)["\x60]?`).FindStringSubmatch(msg); m != nil {
-			return fmt.Errorf("mkdir %s: %v: %s\n\t  Hint: re-run with --ssh-user %s", wlcBaseDir, err, msg, m[1])
-		}
-		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, msg)
+		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
 	}
 
 	if !remoteNeedsSudo() {
@@ -2564,6 +2560,23 @@ func deployAll(hosts []string, displayNames map[string]string, selfPath string) 
 		for _, msg := range msgOrder {
 			displays := byMsg[msg]
 			errorf("  Deploy failed on %d host(s): %s\n    %s", len(displays), msg, strings.Join(displays, ", "))
+		}
+		// If SSH rejected us with a "Please login as the user X" message, surface
+		// a single actionable hint rather than burying it in per-host errors.
+		loginHintRe := regexp.MustCompile(`(?i)please login as the user "([^"]+)"`)
+		suggestedUsers := map[string]struct{}{}
+		for _, f := range failures {
+			if m := loginHintRe.FindStringSubmatch(f.msg); m != nil {
+				suggestedUsers[m[1]] = struct{}{}
+			}
+		}
+		if len(suggestedUsers) > 0 {
+			users := make([]string, 0, len(suggestedUsers))
+			for u := range suggestedUsers {
+				users = append(users, u)
+			}
+			sort.Strings(users)
+			warnf("SSH user rejected — re-run with: --ssh-user %s", strings.Join(users, " or "))
 		}
 	}
 	return succeeded
