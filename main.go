@@ -2477,7 +2477,11 @@ func deployToHost(host, selfPath string) error {
 
 	mkdirArgs := append(sshArgs(), target, maybeRemoteSudo("mkdir -p "+wlcBaseDir))
 	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
-		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
+		msg := strings.TrimSpace(string(out))
+		if m := regexp.MustCompile(`(?i)please login as the user ["\x60]?(\S+?)["\x60]?`).FindStringSubmatch(msg); m != nil {
+			return fmt.Errorf("mkdir %s: %v: %s\n\t  Hint: re-run with --ssh-user %s", wlcBaseDir, err, msg, m[1])
+		}
+		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, msg)
 	}
 
 	if !remoteNeedsSudo() {
