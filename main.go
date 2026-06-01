@@ -2451,17 +2451,53 @@ func remoteBinPath() string {
 	return fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
 }
 
+// remoteNeedsSudo reports whether remote SSH commands need sudo.
+// When the SSH user is not root, weka commands and writes to /opt/weka/
+// require privilege escalation. Assumes passwordless sudo (standard on
+// Weka cloud nodes: OCI ubuntu, EC2 ubuntu/ec2-user, etc.).
+func remoteNeedsSudo() bool {
+	return sshUser() != "root"
+}
+
+// maybeRemoteSudo prefixes cmd with "sudo " when the SSH user is not root.
+func maybeRemoteSudo(cmd string) string {
+	if remoteNeedsSudo() {
+		return "sudo " + cmd
+	}
+	return cmd
+}
+
 // deployToHost copies the running binary to a remote host via SCP.
+// When the SSH user is non-root, it copies to /tmp first then sudo-moves
+// into place, since /opt/weka/weka-log-collector/ is root-owned.
 func deployToHost(host, selfPath string) error {
-	sshTarget := sshTarget(host)
+	target := sshTarget(host)
 	remoteBin := remoteBinPath()
-	mkdirArgs := append(sshArgs(), sshTarget, "mkdir -p "+wlcBaseDir)
+
+	mkdirArgs := append(sshArgs(), target, maybeRemoteSudo("mkdir -p "+wlcBaseDir))
 	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
 	}
-	scpArgs := append(sshArgs(), selfPath, sshTarget+":"+remoteBin)
+
+	if !remoteNeedsSudo() {
+		scpArgs := append(sshArgs(), selfPath, target+":"+remoteBin)
+		if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+
+	// Non-root SSH user: SCP to /tmp, then sudo-move into the wlc directory.
+	tmpRemote := fmt.Sprintf("/tmp/wlc-deploy-%d", os.Getpid())
+	scpArgs := append(sshArgs(), selfPath, target+":"+tmpRemote)
 	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	installCmd := fmt.Sprintf("sudo mv %s %s && sudo chmod +x %s", tmpRemote, remoteBin, remoteBin)
+	installArgs := append(sshArgs(), target, installCmd)
+	if out, err := exec.Command("ssh", installArgs...).CombinedOutput(); err != nil {
+		exec.Command("ssh", append(sshArgs(), target, "rm -f "+tmpRemote)...).Run() //nolint
+		return fmt.Errorf("install %s: %v: %s", remoteBin, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -2574,8 +2610,11 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 
 	timeoutSecs := int(sshTimeout.Seconds())
 	remoteShellCmd := fmt.Sprintf(
-		"chmod +x %s; trap 'rm -f %s' EXIT; timeout %d %s",
-		remoteBin, remoteBin, timeoutSecs, collectionCmd,
+		"%s; trap '%s' EXIT; timeout %d %s",
+		maybeRemoteSudo("chmod +x "+remoteBin),
+		maybeRemoteSudo("rm -f "+remoteBin),
+		timeoutSecs,
+		maybeRemoteSudo(collectionCmd),
 	)
 
 	// ── run collection via SSH, streaming output to a temp file ──────────
@@ -5520,8 +5559,11 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	collectionCmd := strings.Join(args, " ")
 	timeoutSecs := int(sshTimeout.Seconds())
 	remoteShellCmd := fmt.Sprintf(
-		"chmod +x %s; trap 'rm -f %s' EXIT; timeout %d %s",
-		remoteBin, remoteBin, timeoutSecs, collectionCmd,
+		"%s; trap '%s' EXIT; timeout %d %s",
+		maybeRemoteSudo("chmod +x "+remoteBin),
+		maybeRemoteSudo("rm -f "+remoteBin),
+		timeoutSecs,
+		maybeRemoteSudo(collectionCmd),
 	)
 
 	var stderrBuf bytes.Buffer
