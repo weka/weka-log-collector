@@ -3772,7 +3772,7 @@ _weka_log_collector() {
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
           --extra-commands --cmd-timeout --compression --anonymize --anonymize-key --force
-          --list-bundles --rm-bundle --clean-bundles"
+          --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers"
 
     case "$prev" in
         --profile)
@@ -3791,6 +3791,10 @@ _weka_log_collector() {
             now=$(date +%Y-%m-%dT%H:%M)
             today=$(date +%Y-%m-%d)
             COMPREPLY=( $(compgen -W "-1h -2h -4h -8h -12h -24h -1d -2d ${now} ${today}T00:00 ${today}T06:00 ${today}T12:00 ${today}T18:00" -- "$cur") )
+            return 0
+            ;;
+        --cluster-cmd-workers)
+            COMPREPLY=( $(compgen -W "1 2 4 8 16" -- "$cur") )
             return 0
             ;;
     esac
