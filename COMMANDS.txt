@@ -1,0 +1,276 @@
+weka-log-collector — collected commands
+Generated manually for review. Check main.go for authoritative list.
+Profile values: default, perf, nfs, s3, smbw, all
+"all" collects every profile below.
+
+================================================================================
+SYSTEM COMMANDS  (every profile, per-node, OS-level — no weka CLI)
+================================================================================
+uname -a
+grep "" /etc/*release*
+hostname -f
+uptime
+free -h
+lscpu
+lspci
+lsblk -o NAME,SIZE,TYPE,ROTA,TRAN,VENDOR,MODEL,SERIAL,STATE,MOUNTPOINT
+numactl -H
+ps -elf
+df -h
+netstat -nap
+systemctl list-units --failed
+swapon --show
+timedatectl status
+timedatectl show-timesync
+systemctl status systemd-timesyncd
+sysctl -a
+dmesg -T
+lshw -C network -businfo
+ofed_info -s
+lsmod
+modinfo mlx5_core
+modinfo ice
+ethtool <all interfaces>
+ip rule
+ip neighbor
+ip route show table all
+sysctl -a | grep rp_filter
+mst status -v
+mlxconfig query <all ConnectX devices>
+getenforce
+sestatus
+cat /etc/selinux/config
+mokutil --sb-state
+cat /proc/cmdline
+ls /sys/class/iommu/ /sys/kernel/iommu_groups/
+cat /proc/cpuinfo
+grep aes /proc/cpuinfo
+cat /proc/meminfo
+cat /sys/devices/system/cpu/smt/active
+cat /proc/sys/kernel/numa_balancing
+grep MemTotal /sys/devices/system/node/node*/meminfo
+ls /sys/devices/system/node/node*
+cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+grep huge /proc/<weka-pid>/numa_maps
+iptables -L -v -n
+iptables -L -n -t nat
+iptables-save
+nft list ruleset
+systemctl status firewalld
+mount
+cat /etc/fstab
+cat /etc/mtab
+cat /etc/resolv.conf
+rpm -qa / dpkg -l
+nvme list
+nvme id-ns <all nvme namespaces>
+grep squashfs /etc/modprobe.d/*
+ls /etc/modprobe.d/
+cat /proc/net/bonding/* (all bond interfaces)
+grep "" /sys/class/net/*/bonding/mode
+grep "" /sys/class/net/*/bonding/slaves
+grep "" /sys/class/net/*/bonding/xmit_hash_policy
+grep "" /sys/class/net/*/type
+grep "" /sys/class/net/*/mode
+grep "" /sys/class/net/*/device/infiniband/*/ports/*/lid
+grep ib_uverbs /proc/modules
+grep "" /sys/bus/pci/devices/*/net/*/mtu
+ip -j -o addr show
+ip -4 --json route
+stat -fc %T /sys/fs/cgroup
+grep "" /sys/fs/cgroup/weka-*/cpuset.cpus.effective
+cat /proc/mdstat
+mdadm --detail <all md devices>
+NetworkManager --print-config
+nmcli dev status
+systemctl is-enabled weka-agent
+cat /etc/wekaio/service.conf
+grep "" /opt/weka/dist/release/*.spec
+xfs_info /opt/weka/*.loop
+ls /opt/weka/data/agent/containers/state/*/huge*/*
+ps -C wekanode
+ps -C weka_init
+cat /proc/net/if_inet6
+ss -nt 'sport = :2049'
+systemctl status falcon-sensor
+
+================================================================================
+WEKA CLI COMMANDS — DEFAULT PROFILE (every profile, cluster-wide, run once)
+================================================================================
+weka version -J
+weka status -J
+weka status rebuild -J
+weka alerts -J
+weka user -J
+weka cloud status -J
+weka cluster servers list -J
+weka cluster container -J
+weka cluster container net -J
+weka cluster process -J
+weka cluster drive -J
+weka cluster bucket -J
+weka cluster failure-domain -J
+weka cluster task -J
+weka cluster container resources 0 -J
+weka fs -v -J
+weka fs group -J
+weka fs snapshot -v -J
+weka fs tier s3 -v -J
+weka debug traces status -J
+weka debug traces freeze show -J
+weka debug net links -J
+weka debug override list -J
+weka debug blacklist list -J
+weka debug buckets dist -J
+weka security kms -J
+weka debug net peers 1 -J
+weka local exec -C drives0 -- /weka/cfgdump
+weka version current
+weka cluster container --output release --no-header
+weka cluster client-target-version show
+weka cluster host --leader --no-header --output id
+weka cluster container -b -o container,cores,memory --no-header
+weka cluster container --output ips,machineIdentifier,hostname --no-header
+weka cluster process -F role=COMPUTE --output memory --no-header --raw-units
+weka cluster drive --output size --sort size --raw-units --no-header
+weka cluster drive --output block --no-header
+weka cluster bucket -o fillLevel --no-header
+weka cluster bucket --json -s -uptime
+weka cluster process --json -s -uptime
+weka fs -o name,usedSSD,availableSSD,stores --no-header -R
+weka debug config show "obsBuckets[*]._scarceMode"
+weka debug config show snapViews -J
+weka debug override list-keys --output key,defaultValue
+
+--- DIAGNOSTIC STATS (fixed short windows — "is anything wrong right now?") ---
+weka stats --stat DRIVE_READ_RATIO_PER_SSD_READ --start-time -1h
+weka stats --stat RDMA_NET_ERR_RETRY_EXCEEDED,... --start-time -10m -Z
+weka stats --stat PUMPS_TXQ_FULL,BAD_RECV_CSUM,CORRUPT_PACKETS,RDMA_COMP_STATUSES --interval 600
+weka stats --category object_storage --stat RESPONSE_COUNT_BAD_GATEWAY,... --start-time -30m -Z
+
+================================================================================
+WINDOWED COMMANDS (use the collection --start-time window, every profile)
+================================================================================
+weka events --severity major -J --start-time -<N>h
+weka events --type-list LeaderIterationRuntimeTooLong --show-internal --no-header --start-time -<N>h
+
+================================================================================
+WEKA CLI COMMANDS — DEFAULT PROFILE (per-node, node-local)
+================================================================================
+weka local ps -v -J
+weka local status -v
+
+--- PER-CONTAINER (dynamic, for each discovered container: drives0, compute0, etc.) ---
+weka local resources -C <container> -J
+weka local resources -C <container> net --stable -J
+weka local resources -C <container> --stable (text)
+weka local resources -C <container> --stable -J
+weka local exec --container <protocol-container> mount -t wekafs  (ganesha/smbw/s3/envoy only)
+
+================================================================================
+PERF PROFILE (--profile perf / --profile all)
+================================================================================
+Window ≤ 30 min  → --per-process (one row per process per interval)
+Window 30min–2h  → --per-role    (one row per role: DRIVES/COMPUTE/FRONTEND)
+Window > 2h or default → cluster average (one row per interval)
+
+Stats collected (all three tiers use the same stat list, different granularity):
+  CPU_UTILIZATION
+  SSD_READ_LATENCY, SSD_WRITE_LATENCY
+  DRIVE_READ_LATENCY, DRIVE_WRITE_LATENCY
+  SSD_READ_REQS, SSD_WRITES, SSD_BLOCKS_READ, SSD_BLOCKS_WRITTEN
+  DRIVE_READ_OPS, DRIVE_WRITE_OPS, DRIVE_LOAD, DRIVE_ACTIVE_IOS
+  ops: READS, WRITES, READ_LATENCY, WRITE_LATENCY, READ_BYTES, WRITE_BYTES, OPS, THROUGHPUT
+  ops_driver: READS, WRITES, READ_BYTES, WRITE_BYTES, THROUGHPUT
+  GOODPUT_TX_RATIO, GOODPUT_RX_RATIO, PORT_TX_BYTES, PORT_RX_BYTES
+  DROPPED_PACKETS, CORRUPT_PACKETS
+  JRPC_SERVER_PROCESSING_AVG, JRPC_SERVER_PROCESSING_TIME, JRPC_SERVER_CALLS_CLIENT_SUPPORTS_QOS
+  CLIENT_RPC_CALLS, CLIENT_ROUNDTRIP_AVG, SERVER_RPC_CALLS, SERVER_PROCESSING_AVG, CLIENT_RECEIVED_TIMEOUTS
+  weka stats realtime -s -cpu
+
+================================================================================
+NFS PROFILE (--profile nfs / --profile all)
+================================================================================
+weka nfs client-group -J
+weka nfs interface-group -J
+weka nfs permission -J
+weka nfs global-config show -J
+weka nfs custom-options -J
+showmount -e                                                  [per-node]
+weka local resources -C ganesha -J                            [per-node]
+weka local exec --container ganesha cat /proc/wekafs/frontend0/queue   [per-node]
+weka local exec -C ganesha -- dbus-send ... ShowCacheInode    [per-node]
+weka debug config show nfsGaneshaConfig.maxOpenFDs
+weka debug config show nfsGaneshaConfig.customGlobalOptions
+weka nfs interface-group assignment
+weka stats --category ops_nfsw --stat READ_OPS --per-node
+weka stats --category ops_nfsw --stat READ_LATENCY --per-node
+weka stats --category ops_nfsw --stat READ_BYTES --per-node
+weka stats --category ops_nfsw --stat WRITE_OPS --per-node
+weka stats --category ops_nfsw --stat WRITE_LATENCY --per-node
+weka stats --category ops_nfsw --stat WRITE_BYTES --per-node
+weka stats --category ops_nfsw --stat THROUGHPUT --per-node
+weka stats --category ops_nfsw --stat OPS --per-node
+weka stats --category ops_nfsw --stat CREATE_OPS --per-node
+weka stats --category ops_nfsw --stat GETATTR_OPS --per-node
+weka stats --category ops_nfsw --stat LOOKUP_OPS --per-node
+weka stats --category ops_nfsw --stat READDIR_OPS --per-node
+
+NOTE: NFS stats use --per-node (one row per weka node, NOT per process).
+Appropriate for NFS — shows which nodes have NFS load.
+
+================================================================================
+S3 PROFILE (--profile s3 / --profile all)
+================================================================================
+weka s3 cluster -v -J
+weka s3 cluster status -J
+weka s3 bucket list -v -J
+weka s3 policy list -J
+weka s3 service-account list -J
+weka s3 cluster containers list -J
+weka stats --category ops_s3 --stat TOTAL_BUCKET_CREATE_OPS
+weka stats --category ops_s3 --stat TOTAL_BUCKET_DELETE_OPS
+weka stats --category ops_s3 --stat TOTAL_BUCKET_LIST_OPS
+grep "" /sys/fs/cgroup/memory/weka-s3/memory.{limit,usage}_in_bytes   [per-node]
+netstat -tuln | grep 9001                                              [per-node]
+
+================================================================================
+SMB/W PROFILE (--profile smbw / --profile all)
+================================================================================
+weka smb cluster -J
+weka smb cluster status -J
+weka smb domain -J
+weka smb share -J
+weka debug config show sambaClusterInfo -J
+weka local exec --container smbw pcs cluster status     [per-node]
+weka local exec --container smbw pcs status             [per-node]
+weka local exec --container smbw pcs status resources   [per-node]
+weka local exec --container smbw pcs constraint         [per-node]
+cat /etc/sssd/sssd.conf                                 [per-node]
+weka local exec -C smbw cat /tmp/smbw-config-fs/.smbw/tsmb.conf   [per-node]
+weka local exec -C smbw /usr/local/bin/tsmb-server -v              [per-node]
+
+================================================================================
+LOG FILES (time-window filtered where rotated)
+================================================================================
+/var/log/messages, /var/log/messages-*
+/var/log/secure, /var/log/secure-*
+/var/log/cron, /var/log/cron-*
+/var/log/syslog, /var/log/syslog.*
+/var/log/kern.log, /var/log/kern.log.*
+/var/log/boot.log, /var/log/boot.log-*
+/var/log/dmesg, /var/log/dmesg.*
+/var/log/cloud-init.log, /var/log/cloud-init-output.log
+/var/log/audit/audit.log, /var/log/audit/audit.log.*
+/var/log/dnf.log, /var/log/dnf.log-*
+/var/log/yum.log, /var/log/yum.log-*
+/etc/sysctl.conf, /etc/sysctl.d/*.conf, /usr/lib/sysctl.d/*.conf
+/etc/kdump.conf, /etc/default/kdump-tools
+/opt/weka/logs/<container>/syslog.log*
+/opt/weka/logs/<container>/weka/output.log*
+/opt/weka/logs/<container>/weka/shelld.log*
+/opt/weka/logs/<container>/weka/atop.stats*
+/opt/weka/logs/<container>/weka/events.log
+/opt/weka/logs/<container>/upgrade*.log
+journalctl -u weka* (time-windowed to collection --start-time)
