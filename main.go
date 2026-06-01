@@ -1402,7 +1402,7 @@ var systemCommands = []CommandSpec{
 	{Name: "ip_route_json", Cmd: "ip -4 --json route", JSON: true},
 	// ── cgroup state ──────────────────────────────────────────────────────────
 	{Name: "cgroup_type", Cmd: "stat -fc %T /sys/fs/cgroup", NodeOptional: true},
-	{Name: "cgroup_cpuset", Cmd: "grep \"\" /sys/fs/cgroup/weka-*/cpuset.cpus.effective 2>/dev/null", NodeOptional: true},
+	{Name: "cgroup_cpuset", Cmd: "grep \"\" /sys/fs/cgroup/weka-*/cpuset.cpus.effective /sys/fs/cgroup/cpuset/weka-*/cpuset.cpus 2>/dev/null", NodeOptional: true},
 	// ── software RAID ─────────────────────────────────────────────────────────
 	{Name: "mdstat", Cmd: "cat /proc/mdstat", NodeOptional: true},
 	{Name: "mdadm_detail", Cmd: `for md in /dev/md*; do [ -b "$md" ] || continue; echo "=== $md ==="; mdadm --detail --test "$md" 2>&1; done`, NodeOptional: true},
