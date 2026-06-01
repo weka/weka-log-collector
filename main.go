@@ -2903,7 +2903,13 @@ func acquireRunLock(force bool) error {
 	}
 	_ = os.MkdirAll(wlcBaseDir, 0755)
 	content := fmt.Sprintf("%d\n%s\n", os.Getpid(), time.Now().Format(time.RFC3339))
-	return os.WriteFile(wlcRunLock, []byte(content), 0666)
+	if err := os.WriteFile(wlcRunLock, []byte(content), 0666); err != nil {
+		// Lock is a safety net, not a hard requirement. If we can't write it
+		// (e.g. stale file owned by another user, restricted /tmp), warn and
+		// continue — the collection still works, just without concurrency protection.
+		warnf("Cannot write run lock %s: %v — skipping lock (concurrent runs not protected)", wlcRunLock, err)
+	}
+	return nil
 }
 
 // releaseRunLock removes the lock file. Safe to call when no lock was acquired
