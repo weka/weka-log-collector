@@ -2317,6 +2317,11 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// client), then collect resources for each.
 	// weka local ps/resources talk to the local agent only — run regardless of
 	// cluster auth availability.
+	//
+	// activeContainerDirs is populated here and re-used in the log-file phase
+	// to skip stale /opt/weka/logs/<old-container>/ directories that remain on
+	// disk after a container is removed or renamed.
+	activeContainerDirs := map[string]bool{}
 	{
 		var localPSOut []byte
 		for i, spec := range wekaToRun {
@@ -2330,6 +2335,9 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		}
 		if len(localPSOut) > 0 {
 			_ = json.Unmarshal(localPSOut, &containers)
+		}
+		for _, c := range containers {
+			activeContainerDirs[c.Name] = true
 		}
 
 		// addLocalCmd runs a single node-local command and appends it to the archive.
@@ -2464,21 +2472,34 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				vlogf("[%s] skip duplicate %s", hostname, srcPath)
 				continue
 			}
-			// When --container-name is set, restrict /opt/weka/logs/ collection
-			// to only the named container directories; all other paths are unaffected.
-			if len(containerNames) > 0 && strings.HasPrefix(srcPath, "/opt/weka/logs/") {
+			// For /opt/weka/logs/<container>/... paths, restrict collection to
+			// containers that are either explicitly requested (--container-name) or
+			// currently registered with the weka local agent (weka local ps).
+			// This prevents collecting stale log dirs from removed containers.
+			// Top-level files like /opt/weka/logs/quota.json are not filtered.
+			if strings.HasPrefix(srcPath, "/opt/weka/logs/") {
 				rest := srcPath[len("/opt/weka/logs/"):]
-				containerDir := strings.SplitN(rest, "/", 2)[0]
-				allowed := false
-				for _, name := range containerNames {
-					if containerDir == name {
-						allowed = true
-						break
+				parts := strings.SplitN(rest, "/", 2)
+				if len(parts) == 2 { // has a container directory component
+					containerDir := parts[0]
+					if len(containerNames) > 0 {
+						// --container-name flag takes precedence over discovery
+						allowed := false
+						for _, name := range containerNames {
+							if containerDir == name {
+								allowed = true
+								break
+							}
+						}
+						if !allowed {
+							vlogf("[%s] skipping container log (not in scope): %s", hostname, srcPath)
+							continue
+						}
+					} else if len(activeContainerDirs) > 0 && !activeContainerDirs[containerDir] {
+						// Filter by active containers from weka local ps
+						vlogf("[%s] skipping stale container log dir %q: %s", hostname, containerDir, srcPath)
+						continue
 					}
-				}
-				if !allowed {
-					vlogf("[%s] skipping container log (not in scope): %s", hostname, srcPath)
-					continue
 				}
 			}
 			seenSrcPaths[srcPath] = true
