@@ -1081,22 +1081,50 @@ func buildWindowedDefaultCmds(from, to time.Time) []CommandSpec {
 // buildPerfCommands returns the perf-profile command list, translating the
 // --start-time/--end-time window into weka stats --start-time/--end-time flags.
 func buildPerfCommands(from, to time.Time) []CommandSpec {
-	// Two collection modes depending on whether the user gave an explicit time window:
+	// Three collection modes based on window length:
 	//
 	// No explicit --start-time (from.IsZero):
-	//   Collect cluster-averaged stats for the last 4h. No --per-process or --per-role.
-	//   Rationale: weka stats without --start-time returns only ~1min of data (misleading).
-	//   --per-process over an implicit long window produces excessive data. 4h cluster
-	//   average gives a useful health overview without the noise.
+	//   Cluster-averaged stats for the last 2h.
+	//   weka stats without --start-time returns only ~1min of data (misleading),
+	//   so we supply an explicit 2h window. Cluster-average gives a quick health
+	//   snapshot without inflating data on large clusters.
 	//
-	// Explicit --start-time given:
-	//   Use the user's window with full --per-process breakdown — ideal for incident analysis.
+	// Explicit --start-time, window ≤ 30min:
+	//   --per-process breakdown. Maximum granularity for short incident windows —
+	//   one row per process per interval. Safe on large clusters because the short
+	//   window caps row count. Also includes --per-role CPU for role-level summary.
+	//
+	// Explicit --start-time, 30min < window ≤ 2h:
+	//   --per-role breakdown. Ideal for incident analysis — shows which role
+	//   (DRIVES/COMPUTE/FRONTEND) has elevated latency/CPU. ~100x lighter than
+	//   --per-process on large clusters.
+	//
+	// Explicit --start-time, window > 2h:
+	//   Cluster-average with the user's window. Per-role over multi-hour windows
+	//   produces excessive data and slow queries on large clusters; cluster-average
+	//   is sufficient for trend analysis.
 
-	explicitWindow := !from.IsZero()
+	const (
+		perProcessThreshold = 30 * time.Minute
+		perRoleThreshold    = 2 * time.Hour
+	)
 
 	effectiveFrom := from
-	if !explicitWindow {
-		effectiveFrom = time.Now().Add(-4 * time.Hour)
+	mode := "average"
+	if from.IsZero() {
+		effectiveFrom = time.Now().Add(-2 * time.Hour)
+	} else {
+		effectiveTo := to
+		if to.IsZero() {
+			effectiveTo = time.Now()
+		}
+		window := effectiveTo.Sub(from)
+		switch {
+		case window <= perProcessThreshold:
+			mode = "per-process"
+		case window <= perRoleThreshold:
+			mode = "per-role"
+		}
 	}
 
 	timeFlags := fmt.Sprintf(" --start-time %s", effectiveFrom.Format("2006-01-02T15:04:05"))
@@ -1112,15 +1140,14 @@ func buildPerfCommands(from, to time.Time) []CommandSpec {
 		}
 	}
 
-	if explicitWindow {
-		// Full per-process/per-role breakdown for incident analysis.
+	if mode == "per-process" {
+		// --per-process for very short windows (≤ 30min): one row per process per interval.
 		// Note: --stat is required in Weka 4.4+; --category alone is rejected.
-		// Category commands are expanded into individual --stat invocations.
 		return []CommandSpec{
-			// CPU
+			// CPU — per-process (fine-grained) plus per-role (role summary)
 			stats("weka_stats_cpu_per_process", " --show-internal --stat CPU_UTILIZATION --per-process"),
 			stats("weka_stats_cpu_per_role", " --show-internal --stat CPU_UTILIZATION --per-role"),
-			// SSD / drive latency (latency)
+			// SSD / drive latency
 			stats("weka_stats_ssd_read_latency", " --show-internal --stat SSD_READ_LATENCY --per-process"),
 			stats("weka_stats_ssd_write_latency", " --show-internal --stat SSD_WRITE_LATENCY --per-process"),
 			stats("weka_stats_drive_read_latency", " --show-internal --stat DRIVE_READ_LATENCY --per-process"),
@@ -1170,7 +1197,63 @@ func buildPerfCommands(from, to time.Time) []CommandSpec {
 		}
 	}
 
-	// Cluster-averaged overview for last 4h (no explicit window given).
+	if mode == "per-role" {
+		// --per-role breakdown for medium incident windows (30min < window ≤ 2h).
+		// Note: --stat is required in Weka 4.4+; --category alone is rejected.
+		return []CommandSpec{
+			// CPU
+			stats("weka_stats_cpu_per_role", " --show-internal --stat CPU_UTILIZATION --per-role"),
+			// SSD / drive latency
+			stats("weka_stats_ssd_read_latency", " --show-internal --stat SSD_READ_LATENCY --per-role"),
+			stats("weka_stats_ssd_write_latency", " --show-internal --stat SSD_WRITE_LATENCY --per-role"),
+			stats("weka_stats_drive_read_latency", " --show-internal --stat DRIVE_READ_LATENCY --per-role"),
+			stats("weka_stats_drive_write_latency", " --show-internal --stat DRIVE_WRITE_LATENCY --per-role"),
+			// SSD / drive throughput & ops
+			stats("weka_stats_ssd_read_reqs", " --show-internal --stat SSD_READ_REQS --per-role"),
+			stats("weka_stats_ssd_writes", " --show-internal --stat SSD_WRITES --per-role"),
+			stats("weka_stats_ssd_blocks_read", " --show-internal --stat SSD_BLOCKS_READ --per-role"),
+			stats("weka_stats_ssd_blocks_written", " --show-internal --stat SSD_BLOCKS_WRITTEN --per-role"),
+			stats("weka_stats_drive_read_ops", " --show-internal --stat DRIVE_READ_OPS --per-role"),
+			stats("weka_stats_drive_write_ops", " --show-internal --stat DRIVE_WRITE_OPS --per-role"),
+			stats("weka_stats_drive_load", " --show-internal --stat DRIVE_LOAD --per-role"),
+			stats("weka_stats_drive_active_ios", " --show-internal --stat DRIVE_ACTIVE_IOS --per-role"),
+			// Filesystem ops (client-facing)
+			stats("weka_stats_ops_reads", " --show-internal --category ops --stat READS --per-role"),
+			stats("weka_stats_ops_writes", " --show-internal --category ops --stat WRITES --per-role"),
+			stats("weka_stats_read_latency", " --show-internal --category ops --stat READ_LATENCY --per-role"),
+			stats("weka_stats_write_latency", " --show-internal --category ops --stat WRITE_LATENCY --per-role"),
+			stats("weka_stats_ops_read_bytes", " --show-internal --category ops --stat READ_BYTES --per-role"),
+			stats("weka_stats_ops_write_bytes", " --show-internal --category ops --stat WRITE_BYTES --per-role"),
+			stats("weka_stats_ops_count", " --show-internal --category ops --stat OPS --per-role"),
+			stats("weka_stats_ops_throughput", " --show-internal --category ops --stat THROUGHPUT --per-role"),
+			// Driver ops (kernel/DPDK layer)
+			stats("weka_stats_ops_driver_reads", " --show-internal --category ops_driver --stat READS --per-role"),
+			stats("weka_stats_ops_driver_writes", " --show-internal --category ops_driver --stat WRITES --per-role"),
+			stats("weka_stats_ops_driver_read_bytes", " --show-internal --category ops_driver --stat READ_BYTES --per-role"),
+			stats("weka_stats_ops_driver_write_bytes", " --show-internal --category ops_driver --stat WRITE_BYTES --per-role"),
+			stats("weka_stats_ops_driver_throughput", " --show-internal --category ops_driver --stat THROUGHPUT --per-role"),
+			// Network
+			stats("weka_stats_goodput_tx", " --show-internal --stat GOODPUT_TX_RATIO --per-role"),
+			stats("weka_stats_goodput_rx", " --show-internal --stat GOODPUT_RX_RATIO --per-role"),
+			stats("weka_stats_port_tx", " --show-internal --stat PORT_TX_BYTES --per-role"),
+			stats("weka_stats_port_rx", " --show-internal --stat PORT_RX_BYTES --per-role"),
+			stats("weka_stats_dropped_packets", " --show-internal --stat DROPPED_PACKETS --per-role"),
+			stats("weka_stats_corrupt_packets", " --show-internal --stat CORRUPT_PACKETS --per-role"),
+			// JRPC
+			stats("weka_stats_jrpc_processing_avg", " --show-internal --stat JRPC_SERVER_PROCESSING_AVG --per-role"),
+			stats("weka_stats_jrpc_processing_time", " --show-internal --stat JRPC_SERVER_PROCESSING_TIME --per-role"),
+			stats("weka_stats_jrpc_calls", " --show-internal --stat JRPC_SERVER_CALLS_CLIENT_SUPPORTS_QOS --per-role"),
+			// RPC
+			stats("weka_stats_rpc_client_calls", " --show-internal --stat CLIENT_RPC_CALLS --per-role"),
+			stats("weka_stats_rpc_roundtrip_avg", " --show-internal --stat CLIENT_ROUNDTRIP_AVG --per-role"),
+			stats("weka_stats_rpc_server_calls", " --show-internal --stat SERVER_RPC_CALLS --per-role"),
+			stats("weka_stats_rpc_server_processing_avg", " --show-internal --stat SERVER_PROCESSING_AVG --per-role"),
+			stats("weka_stats_rpc_timeouts", " --show-internal --stat CLIENT_RECEIVED_TIMEOUTS --per-role"),
+			{Name: "weka_stats_realtime", Cmd: "weka stats realtime -s -cpu -o node,hostname,role,mode,writeps,writebps,wlatency,readps,readbps,rlatency,ops,cpu,l6recv,l6send,upload,download", Profile: ProfilePerf},
+		}
+	}
+
+	// Cluster-average: used for default 2h rolling window AND long explicit windows (>2h).
 	// Note: --stat is required in Weka 4.4+; --category alone is rejected.
 	// Category commands are expanded into individual --stat invocations.
 	return []CommandSpec{
@@ -1858,6 +1941,20 @@ func phase(name string) {
 // speedup over sequential execution.
 const cmdWorkers = 8
 
+// clusterCmdWorkers controls parallelism for non-stats cluster-wide weka API calls
+// (weka cluster container, weka debug config show, etc.). These read cached state and
+// are safe to run at full parallelism even on large clusters.
+// Configurable via --cluster-cmd-workers.
+var clusterCmdWorkers = 8
+
+// statsWorkers is the max concurrent weka stats commands.
+// weka stats --per-process aggregates data from every process on every node; on large
+// clusters (100+ nodes) running 8 concurrent stats queries has been observed to
+// CPU-starve the management process causing it to restart (SIGKILL on all in-flight
+// CLI processes). Hard-capped at 2 — not user-configurable because there is no safe
+// reason to raise it.
+const statsWorkers = 2
+
 // cmdOutput holds the result of a single command execution.
 type cmdOutput struct {
 	result CommandResult
@@ -1886,9 +1983,11 @@ func commandFileContent(spec CommandSpec, out []byte, errStr string) []byte {
 
 // returns results in the same order as specs. It is safe to call from a single
 // goroutine; tar writes happen after this returns.
-func runCommandsParallel(specs []CommandSpec, timeout time.Duration) []cmdOutput {
+// workers controls the max concurrency; use cmdWorkers for per-node commands and
+// clusterCmdWorkers for cluster-wide API calls.
+func runCommandsParallel(specs []CommandSpec, timeout time.Duration, workers int) []cmdOutput {
 	outputs := make([]cmdOutput, len(specs))
-	sem := make(chan struct{}, cmdWorkers)
+	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	for i, spec := range specs {
 		i, spec := i, spec
@@ -2220,7 +2319,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 
 	// ── phase: system commands (parallel) ────────────────────────────────
 	phase(fmt.Sprintf("[%s] System commands (%d parallel)", hostname, cmdWorkers))
-	sysOutputs := runCommandsParallel(systemCommands, cmdTimeout)
+	sysOutputs := runCommandsParallel(systemCommands, cmdTimeout, cmdWorkers)
 	for i, spec := range systemCommands {
 		co := sysOutputs[i]
 		manifest.Commands = append(manifest.Commands, co.result)
@@ -2280,7 +2379,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	if wekaAvailable {
 		logf("  [%s] running %d weka commands", hostname, len(wekaToRun))
 	}
-	wekaOutputs := runCommandsParallel(wekaToRun, cmdTimeout)
+	wekaOutputs := runCommandsParallel(wekaToRun, cmdTimeout, cmdWorkers)
 	for i, spec := range wekaToRun {
 		co := wekaOutputs[i]
 		manifest.Commands = append(manifest.Commands, co.result)
@@ -2524,7 +2623,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	if !nodeOnly && len(extraCmds) > 0 {
 		hostRoot := filepath.Join(archiveRoot, "hosts", pathHostname)
 		phase(fmt.Sprintf("[%s] Extra commands (%d)", hostname, len(extraCmds)))
-		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
+		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout, cmdWorkers)
 		for i, spec := range extraCmds {
 			co := extraOutputs[i]
 			manifest.Commands = append(manifest.Commands, co.result)
@@ -5108,6 +5207,7 @@ func main() {
 		nodeOnly        = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
 		upload          = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
 		cmdTimeout      = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
+		clusterWorkers  = flag.Int("cluster-cmd-workers", 8, "Max parallel non-stats cluster-wide commands (weka stats are always capped at 2 regardless)")
 		extraCommands   = flag.Bool("extra-commands", false, fmt.Sprintf("Run extra commands from %s and include output in the archive", extraCommandsFile))
 		ver             = flag.Bool("version", false, "Print version and exit")
 		completion      = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
@@ -5146,6 +5246,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: unknown --compression %q (valid: gzip, xz)\n", *compression)
 		os.Exit(1)
 	}
+
+	if *clusterWorkers < 1 || *clusterWorkers > 16 {
+		fmt.Fprintf(os.Stderr, "error: --cluster-cmd-workers must be between 1 and 16\n")
+		os.Exit(1)
+	}
+	clusterCmdWorkers = *clusterWorkers
 
 	if *ver {
 		fmt.Printf("weka-log-collector %s\n", version)
@@ -5503,6 +5609,14 @@ func main() {
 		}
 	} else {
 		logf("Collecting from %d specified host(s): %s", len(clusterHosts), strings.Join(clusterHosts, ", "))
+	}
+
+	// Inform the user about stats throttling on large clusters so the slower stats
+	// phase doesn't look like a hang.
+	if len(clusterHosts) >= 50 && profileEnabled(*profileStr, ProfilePerf) {
+		logf("  [cluster] large cluster (%d nodes) with perf profile: weka stats will run %d at a time "+
+			"to protect the management plane (non-stats commands run at full speed).",
+			len(clusterHosts), statsWorkers)
 	}
 
 	// Resolve the running binary path for self-deploy to remote hosts.
@@ -5994,10 +6108,42 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	// ── run cluster-wide weka commands once on the orchestrator ───────────
 	// These commands produce identical output on every node; running them once
 	// avoids duplicating the same files N times (once per cluster host).
+	// weka stats commands are split out and run at statsWorkers concurrency
+	// (hard cap of 2) because they aggregate data from every process on every
+	// node — running many in parallel CPU-starves the management process on
+	// large clusters. Non-stats commands run at full clusterCmdWorkers speed.
 	clusterCmds := buildClusterWideCmds(profile, from, to)
-	phase(fmt.Sprintf("Cluster-wide Weka commands (run once, %d parallel)", cmdWorkers))
-	logf("  [cluster] running %d cluster-wide commands", len(clusterCmds))
-	clusterOutputs := runCommandsParallel(clusterCmds, cmdTimeout)
+
+	var nonStatsCmds, wekStatsCmds []CommandSpec
+	var nonStatsIdx, statsIdx []int
+	for i, spec := range clusterCmds {
+		if strings.HasPrefix(spec.Cmd, "weka stats") {
+			wekStatsCmds = append(wekStatsCmds, spec)
+			statsIdx = append(statsIdx, i)
+		} else {
+			nonStatsCmds = append(nonStatsCmds, spec)
+			nonStatsIdx = append(nonStatsIdx, i)
+		}
+	}
+
+	clusterOutputs := make([]cmdOutput, len(clusterCmds))
+
+	if len(nonStatsCmds) > 0 {
+		phase(fmt.Sprintf("Cluster-wide Weka commands (%d commands, %d parallel)", len(nonStatsCmds), clusterCmdWorkers))
+		logf("  [cluster] running %d cluster-wide commands", len(nonStatsCmds))
+		outs := runCommandsParallel(nonStatsCmds, cmdTimeout, clusterCmdWorkers)
+		for i, idx := range nonStatsIdx {
+			clusterOutputs[idx] = outs[i]
+		}
+	}
+	if len(wekStatsCmds) > 0 {
+		phase(fmt.Sprintf("Cluster-wide Weka stats (%d commands, %d parallel — management-plane safe)", len(wekStatsCmds), statsWorkers))
+		logf("  [cluster] running %d weka stats commands", len(wekStatsCmds))
+		outs := runCommandsParallel(wekStatsCmds, cmdTimeout, statsWorkers)
+		for i, idx := range statsIdx {
+			clusterOutputs[idx] = outs[i]
+		}
+	}
 	for i, spec := range clusterCmds {
 		co := clusterOutputs[i]
 		if co.result.Error != "" {
@@ -6025,7 +6171,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	// ── run extra commands on the orchestrator ────────────────────────────
 	if len(extraCmds) > 0 {
 		phase(fmt.Sprintf("Extra commands (%d)", len(extraCmds)))
-		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout)
+		extraOutputs := runCommandsParallel(extraCmds, cmdTimeout, clusterCmdWorkers)
 		for i, spec := range extraCmds {
 			co := extraOutputs[i]
 			if co.result.Error != "" {
