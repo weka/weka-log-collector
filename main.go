@@ -1020,8 +1020,37 @@ var defaultCommands = []CommandSpec{
 	// weka local resources collected dynamically per container in CollectLocal
 	// ── events, config dump, network peers (merged from former "full" profile) ──
 	{Name: "weka_events_major", Cmd: "weka events --severity major -J", JSON: true},
+	{Name: "weka_events_leader_too_slow", Cmd: "weka events --type-list LeaderIterationTooSlow --show-internal --no-header --start-time -1d"},
 	{Name: "weka_debug_net_peers", Cmd: "weka debug net peers 1 -J", JSON: true},
 	{Name: "weka_cfgdump", Cmd: "weka local exec -C drives0 -- /weka/cfgdump"}, // raw exec, no -J
+	// ── version detail ────────────────────────────────────────────────────────
+	{Name: "weka_version_current", Cmd: "weka version current"},
+	// ── container / host detail ───────────────────────────────────────────────
+	{Name: "weka_container_releases", Cmd: "weka cluster container --output release --no-header"},
+	{Name: "weka_client_target_version", Cmd: "weka cluster client-target-version show"},
+	{Name: "weka_cluster_leader", Cmd: "weka cluster host --leader --no-header --output id"},
+	{Name: "weka_container_resources_summary", Cmd: "weka cluster container -b -o container,cores,memory --no-header"},
+	{Name: "weka_container_uuids", Cmd: "weka cluster container --output ips,machineIdentifier,hostname --no-header"},
+	// ── process / drive / bucket metrics ─────────────────────────────────────
+	{Name: "weka_compute_ram", Cmd: "weka cluster process -F role=COMPUTE --output memory --no-header --raw-units"},
+	{Name: "weka_drive_sizes", Cmd: "weka cluster drive --output size --sort size --raw-units --no-header"},
+	{Name: "weka_drive_block_sizes", Cmd: "weka cluster drive --output block --no-header"},
+	{Name: "weka_bucket_fill_levels", Cmd: "weka cluster bucket -o fillLevel --no-header"},
+	{Name: "weka_bucket_uptime", Cmd: "weka cluster bucket --json -s -uptime", JSON: true},
+	{Name: "weka_process_uptime", Cmd: "weka cluster process --json -s -uptime", JSON: true},
+	// ── filesystem detail ─────────────────────────────────────────────────────
+	{Name: "weka_fs_detailed", Cmd: "weka fs -o name,usedSSD,availableSSD,stores --no-header -R"},
+	// ── debug config snapshots ────────────────────────────────────────────────
+	{Name: "weka_obs_scarce_mode", Cmd: `weka debug config show "obsBuckets[*]._scarceMode"`},
+	{Name: "weka_debug_snapviews", Cmd: "weka debug config show snapViews -J", JSON: true},
+	{Name: "weka_debug_override_keys", Cmd: "weka debug override list-keys --output key,defaultValue"},
+	// ── floating IPs ──────────────────────────────────────────────────────────
+	{Name: "weka_floating_ips_cluster", Cmd: `weka debug manhole get_aggregated_cluster_status table_names="floatingIps"`},
+	// ── diagnostic stats (fixed windows — snapshot of current cluster health) ──
+	{Name: "weka_stats_drive_read_ratio", Cmd: "weka stats --show-internal --stat DRIVE_READ_RATIO_PER_SSD_READ --start-time -1h"},
+	{Name: "weka_stats_rdma_errors", Cmd: "weka stats --show-internal --stat RDMA_NET_ERR_RETRY_EXCEEDED,RDMA_BINDING_FAILOVERS,RDMA_SERVER_BINDING_RESTARTS,RDMA_COMP_FAILURES,RDMA_WAIT_TIMEOUT --start-time -10m -Z --no-header"},
+	{Name: "weka_stats_outliers", Cmd: "weka stats --show-internal --stat PUMPS_TXQ_FULL,BAD_RECV_CSUM,CORRUPT_PACKETS,RDMA_COMP_STATUSES --per-process --interval 600"},
+	{Name: "weka_stats_obs_errors", Cmd: "weka stats --category object_storage --stat RESPONSE_COUNT_BAD_GATEWAY,RESPONSE_COUNT_GATEWAY_TIMEOUT,RESPONSE_COUNT_HTTP_VERSION_NOT_SUPPORTED,RESPONSE_COUNT_NOT_IMPLEMENTED,RESPONSE_COUNT_SERVER_ERROR,RESPONSE_COUNT_SERVICE_UNAVAILABLE --start-time -30m -Z --per-process"},
 }
 
 // buildPerfCommands returns the perf-profile command list, translating the
@@ -1182,6 +1211,10 @@ var nfsCommands = []CommandSpec{
 	{Name: "showmount", Cmd: "showmount -e", Profile: ProfileNFS, NodeLocal: true},
 	{Name: "weka_local_resources_ganesha", Cmd: "weka local resources -C ganesha -J", Profile: ProfileNFS, NodeLocal: true, JSON: true},
 	{Name: "nfs_ganesha_queue", Cmd: "weka local exec --container ganesha cat /proc/wekafs/frontend0/queue", Profile: ProfileNFS, NodeLocal: true},
+	{Name: "nfs_ganesha_fds", Cmd: "weka local exec -C ganesha -- dbus-send --print-reply --system --dest=org.ganesha.nfsd /org/ganesha/nfsd/ExportMgr org.ganesha.nfsd.exportstats.ShowCacheInode", Profile: ProfileNFS, NodeLocal: true},
+	{Name: "weka_nfs_max_fds", Cmd: "weka debug config show nfsGaneshaConfig.maxOpenFDs", Profile: ProfileNFS},
+	{Name: "weka_nfs_custom_global_options", Cmd: "weka debug config show nfsGaneshaConfig.customGlobalOptions", Profile: ProfileNFS},
+	{Name: "weka_nfs_ig_assignment", Cmd: "weka nfs interface-group assignment", Profile: ProfileNFS},
 	// ops_nfsw: --stat is required in Weka 4.4+; collect the most diagnostic NFS stats.
 	{Name: "weka_stats_nfsw_read_ops", Cmd: "weka stats --category ops_nfsw --stat READ_OPS --per-node", Profile: ProfileNFS},
 	{Name: "weka_stats_nfsw_read_latency", Cmd: "weka stats --category ops_nfsw --stat READ_LATENCY --per-node", Profile: ProfileNFS},
@@ -1233,6 +1266,8 @@ var smbwCommands = []CommandSpec{
 	{Name: "pcs_status_resources", Cmd: "weka local exec --container smbw /usr/sbin/pcs status resources", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "pcs_constraint", Cmd: "weka local exec --container smbw /usr/sbin/pcs constraint", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "sssd_conf", Cmd: "cat /etc/sssd/sssd.conf", Profile: ProfileSMBW, NodeLocal: true},
+	{Name: "tsmb_conf", Cmd: "weka local exec -C smbw cat /tmp/smbw-config-fs/.smbw/tsmb.conf", Profile: ProfileSMBW, NodeLocal: true},
+	{Name: "tsmb_version", Cmd: "weka local exec -C smbw /usr/local/bin/tsmb-server -v", Profile: ProfileSMBW, NodeLocal: true},
 }
 
 // systemCommands run directly on the OS (not via weka CLI).
@@ -2271,23 +2306,66 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 		if len(localPSOut) > 0 {
 			_ = json.Unmarshal(localPSOut, &containers)
 		}
+
+		// addLocalCmd runs a single node-local command and appends it to the archive.
+		addLocalCmd := func(spec CommandSpec, ext string) {
+			result, out := runCommand(spec, cmdTimeout)
+			manifest.Commands = append(manifest.Commands, result)
+			if result.Error != "" {
+				vlogf("[%s] %s failed: %s", hostname, spec.Name, result.Error)
+			}
+			content := commandFileContent(spec, out, result.Error)
+			dest := filepath.Join(hostRoot, "weka", spec.Name+ext)
+			if err := addBytesToArchive(tw, dest, content); err != nil {
+				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
+			}
+		}
+
+		// protocol containers that may have wekafs mounts
+		protocolContainers := map[string]bool{"ganesha": true, "smbw": true, "s3": true, "envoy": true}
+
 		for _, c := range containers {
 			name := c.Name
-			spec := CommandSpec{
+
+			// base resources (existing)
+			addLocalCmd(CommandSpec{
 				Name:      "weka_local_resources_" + name,
 				Cmd:       "weka local resources -C " + name + " -J",
 				NodeLocal: true,
 				JSON:      true,
-			}
-			result, out := runCommand(spec, cmdTimeout)
-			manifest.Commands = append(manifest.Commands, result)
-			if result.Error != "" {
-				warnf("[%s] weka local resources -C %s failed: %s", hostname, name, result.Error)
-			}
-			content := commandFileContent(spec, out, result.Error)
-			dest := filepath.Join(hostRoot, "weka", spec.Name+".json")
-			if err := addBytesToArchive(tw, dest, content); err != nil {
-				warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
+			}, ".json")
+
+			// net --stable -J: per-container network device details with gateway,
+			// PCI ID — used by 7 TA scripts for SBR, MTU, bonding, IB analysis.
+			addLocalCmd(CommandSpec{
+				Name:      "weka_local_resources_net_" + name,
+				Cmd:       "weka local resources -C " + name + " net --stable -J",
+				NodeLocal: true,
+				JSON:      true,
+			}, ".json")
+
+			// --stable (text): container resource config — detects auto-core allocation.
+			addLocalCmd(CommandSpec{
+				Name:      "weka_local_resources_stable_" + name,
+				Cmd:       "weka local resources -C " + name + " --stable",
+				NodeLocal: true,
+			}, ".txt")
+
+			// --stable -J: JSON form used by cgroup validation checks.
+			addLocalCmd(CommandSpec{
+				Name:      "weka_local_resources_stable_" + name,
+				Cmd:       "weka local resources -C " + name + " --stable -J",
+				NodeLocal: true,
+				JSON:      true,
+			}, ".json")
+
+			// protocol container mounts: detects writecache usage on protocol containers.
+			if protocolContainers[name] {
+				addLocalCmd(CommandSpec{
+					Name:      "weka_protocol_mounts_" + name,
+					Cmd:       "weka local exec --container " + name + " mount -t wekafs",
+					NodeLocal: true,
+				}, ".txt")
 			}
 		}
 	}
