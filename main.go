@@ -2512,7 +2512,15 @@ const deployWorkers = 20
 // Errors are collected and printed as a grouped summary after all attempts
 // complete, deduplicating identical messages to avoid repeating the same
 // error N times when all hosts share the same root cause.
+//
+// If all hosts reject the current SSH user with a "Please login as user X"
+// message (common on OCI/EC2 where root SSH is blocked), deployAll
+// automatically retries once with the suggested user.
 func deployAll(hosts []string, displayNames map[string]string, selfPath string) []string {
+	return deployAllInner(hosts, displayNames, selfPath, false)
+}
+
+func deployAllInner(hosts []string, displayNames map[string]string, selfPath string, isRetry bool) []string {
 	type deployErr struct {
 		display string
 		msg     string
@@ -2547,37 +2555,51 @@ func deployAll(hosts []string, displayNames map[string]string, selfPath string) 
 	}
 	wg.Wait()
 
+	if len(failures) == 0 {
+		return succeeded
+	}
+
+	// Check whether all failures are SSH user rejections pointing to the same user.
+	loginHintRe := regexp.MustCompile(`(?i)please login as the user "([^"]+)"`)
+	suggestedUsers := map[string]struct{}{}
+	for _, f := range failures {
+		if m := loginHintRe.FindStringSubmatch(f.msg); m != nil {
+			suggestedUsers[m[1]] = struct{}{}
+		}
+	}
+
+	// Auto-retry: if every failure is a user-rejection pointing to one user,
+	// switch to that user and try again — no manual --ssh-user flag needed.
+	if !isRetry && len(suggestedUsers) == 1 && len(succeeded) == 0 {
+		var autoUser string
+		for u := range suggestedUsers {
+			autoUser = u
+		}
+		warnf("SSH rejected '%s' on all hosts — retrying as '%s' (sudo will be used for privileged ops)", sshUser(), autoUser)
+		sshUserOverride = autoUser
+		return deployAllInner(hosts, displayNames, selfPath, true)
+	}
+
 	// Group failures by error message so N identical errors print as one line.
-	if len(failures) > 0 {
-		byMsg := make(map[string][]string)
-		var msgOrder []string
-		for _, f := range failures {
-			if _, seen := byMsg[f.msg]; !seen {
-				msgOrder = append(msgOrder, f.msg)
-			}
-			byMsg[f.msg] = append(byMsg[f.msg], f.display)
+	byMsg := make(map[string][]string)
+	var msgOrder []string
+	for _, f := range failures {
+		if _, seen := byMsg[f.msg]; !seen {
+			msgOrder = append(msgOrder, f.msg)
 		}
-		for _, msg := range msgOrder {
-			displays := byMsg[msg]
-			errorf("  Deploy failed on %d host(s): %s\n    %s", len(displays), msg, strings.Join(displays, ", "))
+		byMsg[f.msg] = append(byMsg[f.msg], f.display)
+	}
+	for _, msg := range msgOrder {
+		displays := byMsg[msg]
+		errorf("  Deploy failed on %d host(s): %s\n    %s", len(displays), msg, strings.Join(displays, ", "))
+	}
+	if len(suggestedUsers) > 0 {
+		users := make([]string, 0, len(suggestedUsers))
+		for u := range suggestedUsers {
+			users = append(users, u)
 		}
-		// If SSH rejected us with a "Please login as the user X" message, surface
-		// a single actionable hint rather than burying it in per-host errors.
-		loginHintRe := regexp.MustCompile(`(?i)please login as the user "([^"]+)"`)
-		suggestedUsers := map[string]struct{}{}
-		for _, f := range failures {
-			if m := loginHintRe.FindStringSubmatch(f.msg); m != nil {
-				suggestedUsers[m[1]] = struct{}{}
-			}
-		}
-		if len(suggestedUsers) > 0 {
-			users := make([]string, 0, len(suggestedUsers))
-			for u := range suggestedUsers {
-				users = append(users, u)
-			}
-			sort.Strings(users)
-			warnf("SSH user rejected — re-run with: --ssh-user %s", strings.Join(users, " or "))
-		}
+		sort.Strings(users)
+		warnf("SSH user rejected — re-run with: --ssh-user %s", strings.Join(users, " or "))
 	}
 	return succeeded
 }
