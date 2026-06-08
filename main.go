@@ -2298,10 +2298,10 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 // procFDs holds open-FD count, type breakdown, and the per-process limits.
 type procFDs struct {
 	Total     int    `json:"total"`
-	Files     int    `json:"files"`   // regular file paths
-	Sockets   int    `json:"sockets"` // socket:[]
-	Pipes     int    `json:"pipes"`   // pipe:[]
-	Other     int    `json:"other"`   // anon_inode:[eventfd], etc.
+	Files     int    `json:"files"`      // regular file paths
+	Sockets   int    `json:"sockets"`    // socket:[]
+	Pipes     int    `json:"pipes"`      // pipe:[]
+	Other     int    `json:"other"`      // anon_inode:[eventfd], etc.
 	LimitSoft string `json:"limit_soft"` // "unlimited" or integer string
 	LimitHard string `json:"limit_hard"`
 	Error     string `json:"error,omitempty"` // set if /proc/PID/fd unreadable
@@ -2350,8 +2350,8 @@ type procSnap struct {
 	Threads     int               `json:"threads"` // total thread count (nlwp)
 	CPUPct      float64           `json:"cpu_pct"` // lifetime average
 	MEMPct      float64           `json:"mem_pct"`
-	Comm        string            `json:"comm"`    // short name from /proc/PID/status
-	Cmdline     string            `json:"cmdline"` // full argv; "[comm]" for kernel threads
+	Comm        string            `json:"comm"`         // short name from /proc/PID/status
+	Cmdline     string            `json:"cmdline"`      // full argv; "[comm]" for kernel threads
 	StartTime   string            `json:"start_time"`   // RFC3339 UTC
 	ElapsedSecs int64             `json:"elapsed_secs"` // seconds since start
 	CPUAffinity string            `json:"cpu_affinity"` // e.g. "0-3,8-11"
