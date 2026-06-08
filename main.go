@@ -2284,6 +2284,386 @@ func addBytesToArchive(tw *tar.Writer, name string, data []byte) error {
 	return err
 }
 
+// ── process snapshot ─────────────────────────────────────────────────────────
+//
+// collectProcessSnapshot reads /proc/<pid>/* for every visible process and
+// writes hosts/<hostname>/system/process_snapshot.json. It captures data that
+// ps cannot supply: FD type breakdown, resource limits (open-file and memlock),
+// OOM score/adj, voluntary and involuntary context switches, per-process I/O
+// accounting, all 7 namespace IDs, and CPU affinity.
+//
+// CPU% is the lifetime average (total CPU ticks / elapsed seconds) — a single
+// snapshot cannot produce an instantaneous figure without two samples.
+
+// procFDs holds open-FD count, type breakdown, and the per-process limits.
+type procFDs struct {
+	Total     int    `json:"total"`
+	Files     int    `json:"files"`      // regular file paths
+	Sockets   int    `json:"sockets"`    // socket:[]
+	Pipes     int    `json:"pipes"`      // pipe:[]
+	Other     int    `json:"other"`      // anon_inode:[eventfd], etc.
+	LimitSoft string `json:"limit_soft"` // "unlimited" or integer string
+	LimitHard string `json:"limit_hard"`
+	Error     string `json:"error,omitempty"` // set if /proc/PID/fd unreadable
+}
+
+// procMemory holds resident, virtual, peak, locked memory, and memlock limits.
+type procMemory struct {
+	RSSKB       int64  `json:"rss_kb"`
+	VSZKB       int64  `json:"vsz_kb"`
+	PeakVSZKB   int64  `json:"peak_vsz_kb"`
+	LockedKB    int64  `json:"locked_kb"`
+	MemlockSoft string `json:"memlock_limit_soft"` // "unlimited" or bytes string
+	MemlockHard string `json:"memlock_limit_hard"`
+}
+
+// procOOM holds the kernel OOM score and the user-configurable adj value.
+type procOOM struct {
+	Score int `json:"score"`
+	Adj   int `json:"adj"`
+}
+
+// procCtx holds voluntary and involuntary context-switch counts.
+type procCtx struct {
+	Voluntary   int64 `json:"voluntary"`
+	Involuntary int64 `json:"involuntary"`
+}
+
+// procIO holds per-process I/O accounting from /proc/PID/io.
+type procIO struct {
+	RChar               int64 `json:"rchar"`
+	WChar               int64 `json:"wchar"`
+	SyscR               int64 `json:"syscr"`
+	SyscW               int64 `json:"syscw"`
+	ReadBytes           int64 `json:"read_bytes"`
+	WriteBytes          int64 `json:"write_bytes"`
+	CancelledWriteBytes int64 `json:"cancelled_write_bytes"`
+}
+
+// procSnap is one entry in the process snapshot JSON array.
+type procSnap struct {
+	PID         int               `json:"pid"`
+	PPID        int               `json:"ppid"`
+	User        string            `json:"user"`
+	UID         int               `json:"uid"`
+	State       string            `json:"state"`   // R/S/D/Z/T/…
+	Threads     int               `json:"threads"` // total thread count (nlwp)
+	CPUPct      float64           `json:"cpu_pct"` // lifetime average
+	MEMPct      float64           `json:"mem_pct"`
+	Comm        string            `json:"comm"`         // short name from /proc/PID/status
+	Cmdline     string            `json:"cmdline"`      // full argv; "[comm]" for kernel threads
+	StartTime   string            `json:"start_time"`   // RFC3339 UTC
+	ElapsedSecs int64             `json:"elapsed_secs"` // seconds since start
+	CPUAffinity string            `json:"cpu_affinity"` // e.g. "0-3,8-11"
+	Namespaces  map[string]string `json:"namespaces"`   // ns-type → "type:[inode]"
+	FDs         procFDs           `json:"fds"`
+	Memory      procMemory        `json:"memory"`
+	OOM         procOOM           `json:"oom"`
+	CtxSwitches procCtx           `json:"context_switches"`
+	IO          procIO            `json:"io"`
+}
+
+// procKBField parses a /proc/PID/status value like "12345 kB" → int64.
+func procKBField(v string) int64 {
+	fields := strings.Fields(v)
+	if len(fields) == 0 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(fields[0], 10, 64)
+	return n
+}
+
+// scanProcFDs counts and classifies open file descriptors by reading the
+// symlinks under /proc/PID/fd/.
+func scanProcFDs(fdDir string) procFDs {
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return procFDs{Error: err.Error()}
+	}
+	fds := procFDs{Total: len(entries)}
+	for _, e := range entries {
+		target, err := os.Readlink(filepath.Join(fdDir, e.Name()))
+		if err != nil {
+			fds.Other++
+			continue
+		}
+		switch {
+		case strings.HasPrefix(target, "socket:"):
+			fds.Sockets++
+		case strings.HasPrefix(target, "pipe:"):
+			fds.Pipes++
+		case strings.HasPrefix(target, "/"):
+			fds.Files++
+		default:
+			fds.Other++ // anon_inode:[eventfd], memfd:, etc.
+		}
+	}
+	return fds
+}
+
+// parseProcLimits extracts "Max open files" and "Max locked memory" limits
+// from /proc/PID/limits and writes them into snap.
+func parseProcLimits(data []byte, snap *procSnap) {
+	for _, line := range strings.Split(string(data), "\n") {
+		// Limits file columns: <Name tokens…> <Soft> <Hard> [<Units>]
+		// "Max open files            65536   65536   files"  → 3 name tokens
+		// "Max locked memory         unlimited unlimited bytes" → 3 name tokens
+		fields := strings.Fields(line)
+		switch {
+		case strings.HasPrefix(line, "Max open files") && len(fields) >= 5:
+			snap.FDs.LimitSoft = fields[3]
+			snap.FDs.LimitHard = fields[4]
+		case strings.HasPrefix(line, "Max locked memory") && len(fields) >= 5:
+			snap.Memory.MemlockSoft = fields[3]
+			snap.Memory.MemlockHard = fields[4]
+		}
+	}
+}
+
+// scanProcNamespaces reads /proc/PID/ns/ symlinks and returns a map of
+// namespace type → "type:[inode]" (e.g. "net:[4026531992]").
+func scanProcNamespaces(nsDir string) map[string]string {
+	entries, err := os.ReadDir(nsDir)
+	if err != nil {
+		return nil
+	}
+	ns := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if target, err := os.Readlink(filepath.Join(nsDir, e.Name())); err == nil {
+			ns[e.Name()] = target
+		}
+	}
+	return ns
+}
+
+// collectProcessSnapshot reads /proc for every PID and writes a rich JSON
+// snapshot to hosts/<hostname>/system/process_snapshot.json.
+func collectProcessSnapshot(tw *tar.Writer, hostRoot string) {
+	// ── system-wide constants needed for calculations ─────────────────────
+
+	var uptimeSecs float64
+	var bootTimeUnix int64
+
+	if data, err := os.ReadFile("/proc/uptime"); err == nil {
+		if fields := strings.Fields(string(data)); len(fields) > 0 {
+			uptimeSecs, _ = strconv.ParseFloat(fields[0], 64)
+		}
+	}
+	if data, err := os.ReadFile("/proc/stat"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "btime ") {
+				if fields := strings.Fields(line); len(fields) >= 2 {
+					bootTimeUnix, _ = strconv.ParseInt(fields[1], 10, 64)
+				}
+				break
+			}
+		}
+	}
+	var memTotalKB int64
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				if fields := strings.Fields(line); len(fields) >= 2 {
+					memTotalKB, _ = strconv.ParseInt(fields[1], 10, 64)
+				}
+				break
+			}
+		}
+	}
+
+	// USER_HZ: clock ticks per second — always 100 on Linux/amd64.
+	const clkTck float64 = 100
+
+	// UID → username cache to avoid repeated nsswitch/LDAP calls.
+	uidCache := make(map[int]string)
+	lookupUID := func(uid int) string {
+		if name, ok := uidCache[uid]; ok {
+			return name
+		}
+		name := strconv.Itoa(uid)
+		if u, err := user.LookupId(name); err == nil {
+			name = u.Username
+		}
+		uidCache[uid] = name
+		return name
+	}
+
+	// ── iterate /proc ─────────────────────────────────────────────────────
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		warnf("process_snapshot: cannot read /proc: %v", err)
+		return
+	}
+
+	var snaps []procSnap
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue // not a PID directory
+		}
+
+		base := fmt.Sprintf("/proc/%d", pid)
+		snap := procSnap{PID: pid}
+
+		// /proc/PID/status — most scalar fields live here.
+		statusData, err := os.ReadFile(base + "/status")
+		if err != nil {
+			continue // process exited between ReadDir and now
+		}
+		for _, line := range strings.Split(string(statusData), "\n") {
+			kv := strings.SplitN(line, ":", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			k, v := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+			switch k {
+			case "Name":
+				snap.Comm = v
+			case "State":
+				if len(v) > 0 {
+					snap.State = string(v[0]) // "S (sleeping)" → "S"
+				}
+			case "PPid":
+				snap.PPID, _ = strconv.Atoi(v)
+			case "Uid":
+				if fields := strings.Fields(v); len(fields) > 0 {
+					uid, _ := strconv.Atoi(fields[0])
+					snap.UID = uid
+					snap.User = lookupUID(uid)
+				}
+			case "Threads":
+				snap.Threads, _ = strconv.Atoi(v)
+			case "VmPeak":
+				snap.Memory.PeakVSZKB = procKBField(v)
+			case "VmSize":
+				snap.Memory.VSZKB = procKBField(v)
+			case "VmRSS":
+				snap.Memory.RSSKB = procKBField(v)
+			case "VmLck":
+				snap.Memory.LockedKB = procKBField(v)
+			case "voluntary_ctxt_switches":
+				snap.CtxSwitches.Voluntary, _ = strconv.ParseInt(v, 10, 64)
+			case "nonvoluntary_ctxt_switches":
+				snap.CtxSwitches.Involuntary, _ = strconv.ParseInt(v, 10, 64)
+			case "Cpus_allowed_list":
+				snap.CPUAffinity = v
+			}
+		}
+		if memTotalKB > 0 && snap.Memory.RSSKB > 0 {
+			snap.MEMPct = float64(snap.Memory.RSSKB) / float64(memTotalKB) * 100
+		}
+
+		// /proc/PID/cmdline — NUL-separated argv; empty for kernel threads.
+		if cmdData, err := os.ReadFile(base + "/cmdline"); err == nil && len(cmdData) > 0 {
+			args := strings.Split(strings.TrimRight(string(cmdData), "\x00"), "\x00")
+			var parts []string
+			for _, a := range args {
+				if a != "" {
+					parts = append(parts, a)
+				}
+			}
+			if len(parts) > 0 {
+				snap.Cmdline = strings.Join(parts, " ")
+			}
+		}
+		if snap.Cmdline == "" {
+			snap.Cmdline = "[" + snap.Comm + "]" // kernel thread
+		}
+
+		// /proc/PID/stat — starttime (field 22) and CPU ticks (fields 14+15).
+		// Skip past comm (in parens, may contain spaces/parens) by finding last ')'.
+		if statData, err := os.ReadFile(base + "/stat"); err == nil {
+			statStr := string(statData)
+			if idx := strings.LastIndex(statStr, ")"); idx >= 0 {
+				// After ')': [0]=state [1]=ppid … [11]=utime [12]=stime … [19]=starttime
+				fields := strings.Fields(statStr[idx+1:])
+				if len(fields) > 19 {
+					utime, _ := strconv.ParseInt(fields[11], 10, 64)
+					stime, _ := strconv.ParseInt(fields[12], 10, 64)
+					startTicks, _ := strconv.ParseInt(fields[19], 10, 64)
+					startSecs := float64(startTicks) / clkTck
+					if bootTimeUnix > 0 {
+						snap.StartTime = time.Unix(bootTimeUnix+int64(startSecs), 0).
+							UTC().Format(time.RFC3339)
+					}
+					if uptimeSecs > startSecs {
+						elapsed := uptimeSecs - startSecs
+						snap.ElapsedSecs = int64(elapsed)
+						snap.CPUPct = float64(utime+stime) / clkTck / elapsed * 100
+					}
+				}
+			}
+		}
+
+		// /proc/PID/fd/ — count and classify open file descriptors.
+		snap.FDs = scanProcFDs(base + "/fd")
+
+		// /proc/PID/limits — FD and memlock ceilings.
+		if limData, err := os.ReadFile(base + "/limits"); err == nil {
+			parseProcLimits(limData, &snap)
+		}
+
+		// /proc/PID/oom_score and oom_score_adj.
+		if data, err := os.ReadFile(base + "/oom_score"); err == nil {
+			snap.OOM.Score, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
+		if data, err := os.ReadFile(base + "/oom_score_adj"); err == nil {
+			snap.OOM.Adj, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
+
+		// /proc/PID/io — I/O accounting (requires root or same UID).
+		if ioData, err := os.ReadFile(base + "/io"); err == nil {
+			for _, line := range strings.Split(string(ioData), "\n") {
+				kv := strings.SplitN(line, ":", 2)
+				if len(kv) != 2 {
+					continue
+				}
+				k, v := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+				val, _ := strconv.ParseInt(v, 10, 64)
+				switch k {
+				case "rchar":
+					snap.IO.RChar = val
+				case "wchar":
+					snap.IO.WChar = val
+				case "syscr":
+					snap.IO.SyscR = val
+				case "syscw":
+					snap.IO.SyscW = val
+				case "read_bytes":
+					snap.IO.ReadBytes = val
+				case "write_bytes":
+					snap.IO.WriteBytes = val
+				case "cancelled_write_bytes":
+					snap.IO.CancelledWriteBytes = val
+				}
+			}
+		}
+
+		// /proc/PID/ns/ — namespace inode IDs (net, pid, mnt, uts, ipc, user, cgroup).
+		snap.Namespaces = scanProcNamespaces(base + "/ns")
+
+		snaps = append(snaps, snap)
+	}
+
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].PID < snaps[j].PID })
+
+	data, err := json.MarshalIndent(snaps, "", "  ")
+	if err != nil {
+		warnf("process_snapshot: marshal failed: %v", err)
+		return
+	}
+	dest := filepath.Join(hostRoot, "system", "process_snapshot.json")
+	if err := addBytesToArchive(tw, dest, data); err != nil {
+		warnf("process_snapshot: archive write failed: %v", err)
+		return
+	}
+	logf("  process_snapshot: collected %d processes", len(snaps))
+}
+
 // ── local collection ──────────────────────────────────────────────────────────
 
 // CollectLocal collects all logs and command outputs from the local host and
@@ -2340,6 +2720,10 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			warnf("[%s] could not add %s to archive: %v", hostname, spec.Name, err)
 		}
 	}
+
+	// ── phase: process snapshot ──────────────────────────────────────────
+	phase(fmt.Sprintf("[%s] Process snapshot", hostname))
+	collectProcessSnapshot(tw, hostRoot)
 
 	// ── phase: weka CLI commands (parallel) ───────────────────────────────
 	phase(fmt.Sprintf("[%s] Weka commands (profile: %s, %d parallel)", hostname, profile, cmdWorkers))
