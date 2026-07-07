@@ -79,6 +79,7 @@ Flags:
   --end-time           End of time window (default: now)
   --output             Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz). Use - for stdout.
   --host               Collect from this host by IP (repeatable; default: all cluster backends)
+  --ssh-user           SSH username for connections to cluster nodes (default: current OS user)
   --container-id       Collect from specific container IDs (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)
   --upload             Upload collected archive to Weka Home (requires 'weka cloud enable')
   --compression        Compression format: gzip|xz  (default: gzip; xz requires system xz binary, falls back to gzip if not found)
@@ -89,6 +90,7 @@ Flags:
   --clients-only       Collect from client nodes only (skip backends)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands
   --cmd-timeout        Timeout per command (default: 120s)
+  --cluster-cmd-workers  Max parallel non-stats cluster-wide weka commands, 1–16 (default: 8; weka stats are always capped at 2 regardless)
   --verbose            Print detailed progress for every file and command
   --version            Print version and exit
   --completion         Print bash completion script to stdout (also installs to /etc/bash_completion.d/)
@@ -105,8 +107,8 @@ Bundle management:
 # Local only, S3 profile, last 4 hours
 weka-log-collector --local --profile s3 --start-time -4h
 
-# Entire cluster, full profile
-weka-log-collector --profile full
+# Entire cluster, all profiles
+weka-log-collector --profile all
 
 # Specific container IDs (comma-separated or repeatable)
 weka-log-collector --container-id 36,171 --start-time -2h
