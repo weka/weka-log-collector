@@ -6425,7 +6425,33 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	cw, finalize, _ := newCompressedWriter(outWriter, compression, gzip.BestCompression)
 	tw := tar.NewWriter(cw)
 
-	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, nodeOnly, containerNames, extraCmds)
+	// Always collect node-local data only. Cluster-wide commands (NodeLocal==false)
+	// are handled separately below so they land in cluster/weka/ — the same path
+	// writeMergedArchive uses — keeping all bundle types structurally consistent.
+	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, true, containerNames, nil)
+
+	// When acting as orchestrator (not a --node-only sub-invocation), also run
+	// cluster-wide weka commands with proper stats throttle and store under cluster/.
+	var clusterTotal, clusterFailed int
+	if !nodeOnly {
+		clusterTotal, clusterFailed = addClusterWideCmdsToArchive(tw, archiveRoot, profile, from, to, cmdTimeout)
+		if len(extraCmds) > 0 {
+			phase(fmt.Sprintf("Extra commands (%d)", len(extraCmds)))
+			extraOutputs := runCommandsParallel(extraCmds, cmdTimeout, clusterCmdWorkers)
+			for i, spec := range extraCmds {
+				co := extraOutputs[i]
+				clusterTotal++
+				if co.result.Error != "" {
+					clusterFailed++
+					warnf("extra command %q failed (exit %d): %s", spec.Cmd, co.result.ExitCode, co.result.Error)
+				}
+				dest := filepath.Join(archiveRoot, "cluster", "extra", spec.Name+".txt")
+				if addErr := addBytesToArchive(tw, dest, commandFileContent(spec, co.out, co.result.Error)); addErr != nil {
+					warnf("could not add extra/%s to archive: %v", spec.Name, addErr)
+				}
+			}
+		}
+	}
 
 	// Write manifest
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
@@ -6441,7 +6467,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	}
 
 	logf("\nCollection complete → %s", outDesc)
-	logf("  Commands: %d total, %d failed", manifest.TotalCommands, manifest.FailedCommands)
+	logf("  Commands: %d total, %d failed", manifest.TotalCommands+clusterTotal, manifest.FailedCommands+clusterFailed)
 	logf("  Files:    %d collected, %d failed",
 		manifest.CollectedFiles, manifest.FailedFiles)
 	if !toStdout {
@@ -6449,6 +6475,76 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 			logf("  Size:     %d KB", info.Size()/1024)
 		}
 	}
+}
+
+// addClusterWideCmdsToArchive runs cluster-wide weka commands (NodeLocal==false,
+// identical output on every node) once from the orchestrator and writes results
+// under archiveRoot/cluster/weka/. Stats commands are throttled to statsWorkers
+// concurrent requests to protect the management plane on large clusters.
+// Returns (total, failed) command counts for the caller's summary.
+func addClusterWideCmdsToArchive(tw *tar.Writer, archiveRoot, profile string, from, to time.Time, cmdTimeout time.Duration) (totalCmds, failedCmds int) {
+	clusterCmds := buildClusterWideCmds(profile, from, to)
+	if len(clusterCmds) == 0 {
+		return 0, 0
+	}
+
+	var nonStatsCmds, wekStatsCmds []CommandSpec
+	var nonStatsIdx, statsIdx []int
+	for i, spec := range clusterCmds {
+		if strings.HasPrefix(spec.Cmd, "weka stats") {
+			wekStatsCmds = append(wekStatsCmds, spec)
+			statsIdx = append(statsIdx, i)
+		} else {
+			nonStatsCmds = append(nonStatsCmds, spec)
+			nonStatsIdx = append(nonStatsIdx, i)
+		}
+	}
+
+	clusterOutputs := make([]cmdOutput, len(clusterCmds))
+
+	if len(nonStatsCmds) > 0 {
+		phase(fmt.Sprintf("Cluster-wide Weka commands (%d commands, %d parallel)", len(nonStatsCmds), clusterCmdWorkers))
+		logf("  [cluster] running %d cluster-wide commands", len(nonStatsCmds))
+		outs := runCommandsParallel(nonStatsCmds, cmdTimeout, clusterCmdWorkers)
+		for i, idx := range nonStatsIdx {
+			clusterOutputs[idx] = outs[i]
+		}
+	}
+	if len(wekStatsCmds) > 0 {
+		phase(fmt.Sprintf("Cluster-wide Weka stats (%d commands, %d parallel — management-plane safe)", len(wekStatsCmds), statsWorkers))
+		logf("  [cluster] running %d weka stats commands", len(wekStatsCmds))
+		outs := runCommandsParallel(wekStatsCmds, cmdTimeout, statsWorkers)
+		for i, idx := range statsIdx {
+			clusterOutputs[idx] = outs[i]
+		}
+	}
+
+	totalCmds = len(clusterCmds)
+	for i, spec := range clusterCmds {
+		co := clusterOutputs[i]
+		if co.result.Error != "" {
+			failedCmds++
+			if spec.Profile != "" {
+				vlogf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
+			} else {
+				warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
+			}
+		}
+		content := commandFileContent(spec, co.out, co.result.Error)
+		ext := ".txt"
+		if spec.JSON {
+			ext = ".json"
+		}
+		wekaSubdir := "weka"
+		if spec.Profile == ProfilePerf {
+			wekaSubdir = "weka/perf"
+		}
+		dest := filepath.Join(archiveRoot, "cluster", wekaSubdir, spec.Name+ext)
+		if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
+			warnf("[cluster] could not add %s to archive: %v", spec.Name, addErr)
+		}
+	}
+	return totalCmds, failedCmds
 }
 
 // writeMergedArchive merges results from all cluster hosts into a single archive.
@@ -6490,67 +6586,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	tw := tar.NewWriter(cw)
 
 	// ── run cluster-wide weka commands once on the orchestrator ───────────
-	// These commands produce identical output on every node; running them once
-	// avoids duplicating the same files N times (once per cluster host).
-	// weka stats commands are split out and run at statsWorkers concurrency
-	// (hard cap of 2) because they aggregate data from every process on every
-	// node — running many in parallel CPU-starves the management process on
-	// large clusters. Non-stats commands run at full clusterCmdWorkers speed.
-	clusterCmds := buildClusterWideCmds(profile, from, to)
-
-	var nonStatsCmds, wekStatsCmds []CommandSpec
-	var nonStatsIdx, statsIdx []int
-	for i, spec := range clusterCmds {
-		if strings.HasPrefix(spec.Cmd, "weka stats") {
-			wekStatsCmds = append(wekStatsCmds, spec)
-			statsIdx = append(statsIdx, i)
-		} else {
-			nonStatsCmds = append(nonStatsCmds, spec)
-			nonStatsIdx = append(nonStatsIdx, i)
-		}
-	}
-
-	clusterOutputs := make([]cmdOutput, len(clusterCmds))
-
-	if len(nonStatsCmds) > 0 {
-		phase(fmt.Sprintf("Cluster-wide Weka commands (%d commands, %d parallel)", len(nonStatsCmds), clusterCmdWorkers))
-		logf("  [cluster] running %d cluster-wide commands", len(nonStatsCmds))
-		outs := runCommandsParallel(nonStatsCmds, cmdTimeout, clusterCmdWorkers)
-		for i, idx := range nonStatsIdx {
-			clusterOutputs[idx] = outs[i]
-		}
-	}
-	if len(wekStatsCmds) > 0 {
-		phase(fmt.Sprintf("Cluster-wide Weka stats (%d commands, %d parallel — management-plane safe)", len(wekStatsCmds), statsWorkers))
-		logf("  [cluster] running %d weka stats commands", len(wekStatsCmds))
-		outs := runCommandsParallel(wekStatsCmds, cmdTimeout, statsWorkers)
-		for i, idx := range statsIdx {
-			clusterOutputs[idx] = outs[i]
-		}
-	}
-	for i, spec := range clusterCmds {
-		co := clusterOutputs[i]
-		if co.result.Error != "" {
-			if spec.Profile != "" {
-				vlogf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
-			} else {
-				warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
-			}
-		}
-		content := commandFileContent(spec, co.out, co.result.Error)
-		ext := ".txt"
-		if spec.JSON {
-			ext = ".json"
-		}
-		wekaSubdir := "weka"
-		if spec.Profile == ProfilePerf {
-			wekaSubdir = "weka/perf"
-		}
-		dest := filepath.Join(archiveRoot, "cluster", wekaSubdir, spec.Name+ext)
-		if addErr := addBytesToArchive(tw, dest, content); addErr != nil {
-			warnf("[cluster] could not add %s to archive: %v", spec.Name, addErr)
-		}
-	}
+	addClusterWideCmdsToArchive(tw, archiveRoot, profile, from, to, cmdTimeout)
 
 	// ── run extra commands on the orchestrator ────────────────────────────
 	if len(extraCmds) > 0 {
