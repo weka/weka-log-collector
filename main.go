@@ -4929,6 +4929,53 @@ func collectK8sPodLogs(tw *tar.Writer, kc *kubectlRunner, ns, pod, podDir string
 	}
 }
 
+// collectK8sTroubledPods collects diagnostics for non-Running pods (Pending, Failed, Unknown).
+// These pods are the most important to capture — they are the ones actively having problems.
+// All commands use runLenient so expected failures (e.g. logs for Pending pods) do not
+// inflate the manifest failure count. Results go under troubled-pods/<pod-name>/ to
+// distinguish them from the healthy-pod collection.
+func collectK8sTroubledPods(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sManifest, podFilter func(string) bool) {
+	out := kc.runLenient("get", "pods", "-n", ns,
+		"--field-selector=status.phase!=Running", "--no-headers")
+	pods := parsePodNames(out)
+	if podFilter != nil {
+		var filtered []string
+		for _, p := range pods {
+			if podFilter(p) {
+				filtered = append(filtered, p)
+			}
+		}
+		pods = filtered
+	}
+	if len(pods) == 0 {
+		return
+	}
+	logf("    %d non-Running pods in namespace %s", len(pods), ns)
+
+	for _, pod := range pods {
+		podDir := root + "/troubled-pods/" + safeName(pod)
+		vlogf("k8s: troubled pod %s/%s", ns, pod)
+
+		// describe is the highest-value output for non-Running pods — it shows
+		// scheduling failures, resource constraints, and last event timeline.
+		if descOut := kc.runLenient("describe", "pod", pod, "-n", ns); len(descOut) > 0 {
+			_ = addBytesToArchive(tw, podDir+"/describe.txt", descOut)
+		}
+
+		// Current logs — expected to fail for Pending pods (container not created yet).
+		if logsOut, err := kc.podLogs(ns, pod, ""); err == nil && len(logsOut) > 0 {
+			_ = addBytesToArchive(tw, podDir+"/logs/stdout.log", stripANSI(logsOut))
+		}
+
+		// Previous logs — valuable for OOMKilled/CrashLoopBackOff containers that
+		// have since transitioned to Failed or are between restart attempts.
+		if prevOut := kc.runLenient("logs", pod, "-n", ns,
+			"--all-containers=true", "--prefix=true", "--previous=true", "--tail=10000"); len(prevOut) > 0 {
+			_ = addBytesToArchive(tw, podDir+"/logs/previous.log", stripANSI(prevOut))
+		}
+	}
+}
+
 // clusterWideCLICommands are run once per cluster from the first responsive
 // compute pod. Output is identical on every pod so there is no value running
 // them per-pod — doing so only inflates the failure count on non-compute pods.
@@ -5030,6 +5077,8 @@ func collectK8sOperator(tw *tar.Writer, kc *kubectlRunner, root, operatorNS, clu
 	if out := kc.runLenient("get", "wekacontainer", "-n", operatorNS, "-o", "yaml"); len(out) > 0 {
 		_ = addBytesToArchive(tw, root+"/wekacontainer_status.yaml", out)
 	}
+
+	collectK8sTroubledPods(tw, kc, root, operatorNS, m, podFilter)
 }
 
 // collectK8sWekaCluster collects WekaCluster pod diagnostics.
@@ -5089,6 +5138,8 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 			collectK8sOptWekaLogs(tw, kc, clusterNS, pod, podDir+"/opt-weka-logs", m)
 		}
 	}
+
+	collectK8sTroubledPods(tw, kc, root, clusterNS, m, podFilter)
 }
 
 // collectK8sCSI collects CSI plugin diagnostics: controller + node daemonset
@@ -5121,6 +5172,8 @@ func collectK8sCSI(tw *tar.Writer, kc *kubectlRunner, root, ns string, m *k8sMan
 			}
 		}
 	}
+
+	collectK8sTroubledPods(tw, kc, root, ns, m, nil)
 }
 
 func k8sUsageFunc() {
