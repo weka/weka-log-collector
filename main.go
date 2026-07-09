@@ -4665,6 +4665,16 @@ func discoverWekaK8sNamespaces(kc *kubectlRunner, clusterNameHint string) wekaK8
 	return ns
 }
 
+// firstOf returns the first non-empty string from its arguments.
+func firstOf(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // kubectlToArchive runs kubectl args, writes output into tw at archivePath.
 // Errors are logged as verbose and return false; partial output is still archived.
 func kubectlToArchive(tw *tar.Writer, kc *kubectlRunner, archivePath string, args ...string) bool {
@@ -4683,7 +4693,9 @@ func kubectlToArchive(tw *tar.Writer, kc *kubectlRunner, archivePath string, arg
 type k8sManifest struct {
 	CollectedAt       time.Time `json:"collected_at"`
 	Version           string    `json:"version"`
+	CommandLine       []string  `json:"command_line"`
 	JumpHost          string    `json:"jump_host,omitempty"`
+	ClusterNameHint   string    `json:"cluster_name_hint,omitempty"`
 	ClusterName       string    `json:"cluster_name,omitempty"`
 	OperatorNamespace string    `json:"operator_namespace"`
 	ClusterNamespace  string    `json:"cluster_namespace"`
@@ -4783,12 +4795,16 @@ func collectK8sNamespaceMeta(tw *tar.Writer, kc *kubectlRunner, root, ns string,
 	run("events.txt", "get", "events", "-n", ns, "--sort-by=.lastTimestamp")
 	run("workloads.txt", "get", "deployments,statefulsets,daemonsets,replicasets", "-n", ns)
 	run("services.txt", "get", "svc,endpoints", "-n", ns)
-	run("configmaps.txt", "get", "configmap", "-n", ns)
+	// kube-root-ca.crt is a K8s system ConfigMap present in every namespace
+	// that contains the cluster CA public certificate. It is not useful for
+	// Weka diagnostics and is excluded to avoid capturing cert material.
+	cmSelector := "--field-selector=metadata.name!=kube-root-ca.crt"
+	run("configmaps.txt", "get", "configmap", "-n", ns, cmSelector)
 	// configmaps.yaml: redact any sensitive-looking keys before archiving.
 	// Secrets are never collected (names only), but some operators store tokens
 	// or API endpoints in configmaps — redact as a precaution.
 	m.TotalCommands++
-	if cmOut, cmErr := kc.run("get", "configmap", "-n", ns, "-o", "yaml"); cmErr == nil {
+	if cmOut, cmErr := kc.run("get", "configmap", "-n", ns, "-o", "yaml", cmSelector); cmErr == nil {
 		_ = addBytesToArchive(tw, root+"/configmaps.yaml", redactSensitiveYAML(cmOut))
 	} else {
 		m.FailedCommands++
@@ -5202,8 +5218,10 @@ func runK8sMode(args []string) {
 	m := &k8sManifest{
 		CollectedAt:       time.Now(),
 		Version:           version,
+		CommandLine:       os.Args,
 		JumpHost:          *k8sHost,
-		ClusterName:       ns.ClusterName,
+		ClusterNameHint:   *clusterName,
+		ClusterName:       firstOf(ns.ClusterName, *clusterName),
 		OperatorNamespace: ns.Operator,
 		ClusterNamespace:  ns.Cluster,
 		CSINamespace:      ns.CSI,
