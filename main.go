@@ -4482,6 +4482,32 @@ func (k *kubectlRunner) runLenient(args ...string) []byte {
 	return out
 }
 
+// runExternal runs an arbitrary binary (not kubectl) locally or via SSH jump host.
+// Used for tools like helm that have their own binary separate from kubectl.
+func (k *kubectlRunner) runExternal(binary string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if k.jumpHost != "" {
+		parts := make([]string, len(args))
+		for i, a := range args {
+			parts[i] = shellQuote(a)
+		}
+		remoteCmd := shellQuote(binary) + " " + strings.Join(parts, " ")
+		sshOpts := append(sshArgs(), sshTarget(k.jumpHost), remoteCmd)
+		cmd = exec.CommandContext(ctx, "ssh", sshOpts...)
+	} else {
+		cmd = exec.CommandContext(ctx, binary, args...)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("%s: %w", binary, err)
+	}
+	return out, nil
+}
+
 // execInPod runs a command inside a pod via kubectl exec.
 // container may be "" to use the pod's default container.
 func (k *kubectlRunner) execInPod(ns, pod, container string, cmd ...string) ([]byte, error) {
@@ -4638,7 +4664,45 @@ func discoverWekaK8sNamespaces(kc *kubectlRunner, clusterNameHint string) wekaK8
 			}
 		}
 	}
-	if clusterNameHint != "" && ns.ClusterName != clusterNameHint {
+
+	// WekaClient fallback: client-only deployments have a WekaClient CR instead of
+	// (or in addition to) a WekaCluster CR. If no WekaCluster matched, look for
+	// a WekaClient with the same name hint.
+	if ns.ClusterName == "" {
+		out = kc.runLenient("get", "wekaclient", "--all-namespaces", "--no-headers",
+			"-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+		var allClients []string
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 || strings.HasPrefix(fields[0], "No") {
+				continue
+			}
+			allClients = append(allClients, line)
+			if clusterNameHint == "" || fields[1] == clusterNameHint {
+				ns.Cluster = fields[0]
+				ns.ClusterName = fields[1]
+				if clusterNameHint == "" {
+					break
+				}
+			}
+		}
+		if clusterNameHint != "" && ns.ClusterName != clusterNameHint {
+			errorf("CRD %q not found as WekaCluster or WekaClient.", clusterNameHint)
+			if len(allClusters) > 0 || len(allClients) > 0 {
+				errorf("Available WekaCluster CRDs:")
+				for _, c := range allClusters {
+					errorf("  %s", c)
+				}
+				errorf("Available WekaClient CRDs:")
+				for _, c := range allClients {
+					errorf("  %s", c)
+				}
+			} else {
+				errorf("No WekaCluster or WekaClient CRDs found in the cluster.")
+			}
+			os.Exit(1)
+		}
+	} else if clusterNameHint != "" && ns.ClusterName != clusterNameHint {
 		errorf("WekaCluster CRD %q not found.", clusterNameHint)
 		if len(allClusters) > 0 {
 			errorf("Available clusters:")
@@ -4744,6 +4808,9 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 	run("csidrivers.txt", "get", "csidrivers")
 	run("csidrivers.yaml", "get", "csidriver", "-o", "yaml")
 	run("csinodes.yaml", "get", "csinode", "-o", "yaml")
+	// VolumeAttachments show which PVs are attached to which nodes — primary signal
+	// for stuck attach/detach operations causing CSI mount failures.
+	run("volumeattachments.yaml", "get", "volumeattachment", "-o", "yaml")
 
 	// Cluster-wide pod listing — useful for spotting co-located workloads and
 	// understanding scheduling when diagnosing node-level issues.
@@ -4754,7 +4821,10 @@ func collectK8sClusterLevel(tw *tar.Writer, kc *kubectlRunner, root string, m *k
 	soft("pods_top.txt", "top", "pods", "--all-namespaces")
 
 	// helm list — deployment config (kubelet path, CSI version) is a frequent root cause.
-	soft("helm_releases.txt", "helm", "list", "--all-namespaces")
+	// Run helm directly (not via kubectl) since it is a separate binary.
+	if helmOut, _ := kc.runExternal("helm", "list", "--all-namespaces"); len(helmOut) > 0 {
+		_ = addBytesToArchive(tw, base+"/helm_releases.txt", helmOut)
+	}
 
 	// Required Weka CRD (counts as failure if missing)
 	run("wekacluster.yaml", "get", "wekacluster", "--all-namespaces", "-o", "yaml")
@@ -4946,11 +5016,19 @@ func collectK8sOperator(tw *tar.Writer, kc *kubectlRunner, root, operatorNS, clu
 		collectK8sPodLogs(tw, kc, operatorNS, pod, podDir, m)
 	}
 
-	// WekaCluster CRD status — most useful single resource for diagnosing operator issues
+	// CRD status per namespace — collect all three regardless of deployment mode
+	// (WekaCluster, WekaClient, WekaContainer) so both cluster and client-only
+	// deployments are fully represented.
 	m.TotalCommands++
 	if !kubectlToArchive(tw, kc, root+"/wekacluster_status.yaml",
 		"get", "wekacluster", "-n", operatorNS, "-o", "yaml") {
 		m.FailedCommands++
+	}
+	if out := kc.runLenient("get", "wekaclient", "-n", operatorNS, "-o", "yaml"); len(out) > 0 {
+		_ = addBytesToArchive(tw, root+"/wekaclient_status.yaml", out)
+	}
+	if out := kc.runLenient("get", "wekacontainer", "-n", operatorNS, "-o", "yaml"); len(out) > 0 {
+		_ = addBytesToArchive(tw, root+"/wekacontainer_status.yaml", out)
 	}
 }
 
