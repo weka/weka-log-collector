@@ -15,6 +15,7 @@ A single binary that collects exactly what you need from one node or the entire 
 - **Full container log coverage** — all container log trees collected including rotated variants
 - **Cluster-wide in one shot** — auto-deploys itself to each node via SCP, collects in parallel, merges into a single archive
 - **Container-scoped collection** — target specific nodes by their Weka container ID (`--container-id`)
+- **Trace collection** — bundle Weka traces alongside logs with `--collect-traces`; filter by container, slot, and other dimensions with `--trace-filter`
 - **IP-based node discovery** — uses node IPs directly, no DNS required
 - **Space-safe** — checks available disk before writing; warns if space is low
 - **Upload to Weka Home** — use `--upload` to send the archive directly to Weka Home via the node's uploader daemon; or use `--output -` to stream to stdout
@@ -60,6 +61,9 @@ weka-log-collector --start-time -2h
 # Specific incident window, all profiles
 weka-log-collector --profile all --start-time 2026-03-20T14:00 --end-time 2026-03-20T16:00
 
+# Collect logs + traces from all nodes for a 30-minute incident window
+weka-log-collector --collect-traces --start-time 2026-03-20T14:00 --end-time 2026-03-20T14:30
+
 # Collect from a Weka-on-Kubernetes cluster
 weka-log-collector k8s --k8s-host jump.server.internal
 ```
@@ -86,6 +90,16 @@ Flags:
   --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json.
   --anonymize-key      Override path for the anonymization mapping JSON (default: alongside the bundle)
   --upload-file        Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
+  --collect-traces     Collect Weka kernel traces from each node using trace_extractor.
+                       Requires --start-time. Time window must be ≤ 1 hour. Skipped with
+                       a message if the window is too large or --start-time is not given.
+  --trace-filter EXPR  Trace filter expression (repeatable; default: --all).
+                       e.g. --trace-filter "container=drives0 and slot=1"
+                       Multiple --trace-filter flags are OR'd together by trace_extractor.
+  --trace-extractor-path PATH
+                       Override path to the trace_extractor binary. By default the tool
+                       looks alongside itself, in PATH, and at
+                       /opt/weka/weka-log-collector/trace_extractor.
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands
@@ -161,6 +175,8 @@ weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
 
 **System commands** — uname, os-release, uptime, free, lscpu, ip addr/route/rule/neighbor, netstat, ps, df, lspci, lsblk, sysctl -a, dmesg, journalctl (weka-agent + time-windowed full journal), lshw (network), ofed_info, lsmod, modinfo (mlx5_core, ice), rp_filter, ethtool (all physical interfaces)
 
+**Weka traces** (with `--collect-traces`) — per-node trace archives produced by `trace_extractor`, stored under `hosts/<hostname>/traces/` in the bundle
+
 **Clock sync** — timedatectl, timedatectl show-timesync, systemd-timesyncd status, chronyc tracking/sources, chronyd status, ntpd status, ptp4l/phc2sys status — whichever sync daemon is present on each node
 
 **Weka CLI commands** — weka status, alerts, cluster topology, filesystems, snapshots, debug traces, local container resources, and profile-specific commands (events, cfgdump, perf stats, NFS/S3/SMB-W commands)
@@ -206,6 +222,104 @@ weka-log-collector \
   --start-time -2h \
   --output /opt/weka/weka-logs.tar.gz \
   --cmd-timeout 180s
+```
+
+---
+
+## Trace collection
+
+`--collect-traces` bundles Weka traces alongside the standard log collection. The tool uses the `trace_extractor` binary, which is **shipped in this repo** — a `git pull` on any Weka node picks it up automatically alongside `weka-log-collector`.
+
+### Requirements
+
+- `--start-time` is **required** — traces have no safe default window.
+- Time window (`--end-time` minus `--start-time`) must be **≤ 1 hour**. If the window is larger, or if `--start-time` is omitted, trace collection is silently skipped with an explanatory message; the rest of log collection continues normally.
+
+### Filter expressions
+
+Without `--trace-filter`, all traces are collected (`--all`). Pass one or more `--trace-filter` flags to scope collection:
+
+```
+--trace-filter "container=drives0"                    # all traces from drives0
+--trace-filter "container=drives0 and slot=1"         # slot 1 of drives0 only
+--trace-filter "container=compute0 and slot=0"
+--trace-filter "container=frontend0"
+```
+
+Multiple `--trace-filter` flags are **OR'd together** — each is passed as a separate `--filter` argument to `trace_extractor`.
+
+```bash
+# Collect traces from drives0 OR compute0
+weka-log-collector --collect-traces --start-time -30m \
+  --trace-filter "container=drives0" \
+  --trace-filter "container=compute0"
+```
+
+### Combinations
+
+**Local node, last 30 minutes, all traces**
+```bash
+weka-log-collector --collect-traces --start-time -30m --local
+```
+Collects logs and traces from the current node only. No SSH. Fastest option when you're already on the node of interest.
+
+**Local node, filtered traces**
+```bash
+weka-log-collector --collect-traces --start-time -30m --local \
+  --trace-filter "container=drives0 and slot=1"
+```
+Same as above but scopes traces to a specific container/slot. Produces a much smaller trace archive.
+
+**Cluster-wide, all traces**
+```bash
+weka-log-collector --collect-traces --start-time 2026-08-01T14:00 --end-time 2026-08-01T14:30
+```
+Deploys `trace_extractor` to every backend node alongside `weka-log-collector`. Each node runs trace collection locally and the per-node trace archives are merged into the bundle under `hosts/<hostname>/traces/`.
+
+**Cluster-wide, filtered traces, explicit window**
+```bash
+weka-log-collector --collect-traces \
+  --start-time 2026-08-01T14:00 --end-time 2026-08-01T14:30 \
+  --trace-filter "container=drives0 and slot=1"
+```
+Collects the standard log bundle from all nodes plus filtered traces from each. The same filter is applied on every node — useful when the same container/slot is present across all backends.
+
+**Single node via `--container-id`**
+```bash
+weka-log-collector --collect-traces --start-time -30m \
+  --container-id 0 \
+  --trace-filter "container=drives0 and slot=1"
+```
+`--container-id 0` resolves to its host (e.g. `csta01.lab`) and scopes both log collection and trace collection to that one node. Useful when you know which node saw the issue. Combine with `--trace-filter` to keep the trace archive small.
+
+**Multiple nodes via repeated `--container-id`**
+```bash
+weka-log-collector --collect-traces --start-time -30m \
+  --container-id 0 --container-id 6 \
+  --trace-filter "container=drives0"
+```
+Collects from the two hosts that own container IDs 0 and 6. If both resolve to the same host, only one SSH session is opened.
+
+### Bundle layout
+
+Traces land under `hosts/<hostname>/traces/` in the merged archive alongside the standard per-node collection:
+
+```
+<cluster>-weka-logs-<timestamp>/
+  hosts/
+    csta01.lab/
+      traces/
+        csta01-lab-traces-<timestamp>.tar.gz
+      system/
+        ...
+      weka/
+        ...
+    csta02.lab/
+      traces/
+        csta02-lab-traces-<timestamp>.tar.gz
+      ...
+  cluster/
+    ...
 ```
 
 ---
