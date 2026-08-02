@@ -3647,7 +3647,10 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 			byHost[key] = e
 		}
 		e.ids = append(e.ids, id)
-		if strings.ToUpper(statusOut[id]) == "UP" {
+		// Treat unknown status as UP: if the status query failed or the column
+		// is absent (e.g. older weka versions), include the node rather than
+		// silently dropping it.
+		if st := strings.ToUpper(statusOut[id]); st == "UP" || st == "" {
 			e.hasUp = true
 		}
 		m := strings.ToLower(modeOut[id])
