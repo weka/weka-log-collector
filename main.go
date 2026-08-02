@@ -3624,11 +3624,12 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 
 	// Aggregate containers per hostname (fall back to IP when hostname unknown).
 	type hostEntry struct {
-		ip       string
-		hostname string
-		ids      []int
-		hasUp    bool
-		isClient bool
+		ip         string
+		hostname   string
+		ids        []int
+		hasUp      bool
+		hasBackend bool // any non-client container present
+		isClient   bool // at least one client container present
 	}
 	byHost := map[string]*hostEntry{} // keyed by hostname (or IP)
 	for _, id := range allIDs {
@@ -3656,6 +3657,12 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 		m := strings.ToLower(modeOut[id])
 		if m == "client" {
 			e.isClient = true
+		} else {
+			// "backend", or any unrecognised mode (including empty when the query
+			// failed) counts as non-client workload. Weka v4.x backend nodes run
+			// both "backend" and "client" containers on the same host; hasBackend
+			// prevents them from being misclassified as client-only nodes.
+			e.hasBackend = true
 		}
 	}
 
@@ -3665,8 +3672,12 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 		if !e.hasUp {
 			continue // skip hosts with no UP containers (dead / repurposed nodes)
 		}
+		// A host is client-only when it has no backend/compute/drives/frontend
+		// containers. Weka v4.x backend nodes run a "client" container alongside
+		// their backend containers, so the presence of any non-client container
+		// is what determines the host's role.
 		mode := "backend"
-		if e.isClient {
+		if e.isClient && !e.hasBackend {
 			mode = "client"
 		}
 		if mode == "client" && !includeClients {
