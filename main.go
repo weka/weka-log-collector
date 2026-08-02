@@ -46,6 +46,10 @@ const (
 	wlcLogsDir        = wlcBaseDir + "/logs"
 	wlcRunLock        = "/tmp/weka-log-collector.lock"
 	uploadFileMaxSize = 50 * 1024 * 1024 // 50 MB
+
+	traceExtractorBin        = "trace_extractor"
+	remoteTraceExtractorPath = wlcBaseDir + "/" + traceExtractorBin
+	traceMaxWindow           = time.Hour
 )
 
 // ── time parsing ─────────────────────────────────────────────────────────────
@@ -3088,6 +3092,14 @@ var activeRemoteHosts sync.Map
 // sshUserOverride is set by the --ssh-user flag. Empty means "use the default".
 var sshUserOverride string
 
+// trace collection state — set once in main() and read by writeArchive,
+// deployToHost, collectFromHost, and uploadFromHost.
+var (
+	collectTraces              bool
+	traceFilters               []string // values from --trace-filter; empty → pass --all to trace_extractor
+	resolvedTraceExtractorPath string   // validated binary path, set after findTraceExtractor succeeds
+)
+
 // sshUser returns the username to use for SSH connections.
 // Priority: --ssh-user flag > current OS user > "root" (fallback).
 func sshUser() string {
@@ -3159,9 +3171,155 @@ func maybeRemoteSudo(cmd string) string {
 	return cmd
 }
 
+// findTraceExtractor locates the trace_extractor binary. Discovery order:
+//  1. override (--trace-extractor-path flag)
+//  2. PATH (which trace_extractor)
+//  3. wlcBaseDir/trace_extractor (matches the remote deploy path)
+//  4. Same directory as the running wlc binary (typical in the git repo layout)
+func findTraceExtractor(override string) (string, error) {
+	if override != "" {
+		if _, err := os.Stat(override); err != nil {
+			return "", fmt.Errorf("%s: %w", override, err)
+		}
+		return override, nil
+	}
+	if p, err := exec.LookPath(traceExtractorBin); err == nil {
+		return p, nil
+	}
+	if _, err := os.Stat(remoteTraceExtractorPath); err == nil {
+		return remoteTraceExtractorPath, nil
+	}
+	if self, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(self), traceExtractorBin)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("trace_extractor binary not found; place it alongside the wlc binary or use --trace-extractor-path")
+}
+
+// addRawFileToArchive streams a file into the tar without loading it into memory.
+// The archive path is run through the anonymizer (path only); file content is not
+// processed, making it safe for binary blobs like trace archives.
+func addRawFileToArchive(tw *tar.Writer, destPath, srcPath string) error {
+	if globalAnonymizer.enabled {
+		destPath = string(globalAnonymizer.Apply([]byte(destPath)))
+	}
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	hdr := &tar.Header{
+		Name:    destPath,
+		Mode:    0644,
+		Size:    fi.Size(),
+		ModTime: fi.ModTime(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	_, err = io.Copy(tw, f)
+	return err
+}
+
+// runTraceExtractor invokes trace_extractor for the local node and adds its
+// output archive(s) into the bundle under hosts/<hostname>/traces/.
+// Uses the package-level resolvedTraceExtractorPath and traceFilters globals.
+func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, to time.Time) {
+	args := []string{}
+	if len(traceFilters) == 0 {
+		args = append(args, "--all")
+	} else {
+		for _, f := range traceFilters {
+			args = append(args, "--filter", f)
+		}
+	}
+	if !from.IsZero() {
+		args = append(args, "--from", from.Format("2006-01-02T15:04"))
+	}
+	if !to.IsZero() {
+		args = append(args, "--to", to.Format("2006-01-02T15:04"))
+	}
+
+	tmpDir, err := os.MkdirTemp("", "wlc-traces-*")
+	if err != nil {
+		warnf("[traces] could not create temp dir: %v", err)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	logf("[traces] running trace_extractor %s", strings.Join(args, " "))
+	cmd := exec.Command(resolvedTraceExtractorPath, args...)
+	cmd.Dir = tmpDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		warnf("[traces] trace_extractor failed: %v\n%s", err, strings.TrimSpace(string(out)))
+		return
+	}
+	if len(out) > 0 {
+		vlogf("[traces] %s", strings.TrimSpace(string(out)))
+	}
+
+	entries, readErr := os.ReadDir(tmpDir)
+	if readErr != nil {
+		warnf("[traces] could not list output dir: %v", readErr)
+		return
+	}
+
+	added := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
+			continue
+		}
+		srcPath := filepath.Join(tmpDir, e.Name())
+		destPath := filepath.Join(archiveRoot, "hosts", pathHostname, "traces", e.Name())
+		if err := addRawFileToArchive(tw, destPath, srcPath); err != nil {
+			warnf("[traces] could not add %s to archive: %v", e.Name(), err)
+		} else {
+			logf("[traces] added %s", e.Name())
+			added++
+		}
+	}
+	if added == 0 {
+		warnf("[traces] trace_extractor ran but produced no output files")
+	}
+}
+
+// scpFileToRemote copies localPath to sshTarget:remotePath using the standard
+// sudo/non-sudo logic. Non-root SSH users stage via /tmp then sudo-move; root
+// users SCP directly. The suffix is appended to the /tmp staging name to keep
+// concurrent deploys of different files from colliding.
+func scpFileToRemote(target, localPath, remotePath string) error {
+	if !remoteNeedsSudo() {
+		scpArgs := append(sshArgs(), localPath, target+":"+remotePath)
+		if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	// Non-root: SCP to /tmp, then sudo-move and chmod.
+	tmpRemote := fmt.Sprintf("/tmp/wlc-deploy-%d-%s", os.Getpid(), filepath.Base(remotePath))
+	scpArgs := append(sshArgs(), localPath, target+":"+tmpRemote)
+	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	installCmd := fmt.Sprintf("sudo mv %s %s && sudo chmod +x %s", tmpRemote, remotePath, remotePath)
+	if out, err := exec.Command("ssh", append(sshArgs(), target, installCmd)...).CombinedOutput(); err != nil {
+		exec.Command("ssh", append(sshArgs(), target, "rm -f "+tmpRemote)...).Run() //nolint
+		return fmt.Errorf("install %s: %v: %s", remotePath, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // deployToHost copies the running binary to a remote host via SCP.
 // When the SSH user is non-root, it copies to /tmp first then sudo-moves
 // into place, since /opt/weka/weka-log-collector/ is root-owned.
+// When --collect-traces is active, trace_extractor is also deployed.
 func deployToHost(host, selfPath string) error {
 	target := sshTarget(host)
 	remoteBin := remoteBinPath()
@@ -3171,25 +3329,14 @@ func deployToHost(host, selfPath string) error {
 		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
 	}
 
-	if !remoteNeedsSudo() {
-		scpArgs := append(sshArgs(), selfPath, target+":"+remoteBin)
-		if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
-			return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
-		}
-		return nil
+	if err := scpFileToRemote(target, selfPath, remoteBin); err != nil {
+		return err
 	}
 
-	// Non-root SSH user: SCP to /tmp, then sudo-move into the wlc directory.
-	tmpRemote := fmt.Sprintf("/tmp/wlc-deploy-%d", os.Getpid())
-	scpArgs := append(sshArgs(), selfPath, target+":"+tmpRemote)
-	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
-		return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	installCmd := fmt.Sprintf("sudo mv %s %s && sudo chmod +x %s", tmpRemote, remoteBin, remoteBin)
-	installArgs := append(sshArgs(), target, installCmd)
-	if out, err := exec.Command("ssh", installArgs...).CombinedOutput(); err != nil {
-		exec.Command("ssh", append(sshArgs(), target, "rm -f "+tmpRemote)...).Run() //nolint
-		return fmt.Errorf("install %s: %v: %s", remoteBin, err, strings.TrimSpace(string(out)))
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		if err := scpFileToRemote(target, resolvedTraceExtractorPath, remoteTraceExtractorPath); err != nil {
+			warnf("[%s] trace_extractor deploy failed (trace collection may fail on this node): %v", host, err)
+		}
 	}
 	return nil
 }
@@ -3316,7 +3463,7 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 	// timeout kills the process if it exceeds the SSH timeout, preventing orphans
 	// when the orchestrator can no longer wait (e.g. after SSH connection drops).
 	// --node-only skips cluster-wide commands (run once by the orchestrator locally).
-	collectionCmd := strings.Join(append([]string{
+	collectionCmd := shellJoin(append([]string{
 		remoteBin,
 		"--local",
 		"--node-only",
@@ -3336,13 +3483,24 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 		if len(containerNames) > 0 {
 			extra = append(extra, "--container-name", strings.Join(containerNames, ","))
 		}
+		if collectTraces && resolvedTraceExtractorPath != "" {
+			extra = append(extra, "--collect-traces")
+			extra = append(extra, "--trace-extractor-path", remoteTraceExtractorPath)
+			for _, f := range traceFilters {
+				extra = append(extra, "--trace-filter", f)
+			}
+		}
 		return extra
-	}()...), " ")
+	}()...))
 
 	timeoutSecs := int(sshTimeout.Seconds())
+	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath)
+	}
 	remoteShellCmd := fmt.Sprintf(
 		"%s; trap '%s' EXIT; timeout %d %s",
-		maybeRemoteSudo("chmod +x "+remoteBin),
+		chmodSetup,
 		maybeRemoteSudo("rm -f "+remoteBin),
 		timeoutSecs,
 		maybeRemoteSudo(collectionCmd),
@@ -3466,11 +3624,12 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 
 	// Aggregate containers per hostname (fall back to IP when hostname unknown).
 	type hostEntry struct {
-		ip       string
-		hostname string
-		ids      []int
-		hasUp    bool
-		isClient bool
+		ip         string
+		hostname   string
+		ids        []int
+		hasUp      bool
+		hasBackend bool // any non-client container present
+		isClient   bool // at least one client container present
 	}
 	byHost := map[string]*hostEntry{} // keyed by hostname (or IP)
 	for _, id := range allIDs {
@@ -3489,12 +3648,21 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 			byHost[key] = e
 		}
 		e.ids = append(e.ids, id)
-		if strings.ToUpper(statusOut[id]) == "UP" {
+		// Treat unknown status as UP: if the status query failed or the column
+		// is absent (e.g. older weka versions), include the node rather than
+		// silently dropping it.
+		if st := strings.ToUpper(statusOut[id]); st == "UP" || st == "" {
 			e.hasUp = true
 		}
 		m := strings.ToLower(modeOut[id])
 		if m == "client" {
 			e.isClient = true
+		} else {
+			// "backend", or any unrecognised mode (including empty when the query
+			// failed) counts as non-client workload. Weka v4.x backend nodes run
+			// both "backend" and "client" containers on the same host; hasBackend
+			// prevents them from being misclassified as client-only nodes.
+			e.hasBackend = true
 		}
 	}
 
@@ -3504,8 +3672,12 @@ func discoverClusterNodes(includeClients bool) ([]clusterNode, error) {
 		if !e.hasUp {
 			continue // skip hosts with no UP containers (dead / repurposed nodes)
 		}
+		// A host is client-only when it has no backend/compute/drives/frontend
+		// containers. Weka v4.x backend nodes run a "client" container alongside
+		// their backend containers, so the presence of any non-client container
+		// is what determines the host's role.
 		mode := "backend"
-		if e.isClient {
+		if e.isClient && !e.hasBackend {
 			mode = "client"
 		}
 		if mode == "client" && !includeClients {
@@ -4255,7 +4427,8 @@ _weka_log_collector() {
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
           --extra-commands --cmd-timeout --compression --anonymize --anonymize-key --force
-          --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers"
+          --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers
+          --collect-traces --trace-filter --trace-extractor-path"
 
     case "$prev" in
         --profile)
@@ -4266,7 +4439,7 @@ _weka_log_collector() {
             COMPREPLY=( $(compgen -W "gzip xz" -- "$cur") )
             return 0
             ;;
-        --output|--anonymize-key)
+        --output|--anonymize-key|--trace-extractor-path)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
@@ -4436,6 +4609,14 @@ type kubectlRunner struct {
 // safe for embedding in a shell command string.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func shellJoin(args []string) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = shellQuote(a)
+	}
+	return strings.Join(parts, " ")
 }
 
 // buildKubectlArgs prepends --kubeconfig=... when set.
@@ -5732,31 +5913,34 @@ func main() {
 	}
 
 	var (
-		startTimeStr    = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
-		endTimeStr      = flag.String("end-time", "", "End of time window (default: now)")
-		profileStr      = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
-		outputPath      = flag.String("output", "", "Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<name>-weka-logs-<ts>.tar.gz). Use - for stdout.")
-		localOnly       = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
-		nodeOnly        = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
-		upload          = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
-		cmdTimeout      = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
-		clusterWorkers  = flag.Int("cluster-cmd-workers", 8, "Max parallel non-stats cluster-wide commands (weka stats are always capped at 2 regardless)")
-		extraCommands   = flag.Bool("extra-commands", false, fmt.Sprintf("Run extra commands from %s and include output in the archive", extraCommandsFile))
-		ver             = flag.Bool("version", false, "Print version and exit")
-		completion      = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
-		listBundles     = flag.Bool("list-bundles", false, fmt.Sprintf("List bundles in %s", wlcBundlesDir))
-		rmBundle        = flag.String("rm-bundle", "", fmt.Sprintf("Remove a specific bundle from %s (filename or full path)", wlcBundlesDir))
-		cleanBundles    = flag.Bool("clean-bundles", false, fmt.Sprintf("Remove all bundles from %s", wlcBundlesDir))
-		uploadFile      = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)", wlcBaseDir))
-		uploadSessionID = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
-		compression     = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
-		anonymize       = flag.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json (kept by the customer; not in the archive).")
-		anonymizeKey    = flag.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
-		force           = flag.Bool("force", false, "Override the run lock (use only when an earlier run is known to be hung)")
+		startTimeStr       = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
+		endTimeStr         = flag.String("end-time", "", "End of time window (default: now)")
+		profileStr         = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
+		outputPath         = flag.String("output", "", "Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<name>-weka-logs-<ts>.tar.gz). Use - for stdout.")
+		localOnly          = flag.Bool("local", false, "Collect from local host only (no SSH, no cluster query)")
+		nodeOnly           = flag.Bool("node-only", false, "Skip cluster-wide weka commands; collect only node-local data (used internally by SSH collection)")
+		upload             = flag.Bool("upload", false, "Upload the collected archive to Weka Home (requires 'weka cloud enable')")
+		cmdTimeout         = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
+		clusterWorkers     = flag.Int("cluster-cmd-workers", 8, "Max parallel non-stats cluster-wide commands (weka stats are always capped at 2 regardless)")
+		extraCommands      = flag.Bool("extra-commands", false, fmt.Sprintf("Run extra commands from %s and include output in the archive", extraCommandsFile))
+		ver                = flag.Bool("version", false, "Print version and exit")
+		completion         = flag.Bool("completion", false, "Print bash completion script to stdout (source with: source <(./weka-log-collector --completion))")
+		listBundles        = flag.Bool("list-bundles", false, fmt.Sprintf("List bundles in %s", wlcBundlesDir))
+		rmBundle           = flag.String("rm-bundle", "", fmt.Sprintf("Remove a specific bundle from %s (filename or full path)", wlcBundlesDir))
+		cleanBundles       = flag.Bool("clean-bundles", false, fmt.Sprintf("Remove all bundles from %s", wlcBundlesDir))
+		uploadFile         = flag.String("upload-file", "", fmt.Sprintf("Upload a specific file to Weka Home (must be under %s, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)", wlcBaseDir))
+		uploadSessionID    = flag.Int64("upload-session-id", 0, "Internal: shared session ID for wlc: symlink grouping across cluster nodes")
+		compression        = flag.String("compression", "gzip", "Compression format: gzip|xz (xz requires the xz binary on PATH)")
+		anonymize          = flag.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name, AD domain) with placeholders. Mapping written next to the bundle as <bundle>.anonymization-key.json (kept by the customer; not in the archive).")
+		anonymizeKey       = flag.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
+		force              = flag.Bool("force", false, "Override the run lock (use only when an earlier run is known to be hung)")
+		collectTracesFlag  = flag.Bool("collect-traces", false, "Collect traces via trace_extractor (WEKA v5.x+ only; requires --start-time; window capped at 1 hour)")
+		traceExtractorPath = flag.String("trace-extractor-path", "", "Path to trace_extractor binary (default: auto-discover alongside wlc binary or in PATH)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
 	var containerNamesFlag multiStringFlag
+	var traceFilterFlags multiStringFlag
 	withClients := flag.Bool("clients", false, "Include client nodes in cluster collection (default: backends only)")
 	clientsOnly := flag.Bool("clients-only", false, "Collect from client nodes only (skip backends)")
 	flag.BoolVar(&verbose, "verbose", false, "Print detailed progress for every file and command")
@@ -5764,6 +5948,7 @@ func main() {
 	flag.StringVar(&sshUserOverride, "ssh-user", "", "Username for SSH connections to cluster nodes (default: current OS user)")
 	flag.Var(&containerIDs, "container-id", "Collect from specific container IDs only (comma-separated or repeatable; e.g. --container-id 0,1 or --container-id 0 --container-id 1)")
 	flag.Var(&containerNamesFlag, "container-name", "Internal: restrict /opt/weka/logs/ collection to these container names (set by orchestrator when --container-id is used)")
+	flag.Var(&traceFilterFlags, "trace-filter", `Filter expression for trace_extractor (repeatable; e.g. --trace-filter "container=drives0 and slot=7"); default when --collect-traces is set: --all`)
 	flag.Usage = usageFunc
 	flag.Parse()
 
@@ -5904,6 +6089,37 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ── validate trace collection window and resolve binary ───────────────
+	if *collectTracesFlag {
+		if from.IsZero() {
+			// No explicit --start-time: default window (8h) is too large for traces.
+			logf("Note: --collect-traces skipped — requires an explicit --start-time (max 1 hour).")
+			logf("      Traces are targeted; use e.g. --start-time -30m --collect-traces")
+			*collectTracesFlag = false
+		} else {
+			effectiveTo := to
+			if effectiveTo.IsZero() {
+				effectiveTo = time.Now()
+			}
+			if effectiveTo.Sub(from) > traceMaxWindow {
+				logf("Note: --collect-traces skipped — time window is %.0f minutes (max: 60 minutes).",
+					effectiveTo.Sub(from).Minutes())
+				logf("      Narrow the window with --start-time / --end-time to at most 1 hour.")
+				*collectTracesFlag = false
+			}
+		}
+	}
+	if *collectTracesFlag {
+		collectTraces = true
+		traceFilters = []string(traceFilterFlags)
+		var err error
+		resolvedTraceExtractorPath, err = findTraceExtractor(*traceExtractorPath)
+		if err != nil {
+			errorf("--collect-traces: %v", err)
+			os.Exit(1)
+		}
+	}
+
 	// ── default time window ───────────────────────────────────────────────
 	// Default to the last 8 hours when no --start-time was specified, regardless
 	// of profile. For longer windows pass --start-time -24h, -7d, etc. The window
@@ -5974,6 +6190,13 @@ func main() {
 	}
 	if globalAnonymizer.enabled {
 		logf("Anonymize: ON  (mapping → %s)", keyPath)
+	}
+	if collectTraces {
+		filterDesc := "--all"
+		if len(traceFilters) > 0 {
+			filterDesc = strings.Join(traceFilters, " OR ")
+		}
+		logf("Traces:   %s  (filter: %s)", resolvedTraceExtractorPath, filterDesc)
 	}
 
 	// ── write anonymization mapping after collection completes ───────────
@@ -6455,11 +6678,22 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	if compression != "" && compression != "gzip" {
 		args = append(args, "--compression", compression)
 	}
-	collectionCmd := strings.Join(args, " ")
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		args = append(args, "--collect-traces")
+		args = append(args, "--trace-extractor-path", remoteTraceExtractorPath)
+		for _, f := range traceFilters {
+			args = append(args, "--trace-filter", f)
+		}
+	}
+	collectionCmd := shellJoin(args)
 	timeoutSecs := int(sshTimeout.Seconds())
+	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath)
+	}
 	remoteShellCmd := fmt.Sprintf(
 		"%s; trap '%s' EXIT; timeout %d %s",
-		maybeRemoteSudo("chmod +x "+remoteBin),
+		chmodSetup,
 		maybeRemoteSudo("rm -f "+remoteBin),
 		timeoutSecs,
 		maybeRemoteSudo(collectionCmd),
@@ -6578,6 +6812,18 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	// are handled separately below so they land in cluster/weka/ — the same path
 	// writeMergedArchive uses — keeping all bundle types structurally consistent.
 	manifest := CollectLocal(tw, archiveRoot, profile, from, to, cmdTimeout, true, containerNames, nil)
+
+	// Trace collection is always per-node. Run after local data so the trace
+	// archive lands next to the regular node data under hosts/<hostname>/traces/.
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		hostname, _ := os.Hostname()
+		pathHostname := hostname
+		if globalAnonymizer.enabled {
+			pathHostname = string(globalAnonymizer.Apply([]byte(hostname)))
+		}
+		phase(fmt.Sprintf("[%s] Collecting traces", hostname))
+		runTraceExtractor(tw, archiveRoot, pathHostname, from, to)
+	}
 
 	// When acting as orchestrator (not a --node-only sub-invocation), also run
 	// cluster-wide weka commands with proper stats throttle and store under cluster/.
@@ -6895,6 +7141,16 @@ OPTIONS
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
 
+TRACES  (requires WEKA v5.x+ on each node; window is capped at 1 hour)
+  --collect-traces             Collect per-node traces via trace_extractor alongside regular logs.
+                               Stored under hosts/<hostname>/traces/ in the bundle.
+  --trace-filter EXPR          Filter expression (repeatable; OR'd together).
+                               e.g. --trace-filter "container=drives0 and slot=7"
+                               Default when omitted: collect all traces (--all).
+  --trace-extractor-path PATH  Override the trace_extractor binary path.
+                               Default: auto-discovered alongside the wlc binary, in PATH,
+                               or at /opt/weka/weka-log-collector/trace_extractor.
+
 BUNDLE MANAGEMENT
   --list-bundles       List bundles in /opt/weka/weka-log-collector/bundles
   --rm-bundle NAME     Remove a specific bundle (filename or full path)
@@ -6915,6 +7171,12 @@ EXAMPLES
 
   # Specific hosts by IP
   weka-log-collector --host 10.0.0.1 --host 10.0.0.2 --start-time -1h
+
+  # Collect all traces from the last 30 minutes (cluster-wide)
+  weka-log-collector --start-time -30m --collect-traces
+
+  # Collect traces filtered to drives0 container only
+  weka-log-collector --start-time -30m --collect-traces --trace-filter "container=drives0"
 
 `)
 }
