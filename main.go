@@ -3463,7 +3463,7 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 	// timeout kills the process if it exceeds the SSH timeout, preventing orphans
 	// when the orchestrator can no longer wait (e.g. after SSH connection drops).
 	// --node-only skips cluster-wide commands (run once by the orchestrator locally).
-	collectionCmd := strings.Join(append([]string{
+	collectionCmd := shellJoin(append([]string{
 		remoteBin,
 		"--local",
 		"--node-only",
@@ -3491,7 +3491,7 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 			}
 		}
 		return extra
-	}()...), " ")
+	}()...))
 
 	timeoutSecs := int(sshTimeout.Seconds())
 	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
@@ -4609,6 +4609,14 @@ type kubectlRunner struct {
 // safe for embedding in a shell command string.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func shellJoin(args []string) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = shellQuote(a)
+	}
+	return strings.Join(parts, " ")
 }
 
 // buildKubectlArgs prepends --kubeconfig=... when set.
@@ -6677,7 +6685,7 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 			args = append(args, "--trace-filter", f)
 		}
 	}
-	collectionCmd := strings.Join(args, " ")
+	collectionCmd := shellJoin(args)
 	timeoutSecs := int(sshTimeout.Seconds())
 	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
 	if collectTraces && resolvedTraceExtractorPath != "" {
