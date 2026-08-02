@@ -4427,7 +4427,8 @@ _weka_log_collector() {
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
           --extra-commands --cmd-timeout --compression --anonymize --anonymize-key --force
-          --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers"
+          --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers
+          --collect-traces --trace-filter --trace-extractor-path"
 
     case "$prev" in
         --profile)
@@ -4438,7 +4439,7 @@ _weka_log_collector() {
             COMPREPLY=( $(compgen -W "gzip xz" -- "$cur") )
             return 0
             ;;
-        --output|--anonymize-key)
+        --output|--anonymize-key|--trace-extractor-path)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
