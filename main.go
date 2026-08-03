@@ -4165,7 +4165,7 @@ func uploadBundle(archivePath string, sessionID int64) error {
 	// (network to Weka Home can be slow); also scale by file size at ~0.5 MB/s
 	// to handle large archives. If nothing happens in that window the uploader
 	// for that container is likely broken (e.g. HostId FAILURE in cloud status).
-	perDirTimeout := time.Duration(max(300, sizeMB*2)) * time.Second
+	perDirTimeout := time.Duration(max(600, sizeMB*4)) * time.Second
 
 	for i, supportDir := range supportDirs {
 		containerName := filepath.Base(filepath.Dir(supportDir))
@@ -4192,7 +4192,7 @@ func uploadBundle(archivePath string, sessionID int64) error {
 		start := time.Now()
 		lastLog := start
 		perDirDeadline := start.Add(perDirTimeout)
-		overallDeadline := start.Add(20 * time.Minute)
+		overallDeadline := start.Add(perDirTimeout + 2*time.Minute)
 		success := false
 
 		for time.Now().Before(overallDeadline) {
@@ -4354,7 +4354,7 @@ func uploadK8sBundle(kc *kubectlRunner, clusterNS, archivePath string) error {
 	logf("  Queued %s (%d MB) — waiting for weka uploader (speed varies; ~%d min at 0.5 MB/s)...", filename, sizeMB, estMins)
 
 	// 6. Poll until the uploader daemon signals completion.
-	perDirTimeout := time.Duration(max(300, sizeMB*2)) * time.Second
+	perDirTimeout := time.Duration(max(600, sizeMB*4)) * time.Second
 	start := time.Now()
 	lastLog := start
 	deadline := start.Add(perDirTimeout)
