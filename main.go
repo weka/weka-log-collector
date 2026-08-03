@@ -4135,7 +4135,7 @@ func uploadBundle(archivePath string, sessionID int64) error {
 	if info != nil {
 		sizeMB = info.Size() / (1024 * 1024)
 	}
-	estMins := (sizeMB / 60) + 1
+	estMins := (sizeMB / 30) + 1
 
 	// Track the currently active symlink for signal cleanup.
 	var mu sync.Mutex
@@ -4186,7 +4186,7 @@ func uploadBundle(archivePath string, sessionID int64) error {
 
 		logf("Queued %s (%d MB) in %s", filename, sizeMB, supportDir)
 		if i == 0 {
-			logf("Waiting for weka uploader daemon (~1 MB/s, estimated ~%d min)...", estMins)
+			logf("Waiting for weka uploader daemon (~0.5–1 MB/s, estimated ~%d min)...", estMins)
 		}
 
 		start := time.Now()
@@ -4350,8 +4350,8 @@ func uploadK8sBundle(kc *kubectlRunner, clusterNS, archivePath string) error {
 		return fmt.Errorf("create upload symlink in pod: %w", err)
 	}
 
-	estMins := (sizeMB / 60) + 1
-	logf("  Queued %s (%d MB) — waiting for weka uploader (~1 MB/s, est. ~%d min)...", filename, sizeMB, estMins)
+	estMins := (sizeMB / 30) + 1
+	logf("  Queued %s (%d MB) — waiting for weka uploader (~0.5–1 MB/s, est. ~%d min)...", filename, sizeMB, estMins)
 
 	// 6. Poll until the uploader daemon signals completion.
 	perDirTimeout := time.Duration(max(300, sizeMB*2)) * time.Second
