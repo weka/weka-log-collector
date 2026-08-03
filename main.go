@@ -6118,6 +6118,10 @@ func main() {
 			errorf("--collect-traces: %v", err)
 			os.Exit(1)
 		}
+		// Ensure the binary is executable for local invocations. The SSH path
+		// does chmod +x on remote nodes, but the orchestrating node runs the
+		// binary directly without going through that path.
+		_ = os.Chmod(resolvedTraceExtractorPath, 0755)
 	}
 
 	// ── default time window ───────────────────────────────────────────────
