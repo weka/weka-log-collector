@@ -44,7 +44,7 @@ git pull
 | Binary                     | Architecture | Nodes                        |
 |----------------------------|--------------|------------------------------|
 | `weka-log-collector`       | Linux amd64  | Standard Weka nodes (x86_64) |
-| `weka-log-collector-arm64` | Linux arm64  | Nebius and other ARM nodes   |
+| `weka-log-collector-arm64` | Linux arm64  | ARM nodes (aarch64)          |
 
 Both binaries are included — `git pull` keeps them up to date automatically.
 
