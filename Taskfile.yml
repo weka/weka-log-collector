@@ -3,6 +3,7 @@ version: '3'
 vars:
   BINARY: weka-log-collector
   LINUX_BINARY: weka-log-collector
+  LINUX_ARM64_BINARY: weka-log-collector-arm64
 
 tasks:
   fmt:
@@ -31,12 +32,17 @@ tasks:
       - go build -o {{.BINARY}} ./...
 
   build-linux:
-    desc: Build portable static Linux binary (for deployment to Weka nodes)
+    desc: Build portable static Linux binary for amd64 (for deployment to Weka nodes)
     cmds:
       - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o {{.LINUX_BINARY}} ./...
 
+  build-linux-arm64:
+    desc: Build portable static Linux binary for arm64 (Nebius and other ARM nodes)
+    cmds:
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o {{.LINUX_ARM64_BINARY}} ./...
+
   check:
-    desc: Run all quality checks (fmt, vet, lint, test, build, build-linux)
+    desc: Run all quality checks (fmt, vet, lint, test, build, build-linux, build-linux-arm64)
     cmds:
       - task: fmt
       - task: vet
@@ -44,6 +50,7 @@ tasks:
       - task: test
       - task: build
       - task: build-linux
+      - task: build-linux-arm64
 
   install-hooks:
     desc: Install git hooks (builds Linux binary and stages it on every commit)
@@ -55,4 +62,4 @@ tasks:
   clean:
     desc: Remove built binaries
     cmds:
-      - rm -f {{.BINARY}} {{.LINUX_BINARY}}
+      - rm -f {{.BINARY}} {{.LINUX_BINARY}} {{.LINUX_ARM64_BINARY}}
