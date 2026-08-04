@@ -28,11 +28,25 @@ A single binary that collects exactly what you need from one node or the entire 
 ## Installation
 
 ```bash
-git clone https://github.com/weka/weka-log-collector
-scp weka-log-collector/weka-log-collector root@<node-ip>:/opt/weka/weka-log-collector/weka-log-collector
+git clone --depth=1 https://github.com/weka/weka-log-collector
 ```
 
-The binary is a static Linux amd64 build — no dependencies, works on any Weka node.
+> Use `--depth=1` to fetch only the latest commit (~15 MB). Without it the full binary history is downloaded (~200 MB).
+
+To update on any node:
+
+```bash
+git pull
+```
+
+### Architecture
+
+| Binary                     | Architecture | Nodes                        |
+|----------------------------|--------------|------------------------------|
+| `weka-log-collector`       | Linux amd64  | Standard Weka nodes (x86_64) |
+| `weka-log-collector-arm64` | Linux arm64  | Nebius and other ARM nodes   |
+
+Both binaries are included — `git pull` keeps them up to date automatically.
 
 > The tool stores all files (archives, debug logs, the self-deployed binary) under `/opt/weka/weka-log-collector/`. This directory is created automatically on first use and on remote nodes during cluster-wide collection. `/opt/weka/` is used instead of `/tmp` to avoid `noexec` mount restrictions common on hardened systems.
 
