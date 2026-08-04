@@ -1076,9 +1076,9 @@ func buildWindowedDefaultCmds(from, to time.Time) []CommandSpec {
 	return []CommandSpec{
 		// All events at major+ severity within the collection window.
 		{Name: "weka_events_major", Cmd: "weka events --severity major -J" + startFlag, JSON: true},
-		// LeaderIterationTooSlow fires when the leader's main loop takes too long —
+		// LeaderIterationRuntimeTooLong fires when the leader's main loop takes too long —
 		// a key early-warning signal. Time-windowed so it aligns with the collection window.
-		{Name: "weka_events_leader_too_slow", Cmd: "weka events --type-list LeaderIterationTooSlow --show-internal --no-header" + startFlag},
+		{Name: "weka_events_leader_too_slow", Cmd: "weka events --type-list LeaderIterationRuntimeTooLong --show-internal --no-header" + startFlag},
 	}
 }
 
