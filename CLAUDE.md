@@ -45,7 +45,7 @@ No build step needed on the node — the binaries are always up to date in git.
 | Binary                    | Architecture         | Nodes               |
 |---------------------------|----------------------|---------------------|
 | `weka-log-collector`      | Linux amd64 (x86_64) | Standard Weka nodes |
-| `weka-log-collector-arm64`| Linux arm64 (aarch64)| Nebius and ARM nodes|
+| `weka-log-collector-arm64`| Linux arm64 (aarch64)| ARM nodes (aarch64) |
 
 ## Code Layout
 
