@@ -1885,6 +1885,7 @@ type HostManifest struct {
 	From           *time.Time      `json:"from,omitempty"`
 	To             *time.Time      `json:"to,omitempty"`
 	WekaVersion    string          `json:"weka_version,omitempty"`
+	WekaDown       bool            `json:"weka_down,omitempty"`
 	Commands       []CommandResult `json:"commands"`
 	Files          []FileResult    `json:"files"`
 	Errors         []string        `json:"errors,omitempty"`
@@ -2732,27 +2733,43 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// ── phase: weka CLI commands (parallel) ───────────────────────────────
 	phase(fmt.Sprintf("[%s] Weka commands (profile: %s, %d parallel)", hostname, profile, cmdWorkers))
 
-	// Auth probe: run weka status first. Exit 41 = authentication required.
-	// If auth fails, skip all Weka CLI commands to avoid 30+ identical warnings.
-	wekaAvailable := true
+	// Auth probe: run weka status with a short timeout to detect two failure modes:
+	//   exit 41          → auth required; skip cluster commands but keep weka local ps/resources
+	//   timeout/other    → container down; skip all weka commands (local agent is also unavailable)
+	// Using a short probe timeout (10s) avoids a 120s hang per batch when the container is down.
+	type wekaState int
+	const (
+		wekaOK     wekaState = iota
+		wekaNoAuth           // exit 41 — needs login
+		wekaDown             // container down or unresponsive
+	)
+	weka := wekaOK
 	{
 		probe := CommandSpec{Name: "weka_auth_probe", Cmd: "weka status"}
-		probeResult, _ := runCommand(probe, cmdTimeout)
+		probeResult, _ := runCommand(probe, 10*time.Second)
 		if probeResult.ExitCode == 41 {
-			wekaAvailable = false
-			warnf("[%s] Weka authentication required — run 'weka user login' first. Skipping cluster-wide Weka commands (weka local ps/resources still collected).", hostname)
+			weka = wekaNoAuth
+			warnf("[%s] Weka authentication required — run 'weka user login' first. Skipping Weka commands (weka local ps/resources still collected).", hostname)
+		} else if probeResult.ExitCode != 0 {
+			weka = wekaDown
+			manifest.WekaDown = true
+			warnf("[%s] Weka container unavailable (weka status exit %d) — skipping all Weka commands. Log files from /opt/weka/logs/ still collected.", hostname, probeResult.ExitCode)
 		}
 	}
 
 	allWekaCmds := append(append(append([]CommandSpec{}, defaultCommands...), buildWindowedDefaultCmds(from, to)...), buildProfileCommands(profile, from, to)...)
 
-	// Filter to the commands we'll actually run on this node before parallelising.
-	// LocalOnly commands (weka local ps/resources) bypass the auth gate — they talk
-	// to the local agent only and work even when cluster auth is unavailable.
+	// Filter commands based on weka availability:
+	//   wekaOK     → run everything
+	//   wekaNoAuth → run LocalOnly commands only (weka local ps/resources talk to local agent, not cluster)
+	//   wekaDown   → skip everything (local agent is also down)
 	var wekaToRun []CommandSpec
 	var skippedClusterCmds int
 	for _, spec := range allWekaCmds {
-		if !wekaAvailable && !spec.LocalOnly {
+		if weka == wekaDown {
+			continue
+		}
+		if weka == wekaNoAuth && !spec.LocalOnly {
 			continue
 		}
 		if nodeOnly && !spec.NodeLocal {
@@ -2764,7 +2781,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	if skippedClusterCmds > 0 {
 		vlogf("  [%s] skipping %d cluster-wide commands (--node-only)", hostname, skippedClusterCmds)
 	}
-	if wekaAvailable {
+	if weka == wekaOK {
 		logf("  [%s] running %d weka commands", hostname, len(wekaToRun))
 	}
 	wekaOutputs := runCommandsParallel(wekaToRun, cmdTimeout, cmdWorkers)
@@ -3861,7 +3878,9 @@ func releaseRunLock() {
 }
 
 func getClusterName() string {
-	out, err := exec.Command("weka", "status").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "weka", "status").Output()
 	if err == nil {
 		// Look for a line like:  "       cluster: CST-LTS (uuid)"
 		for _, line := range strings.Split(string(out), "\n") {
@@ -6833,7 +6852,12 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	// cluster-wide weka commands with proper stats throttle and store under cluster/.
 	var clusterTotal, clusterFailed int
 	if !nodeOnly {
-		clusterTotal, clusterFailed = addClusterWideCmdsToArchive(tw, archiveRoot, profile, from, to, cmdTimeout)
+		if manifest.WekaDown {
+			clusterCmds := buildClusterWideCmds(profile, from, to)
+			warnf("[cluster] Weka unavailable — skipping %d cluster-wide commands", len(clusterCmds))
+		} else {
+			clusterTotal, clusterFailed = addClusterWideCmdsToArchive(tw, archiveRoot, profile, from, to, cmdTimeout)
+		}
 		if len(extraCmds) > 0 {
 			phase(fmt.Sprintf("Extra commands (%d)", len(extraCmds)))
 			extraOutputs := runCommandsParallel(extraCmds, cmdTimeout, clusterCmdWorkers)
