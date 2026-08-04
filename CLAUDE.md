@@ -4,20 +4,21 @@
 
     task check
 
-This runs in order: fmt -> vet -> lint -> test -> build -> build-linux.
+This runs in order: fmt -> vet -> lint -> test -> build -> build-linux -> build-linux-arm64.
 **Do not commit if any step fails.**
 
 ## Individual Tasks
 
-| Command            | What it does                                          |
-|--------------------|-------------------------------------------------------|
-| `task fmt`         | Format code with gofmt (modifies files)               |
-| `task vet`         | Static analysis (go vet)                              |
-| `task lint`        | Linter (staticcheck)                                  |
-| `task test`        | Unit tests (go test ./... -v)                         |
-| `task build`       | Compile binary for current platform (macOS)           |
-| `task build-linux` | Cross-compile static Linux binary                     |
-| `task check`       | All of the above, in order                            |
+| Command                  | What it does                                          |
+|--------------------------|-------------------------------------------------------|
+| `task fmt`               | Format code with gofmt (modifies files)               |
+| `task vet`               | Static analysis (go vet)                              |
+| `task lint`              | Linter (staticcheck)                                  |
+| `task test`              | Unit tests (go test ./... -v)                         |
+| `task build`             | Compile binary for current platform (macOS)           |
+| `task build-linux`       | Cross-compile static Linux binary (amd64)             |
+| `task build-linux-arm64` | Cross-compile static Linux binary (arm64)             |
+| `task check`             | All of the above, in order                            |
 
 ## One-Time Setup
 
@@ -35,11 +36,16 @@ Install git hooks (builds and stages the Linux binary on every commit):
 
 ## Deploying to Weka nodes
 
-The compiled Linux binary is committed to the repo. Backend nodes update with:
+Both Linux binaries are committed to the repo. Nodes update with:
 
     git pull
 
-No build step needed on the node — the binary is always up to date in git.
+No build step needed on the node — the binaries are always up to date in git.
+
+| Binary                    | Architecture         | Nodes               |
+|---------------------------|----------------------|---------------------|
+| `weka-log-collector`      | Linux amd64 (x86_64) | Standard Weka nodes |
+| `weka-log-collector-arm64`| Linux arm64 (aarch64)| Nebius and ARM nodes|
 
 ## Code Layout
 
@@ -51,7 +57,7 @@ No build step needed on the node — the binary is always up to date in git.
 
 - NEVER commit without running `task check` first
 - Fix ALL fmt, vet, lint, and test failures before committing
-- ALWAYS stage and commit the `weka-log-collector` binary alongside code changes (`git add weka-log-collector`)
+- ALWAYS stage and commit BOTH binaries alongside code changes (`git add weka-log-collector weka-log-collector-arm64`)
 - No external dependencies — stdlib only
 - No CGo
-- Binary must build statically for Linux amd64 via `task build-linux`
+- Both binaries must build statically via `task build-linux` (amd64) and `task build-linux-arm64` (arm64)
