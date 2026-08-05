@@ -6854,7 +6854,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	if !nodeOnly {
 		if manifest.WekaDown {
 			clusterCmds := buildClusterWideCmds(profile, from, to)
-			warnf("[cluster] Weka unavailable — skipping %d cluster-wide commands", len(clusterCmds))
+			warnf("[cluster] skipping %d cluster-wide commands (local container is down)", len(clusterCmds))
 		} else {
 			clusterTotal, clusterFailed = addClusterWideCmdsToArchive(tw, archiveRoot, profile, from, to, cmdTimeout)
 		}
