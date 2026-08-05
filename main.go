@@ -1486,9 +1486,8 @@ var systemCommands = []CommandSpec{
 	{Name: "ib_device_modes", Cmd: "grep \"\" /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
 	{Name: "ib_lid_values", Cmd: "grep \"\" /sys/class/net/*/device/infiniband/*/ports/*/lid 2>/dev/null", NodeOptional: true},
 	{Name: "pci_net_mtu", Cmd: "grep \"\" /sys/bus/pci/devices/*/net/*/mtu 2>/dev/null", NodeOptional: true},
-	// ── IP address / route (JSON for programmatic analysis) ───────────────────
-	{Name: "ip_addr_json", Cmd: "ip -j -o addr show", JSON: true},
-	{Name: "ip_route_json", Cmd: "ip -4 --json route", JSON: true},
+	// ── IP address ───────────────────────────────────────────────────────────
+	{Name: "ip_addr", Cmd: "ip addr show"},
 	// ── cgroup state ──────────────────────────────────────────────────────────
 	{Name: "cgroup_type", Cmd: "stat -fc %T /sys/fs/cgroup", NodeOptional: true},
 	{Name: "cgroup_cpuset", Cmd: "grep \"\" /sys/fs/cgroup/weka-*/cpuset.cpus.effective /sys/fs/cgroup/cpuset/weka-*/cpuset.cpus 2>/dev/null", NodeOptional: true},
