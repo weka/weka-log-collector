@@ -1484,9 +1484,6 @@ var systemCommands = []CommandSpec{
 	{Name: "modprobe_d_listing", Cmd: "ls /etc/modprobe.d/"},
 	// ── bonding ───────────────────────────────────────────────────────────────
 	{Name: "bonding_info", Cmd: `for f in /proc/net/bonding/*; do [ -f "$f" ] || continue; echo "=== $f ==="; cat "$f"; done 2>/dev/null`, NodeOptional: true},
-	{Name: "bonding_modes", Cmd: "grep \"\" /sys/class/net/*/bonding/mode 2>/dev/null", NodeOptional: true},
-	{Name: "bonding_slaves", Cmd: "grep \"\" /sys/class/net/*/bonding/slaves 2>/dev/null", NodeOptional: true},
-	{Name: "bonding_hash_policy", Cmd: "grep \"\" /sys/class/net/*/bonding/xmit_hash_policy 2>/dev/null", NodeOptional: true},
 	// ── InfiniBand / network device sysfs ─────────────────────────────────────
 	{Name: "net_device_types", Cmd: "grep \"\" /sys/class/net/*/type 2>/dev/null", NodeOptional: true},
 	{Name: "ib_device_modes", Cmd: "grep \"\" /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
@@ -1553,8 +1550,6 @@ var logFileSpecs = []LogFileSpec{
 	// Boot and init
 	{SrcGlob: "/var/log/boot.log", DestDir: "system"},
 	{SrcGlob: "/var/log/boot.log-*", DestDir: "system"},
-	{SrcGlob: "/var/log/dmesg", DestDir: "system"},
-	{SrcGlob: "/var/log/dmesg.*", DestDir: "system"},
 	// Cloud-init (important on OCI/AWS instances)
 	{SrcGlob: "/var/log/cloud-init.log", DestDir: "system"},
 	{SrcGlob: "/var/log/cloud-init-output.log", DestDir: "system"},
