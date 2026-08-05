@@ -1055,20 +1055,8 @@ var defaultCommands = []CommandSpec{
 	// ── version detail ────────────────────────────────────────────────────────
 	{Name: "weka_version_current", Cmd: "weka version current"},
 	// ── container / host detail ───────────────────────────────────────────────
-	{Name: "weka_container_releases", Cmd: "weka cluster container --output release --no-header"},
 	{Name: "weka_client_target_version", Cmd: "weka cluster client-target-version show"},
 	{Name: "weka_cluster_leader", Cmd: "weka cluster host --leader --no-header --output id"},
-	{Name: "weka_container_resources_summary", Cmd: "weka cluster container -b -o container,cores,memory --no-header"},
-	{Name: "weka_container_uuids", Cmd: "weka cluster container --output ips,machineIdentifier,hostname --no-header"},
-	// ── process / drive / bucket metrics ─────────────────────────────────────
-	{Name: "weka_compute_ram", Cmd: "weka cluster process -F role=COMPUTE --output memory --no-header --raw-units"},
-	{Name: "weka_drive_sizes", Cmd: "weka cluster drive --output size --sort size --raw-units --no-header"},
-	{Name: "weka_drive_block_sizes", Cmd: "weka cluster drive --output block --no-header"},
-	{Name: "weka_bucket_fill_levels", Cmd: "weka cluster bucket -o fillLevel --no-header"},
-	{Name: "weka_bucket_uptime", Cmd: "weka cluster bucket --json -s -uptime", JSON: true},
-	{Name: "weka_process_uptime", Cmd: "weka cluster process --json -s -uptime", JSON: true},
-	// ── filesystem detail ─────────────────────────────────────────────────────
-	{Name: "weka_fs_detailed", Cmd: "weka fs -o name,usedSSD,availableSSD,stores --no-header -R"},
 	// ── debug config snapshots ────────────────────────────────────────────────
 	{Name: "weka_obs_scarce_mode", Cmd: `weka debug config show "obsBuckets[*]._scarceMode"`},
 	{Name: "weka_debug_snapviews", Cmd: "weka debug config show snapViews -J", JSON: true},
@@ -1399,7 +1387,6 @@ var smbwCommands = []CommandSpec{
 	{Name: "weka_smb_cluster_info", Cmd: "weka debug config show sambaClusterInfo -J", Profile: ProfileSMBW, JSON: true},
 	{Name: "pcs_cluster_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs cluster status", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "pcs_status", Cmd: "weka local exec --container smbw /usr/sbin/pcs status", Profile: ProfileSMBW, NodeLocal: true},
-	{Name: "pcs_status_resources", Cmd: "weka local exec --container smbw /usr/sbin/pcs status resources", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "pcs_constraint", Cmd: "weka local exec --container smbw /usr/sbin/pcs constraint", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "sssd_conf", Cmd: "cat /etc/sssd/sssd.conf", Profile: ProfileSMBW, NodeLocal: true},
 	{Name: "tsmb_conf", Cmd: "weka local exec -C smbw cat /tmp/smbw-config-fs/.smbw/tsmb.conf", Profile: ProfileSMBW, NodeLocal: true},
@@ -1451,14 +1438,12 @@ var systemCommands = []CommandSpec{
 	{Name: "ip_rule", Cmd: "ip rule"},
 	{Name: "ip_neighbor", Cmd: "ip neighbor"},
 	{Name: "ip_route_all_tables", Cmd: "ip route show table all"},
-	{Name: "rp_filter", Cmd: "sysctl -a | grep -w rp_filter"},
 	// ── Mellanox firmware settings (ADVANCED_PCI_SETTINGS, PCI_WR_ORDERING) ─
 	// mst/mlxconfig only present on nodes with ConnectX NICs + MFT package;
 	// fails gracefully on Intel/other NIC nodes
 	{Name: "mst_status", Cmd: "mst status -v"},
 	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
 	// ── SELinux / secure boot ─────────────────────────────────────────────────
-	{Name: "getenforce", Cmd: "getenforce", NodeOptional: true},
 	{Name: "sestatus", Cmd: "sestatus", NodeOptional: true},
 	{Name: "selinux_config", Cmd: "cat /etc/selinux/config", NodeOptional: true},
 	{Name: "secureboot_state", Cmd: "mokutil --sb-state", NodeOptional: true},
@@ -1467,10 +1452,8 @@ var systemCommands = []CommandSpec{
 	{Name: "iommu_state", Cmd: "ls /sys/class/iommu/ /sys/kernel/iommu_groups/ 2>/dev/null", NodeOptional: true},
 	// ── CPU / memory detail ───────────────────────────────────────────────────
 	{Name: "proc_cpuinfo", Cmd: "cat /proc/cpuinfo"},
-	{Name: "cpuinfo_aes", Cmd: "grep -m1 aes /proc/cpuinfo", NodeOptional: true},
 	{Name: "proc_meminfo", Cmd: "cat /proc/meminfo"},
 	{Name: "smt_active", Cmd: "cat /sys/devices/system/cpu/smt/active", NodeOptional: true},
-	{Name: "numa_balancing", Cmd: "cat /proc/sys/kernel/numa_balancing"},
 	{Name: "numa_meminfo", Cmd: "grep MemTotal /sys/devices/system/node/node*/meminfo", NodeOptional: true},
 	{Name: "numa_nodes", Cmd: "ls -d /sys/devices/system/node/node*", NodeOptional: true},
 	// ── hugepages ─────────────────────────────────────────────────────────────
@@ -1487,7 +1470,6 @@ var systemCommands = []CommandSpec{
 	// ── mount / filesystem config ─────────────────────────────────────────────
 	{Name: "mount", Cmd: "mount"},
 	{Name: "fstab", Cmd: "cat /etc/fstab"},
-	{Name: "mtab", Cmd: "cat /etc/mtab", NodeOptional: true},
 	{Name: "resolv_conf", Cmd: "cat /etc/resolv.conf"},
 	// ── package list (rpm on RHEL family, dpkg on Debian/Ubuntu) ─────────────
 	{Name: "pkg_list", Cmd: "rpm -qa 2>/dev/null || dpkg -l 2>/dev/null", NodeOptional: true},
@@ -1499,18 +1481,13 @@ var systemCommands = []CommandSpec{
 	{Name: "modprobe_d_listing", Cmd: "ls /etc/modprobe.d/"},
 	// ── bonding ───────────────────────────────────────────────────────────────
 	{Name: "bonding_info", Cmd: `for f in /proc/net/bonding/*; do [ -f "$f" ] || continue; echo "=== $f ==="; cat "$f"; done 2>/dev/null`, NodeOptional: true},
-	{Name: "bonding_modes", Cmd: "grep \"\" /sys/class/net/*/bonding/mode 2>/dev/null", NodeOptional: true},
-	{Name: "bonding_slaves", Cmd: "grep \"\" /sys/class/net/*/bonding/slaves 2>/dev/null", NodeOptional: true},
-	{Name: "bonding_hash_policy", Cmd: "grep \"\" /sys/class/net/*/bonding/xmit_hash_policy 2>/dev/null", NodeOptional: true},
 	// ── InfiniBand / network device sysfs ─────────────────────────────────────
 	{Name: "net_device_types", Cmd: "grep \"\" /sys/class/net/*/type 2>/dev/null", NodeOptional: true},
 	{Name: "ib_device_modes", Cmd: "grep \"\" /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
 	{Name: "ib_lid_values", Cmd: "grep \"\" /sys/class/net/*/device/infiniband/*/ports/*/lid 2>/dev/null", NodeOptional: true},
-	{Name: "ib_uverbs_module", Cmd: "grep ib_uverbs /proc/modules", NodeOptional: true},
 	{Name: "pci_net_mtu", Cmd: "grep \"\" /sys/bus/pci/devices/*/net/*/mtu 2>/dev/null", NodeOptional: true},
-	// ── IP address / route (JSON for programmatic analysis) ───────────────────
-	{Name: "ip_addr_json", Cmd: "ip -j -o addr show", JSON: true},
-	{Name: "ip_route_json", Cmd: "ip -4 --json route", JSON: true},
+	// ── IP address ───────────────────────────────────────────────────────────
+	{Name: "ip_addr", Cmd: "ip addr show"},
 	// ── cgroup state ──────────────────────────────────────────────────────────
 	{Name: "cgroup_type", Cmd: "stat -fc %T /sys/fs/cgroup", NodeOptional: true},
 	{Name: "cgroup_cpuset", Cmd: "grep \"\" /sys/fs/cgroup/weka-*/cpuset.cpus.effective /sys/fs/cgroup/cpuset/weka-*/cpuset.cpus 2>/dev/null", NodeOptional: true},
@@ -1568,8 +1545,6 @@ var logFileSpecs = []LogFileSpec{
 	// Boot and init
 	{SrcGlob: "/var/log/boot.log", DestDir: "system"},
 	{SrcGlob: "/var/log/boot.log-*", DestDir: "system"},
-	{SrcGlob: "/var/log/dmesg", DestDir: "system"},
-	{SrcGlob: "/var/log/dmesg.*", DestDir: "system"},
 	// Cloud-init (important on OCI/AWS instances)
 	{SrcGlob: "/var/log/cloud-init.log", DestDir: "system"},
 	{SrcGlob: "/var/log/cloud-init-output.log", DestDir: "system"},
