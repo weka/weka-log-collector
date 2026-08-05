@@ -2011,6 +2011,16 @@ func runCommandsParallel(specs []CommandSpec, timeout time.Duration, workers int
 
 // runCommand executes a shell command with a timeout and returns its output.
 // It is always non-fatal: errors are captured in the returned CommandResult.
+// truncateCmdError shortens noisy multi-line error messages to one line.
+// Weka CLI prints the full valid-event-types list on an invalid --type-list
+// argument (exit 3); we only need the first line.
+func truncateCmdError(msg string) string {
+	if first := strings.SplitN(msg, "\n", 2)[0]; len(first) < len(msg) {
+		return strings.TrimSpace(first) + " (truncated)"
+	}
+	return msg
+}
+
 func runCommand(spec CommandSpec, timeout time.Duration) (CommandResult, []byte) {
 	start := time.Now()
 	result := CommandResult{
@@ -2712,7 +2722,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 			if spec.NodeOptional {
 				vlogf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
 			} else {
-				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, truncateCmdError(co.result.Error))
 			}
 		}
 		content := commandFileContent(spec, co.out, co.result.Error)
@@ -2794,7 +2804,7 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 				// some nodes/distros. Log to verbose/debug only, not as a WARN.
 				vlogf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
 			} else {
-				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, co.result.Error)
+				warnf("[%s] command %q failed (exit %d): %s", hostname, spec.Name, co.result.ExitCode, truncateCmdError(co.result.Error))
 			}
 		}
 		content := commandFileContent(spec, co.out, co.result.Error)
@@ -6950,7 +6960,7 @@ func addClusterWideCmdsToArchive(tw *tar.Writer, archiveRoot, profile string, fr
 			if spec.Profile != "" {
 				vlogf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
 			} else {
-				warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, co.result.Error)
+				warnf("[cluster] command %q failed (exit %d): %s", spec.Name, co.result.ExitCode, truncateCmdError(co.result.Error))
 			}
 		}
 		content := commandFileContent(spec, co.out, co.result.Error)
