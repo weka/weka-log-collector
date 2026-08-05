@@ -1444,7 +1444,6 @@ var systemCommands = []CommandSpec{
 	{Name: "mst_status", Cmd: "mst status -v"},
 	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
 	// ── SELinux / secure boot ─────────────────────────────────────────────────
-	{Name: "getenforce", Cmd: "getenforce", NodeOptional: true},
 	{Name: "sestatus", Cmd: "sestatus", NodeOptional: true},
 	{Name: "selinux_config", Cmd: "cat /etc/selinux/config", NodeOptional: true},
 	{Name: "secureboot_state", Cmd: "mokutil --sb-state", NodeOptional: true},
@@ -1455,7 +1454,6 @@ var systemCommands = []CommandSpec{
 	{Name: "proc_cpuinfo", Cmd: "cat /proc/cpuinfo"},
 	{Name: "proc_meminfo", Cmd: "cat /proc/meminfo"},
 	{Name: "smt_active", Cmd: "cat /sys/devices/system/cpu/smt/active", NodeOptional: true},
-	{Name: "numa_balancing", Cmd: "cat /proc/sys/kernel/numa_balancing"},
 	{Name: "numa_meminfo", Cmd: "grep MemTotal /sys/devices/system/node/node*/meminfo", NodeOptional: true},
 	{Name: "numa_nodes", Cmd: "ls -d /sys/devices/system/node/node*", NodeOptional: true},
 	// ── hugepages ─────────────────────────────────────────────────────────────
@@ -1472,7 +1470,6 @@ var systemCommands = []CommandSpec{
 	// ── mount / filesystem config ─────────────────────────────────────────────
 	{Name: "mount", Cmd: "mount"},
 	{Name: "fstab", Cmd: "cat /etc/fstab"},
-	{Name: "mtab", Cmd: "cat /etc/mtab", NodeOptional: true},
 	{Name: "resolv_conf", Cmd: "cat /etc/resolv.conf"},
 	// ── package list (rpm on RHEL family, dpkg on Debian/Ubuntu) ─────────────
 	{Name: "pkg_list", Cmd: "rpm -qa 2>/dev/null || dpkg -l 2>/dev/null", NodeOptional: true},
@@ -1488,7 +1485,6 @@ var systemCommands = []CommandSpec{
 	{Name: "net_device_types", Cmd: "grep \"\" /sys/class/net/*/type 2>/dev/null", NodeOptional: true},
 	{Name: "ib_device_modes", Cmd: "grep \"\" /sys/class/net/*/mode 2>/dev/null", NodeOptional: true},
 	{Name: "ib_lid_values", Cmd: "grep \"\" /sys/class/net/*/device/infiniband/*/ports/*/lid 2>/dev/null", NodeOptional: true},
-	{Name: "ib_uverbs_module", Cmd: "grep ib_uverbs /proc/modules", NodeOptional: true},
 	{Name: "pci_net_mtu", Cmd: "grep \"\" /sys/bus/pci/devices/*/net/*/mtu 2>/dev/null", NodeOptional: true},
 	// ── IP address / route (JSON for programmatic analysis) ───────────────────
 	{Name: "ip_addr_json", Cmd: "ip -j -o addr show", JSON: true},
