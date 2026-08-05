@@ -159,6 +159,10 @@ var ipv4Re = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 // Matches MAC addresses in colon-separated form (lowercase or uppercase hex).
 var macRe = regexp.MustCompile(`\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b`)
 
+// Matches IPv6 addresses (full, compressed, and IPv4-mapped forms).
+// Requires at least two colon-separated hex groups to avoid false-positives.
+var ipv6Re = regexp.MustCompile(`\b(?:[0-9a-fA-F]{1,4}:){2,7}(?:[0-9a-fA-F]{1,4}|:)\b|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b`)
+
 // trailingDigitsRe extracts the trailing run of digits from a hostname.
 var trailingDigitsRe = regexp.MustCompile(`(\d+)$`)
 
@@ -456,6 +460,8 @@ func (a *anonymizer) Apply(content []byte) []byte {
 	content = a.maskIPv4InContent(content)
 	// 3. MAC: mask first 3 bytes, preserve last 3.
 	content = macRe.ReplaceAllFunc(content, a.maskMAC)
+	// 4. IPv6: mask all but the last group.
+	content = ipv6Re.ReplaceAllFunc(content, a.maskIPv6)
 	return content
 }
 
@@ -508,6 +514,24 @@ func (a *anonymizer) maskIPv4(b []byte) []byte {
 		return []byte(v)
 	}
 	masked := "x.x.x." + parts[3]
+	a.mapIPs[s] = masked
+	return []byte(masked)
+}
+
+func (a *anonymizer) maskIPv6(b []byte) []byte {
+	s := string(b)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if v, ok := a.mapIPs[s]; ok {
+		return []byte(v)
+	}
+	// Preserve the last group for correlation (same strategy as IPv4).
+	parts := strings.Split(s, ":")
+	last := parts[len(parts)-1]
+	if last == "" && len(parts) > 1 {
+		last = parts[len(parts)-2]
+	}
+	masked := "x:x:x:x:x:x:x:" + last
 	a.mapIPs[s] = masked
 	return []byte(masked)
 }
@@ -3141,6 +3165,9 @@ func sshUser() string {
 
 // sshTarget returns user@host for SSH/SCP calls.
 func sshTarget(host string) string {
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
 	return sshUser() + "@" + host
 }
 
