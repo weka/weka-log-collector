@@ -6141,6 +6141,12 @@ func main() {
 	if *collectTracesFlag {
 		collectTraces = true
 		traceFilters = []string(traceFilterFlags)
+		for _, f := range traceFilters {
+			if strings.Contains(f, "&") {
+				errorf("--trace-filter: use 'and' instead of '&' in filter expressions (e.g. \"container=drives0 and slot=1\")")
+				os.Exit(1)
+			}
+		}
 		var err error
 		resolvedTraceExtractorPath, err = findTraceExtractor(*traceExtractorPath)
 		if err != nil {
