@@ -3138,20 +3138,35 @@ func sshUser() string {
 	return "root"
 }
 
-// sshTarget returns user@host for SSH/SCP calls.
+// sshTarget returns the host argument for SSH commands.
+// IPv6 addresses are passed bare (no brackets) — exec.Command bypasses the
+// shell so colons are not interpreted. SSH receives the raw address and
+// connects directly without attempting DNS resolution of a bracketed string.
 func sshTarget(host string) string {
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
-	return sshUser() + "@" + host
+	return host
 }
 
-// sshArgs returns the common SSH option flags used for all SSH/SCP calls.
+// scpRemote returns the remote path spec for SCP destination arguments.
+// IPv6 addresses are wrapped in brackets so SCP can distinguish the host:path
+// colon from the colons in the address. SCP strips the brackets itself before
+// invoking SSH, so SSH always receives a bare IPv6 address.
+func scpRemote(host, path string) string {
+	if strings.Contains(host, ":") {
+		return "[" + host + "]:" + path
+	}
+	return host + ":" + path
+}
+
+// sshArgs returns the common SSH/SCP option flags used for all SSH/SCP calls.
+// User is passed via -o User= so the host argument can be a bare address with
+// no user@ prefix — this avoids SSH's failure to resolve bracketed IPv6 in
+// the user@[IPv6] compound argument form.
 func sshArgs() []string {
 	return []string{
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "ConnectTimeout=30",
 		"-o", "BatchMode=yes",
+		"-o", "User=" + sshUser(),
 	}
 }
 
@@ -3164,6 +3179,7 @@ func probeSSHAccess(host string) error {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "ConnectTimeout=5",
 		"-o", "BatchMode=yes",
+		"-o", "User=" + sshUser(),
 		sshTarget(host), "true",
 	}
 	out, err := exec.Command("ssh", args...).CombinedOutput()
@@ -3325,7 +3341,7 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 // concurrent deploys of different files from colliding.
 func scpFileToRemote(target, localPath, remotePath string) error {
 	if !remoteNeedsSudo() {
-		scpArgs := append(sshArgs(), localPath, target+":"+remotePath)
+		scpArgs := append(sshArgs(), localPath, scpRemote(target, remotePath))
 		if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
 			return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
 		}
@@ -3333,7 +3349,7 @@ func scpFileToRemote(target, localPath, remotePath string) error {
 	}
 	// Non-root: SCP to /tmp, then sudo-move and chmod.
 	tmpRemote := fmt.Sprintf("/tmp/wlc-deploy-%d-%s", os.Getpid(), filepath.Base(remotePath))
-	scpArgs := append(sshArgs(), localPath, target+":"+tmpRemote)
+	scpArgs := append(sshArgs(), localPath, scpRemote(target, tmpRemote))
 	if out, err := exec.Command("scp", scpArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(string(out)))
 	}
