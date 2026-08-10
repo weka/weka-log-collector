@@ -6943,23 +6943,32 @@ func addClusterWideCmdsToArchive(tw *tar.Writer, archiveRoot, profile string, fr
 		return 0, 0
 	}
 
+	if noStats {
+		var filtered []CommandSpec
+		for _, spec := range clusterCmds {
+			if !strings.HasPrefix(spec.Cmd, "weka stats") {
+				filtered = append(filtered, spec)
+			}
+		}
+		if n := len(clusterCmds) - len(filtered); n > 0 {
+			logf("  [cluster] skipping %d weka stats commands (--no-stats)", n)
+		}
+		clusterCmds = filtered
+		if len(clusterCmds) == 0 {
+			return 0, 0
+		}
+	}
+
 	var nonStatsCmds, wekStatsCmds []CommandSpec
 	var nonStatsIdx, statsIdx []int
 	for i, spec := range clusterCmds {
 		if strings.HasPrefix(spec.Cmd, "weka stats") {
-			if !noStats {
-				wekStatsCmds = append(wekStatsCmds, spec)
-				statsIdx = append(statsIdx, i)
-			}
+			wekStatsCmds = append(wekStatsCmds, spec)
+			statsIdx = append(statsIdx, i)
 		} else {
 			nonStatsCmds = append(nonStatsCmds, spec)
 			nonStatsIdx = append(nonStatsIdx, i)
 		}
-	}
-	if noStats && len(clusterCmds) != len(nonStatsCmds) {
-		skipped := len(clusterCmds) - len(nonStatsCmds)
-		logf("  [cluster] skipping %d weka stats commands (--no-stats)", skipped)
-		clusterCmds = nonStatsCmds
 	}
 
 	clusterOutputs := make([]cmdOutput, len(clusterCmds))
