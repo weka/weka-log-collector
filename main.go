@@ -1401,7 +1401,7 @@ var systemCommands = []CommandSpec{
 	{Name: "lscpu", Cmd: "lscpu"},
 	{Name: "lspci", Cmd: "lspci"},
 	{Name: "lsblk", Cmd: "lsblk -o NAME,SIZE,TYPE,ROTA,TRAN,VENDOR,MODEL,SERIAL,STATE,MOUNTPOINT"},
-	{Name: "numactl_hardware", Cmd: "numactl -H"},
+	{Name: "numactl_hardware", Cmd: "numactl -H", NodeOptional: true},
 	// ── processes & disk ─────────────────────────────────────────────────
 	{Name: "ps_elf", Cmd: "ps -elf"},
 	{Name: "df_h", Cmd: "df -h"},
@@ -1423,7 +1423,7 @@ var systemCommands = []CommandSpec{
 	{Name: "dmesg", Cmd: "dmesg -T"},
 	// ── NIC / OFED / routing ──────────────────────────────────────────────
 	{Name: "lshw_network", Cmd: "lshw -C network -businfo"},
-	{Name: "ofed_info", Cmd: "ofed_info -s"},
+	{Name: "ofed_info", Cmd: "ofed_info -s", NodeOptional: true},
 	{Name: "lsmod", Cmd: "lsmod"},
 	{Name: "modinfo_mlx5_core", Cmd: "modinfo mlx5_core"},
 	{Name: "modinfo_ice", Cmd: "modinfo ice"},
@@ -1437,8 +1437,8 @@ var systemCommands = []CommandSpec{
 	// ── Mellanox firmware settings (ADVANCED_PCI_SETTINGS, PCI_WR_ORDERING) ─
 	// mst/mlxconfig only present on nodes with ConnectX NICs + MFT package;
 	// fails gracefully on Intel/other NIC nodes
-	{Name: "mst_status", Cmd: "mst status -v"},
-	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`},
+	{Name: "mst_status", Cmd: "mst status -v", NodeOptional: true},
+	{Name: "mlxconfig_query", Cmd: `for d in /dev/mst/mt*_pciconf0; do echo "=== $d ==="; mlxconfig -d "$d" query 2>&1; done`, NodeOptional: true},
 	// ── SELinux / secure boot ─────────────────────────────────────────────────
 	{Name: "sestatus", Cmd: "sestatus", NodeOptional: true},
 	{Name: "selinux_config", Cmd: "cat /etc/selinux/config", NodeOptional: true},
