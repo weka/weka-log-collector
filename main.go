@@ -5439,6 +5439,7 @@ OPTIONS
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
+  --no-shell-history   Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)
   --verbose            Verbose output (show every kubectl call)
   --version            Print version and exit
 
@@ -7236,7 +7237,7 @@ OPTIONS
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
   --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
-  --cmd-timeout DUR    Per-command timeout (default: 60s)
+  --cmd-timeout DUR    Per-command timeout (default: 120s)
   --no-shell-history   Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)
   --force              Override the run lock (use only when an earlier run is known to be hung)
   --verbose            Detailed per-file/command progress
