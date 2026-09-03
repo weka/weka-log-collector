@@ -1506,6 +1506,8 @@ var systemCommands = []CommandSpec{
 	{Name: "nfs_tcp_connections", Cmd: "ss -nt 'sport = :2049'", NodeOptional: true},
 	// ── security software ─────────────────────────────────────────────────────
 	{Name: "falcon_sensor_status", Cmd: "systemctl status falcon-sensor --no-pager", NodeOptional: true},
+	// ── shell history ─────────────────────────────────────────────────────────
+	{Name: "bash_history", Cmd: "tail -n 1000 /root/.bash_history 2>/dev/null", NodeOptional: true},
 	// weka-agent journal — collected separately in CollectLocal with time window support
 }
 
@@ -1895,6 +1897,9 @@ type HostManifest struct {
 
 // verbose controls whether verbose output is printed to stderr.
 var verbose bool
+
+// noShellHistory skips collecting /root/.bash_history when true (--no-shell-history).
+var noShellHistory bool
 
 // debugLog receives all log output (including verbose) regardless of the
 // --verbose flag. It is set to a real file early in main; until then it
@@ -2708,9 +2713,18 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	hostRoot := filepath.Join(archiveRoot, "hosts", pathHostname)
 
 	// ── phase: system commands (parallel) ────────────────────────────────
+	activeSysCmds := systemCommands
+	if noShellHistory {
+		activeSysCmds = make([]CommandSpec, 0, len(systemCommands))
+		for _, s := range systemCommands {
+			if s.Name != "bash_history" {
+				activeSysCmds = append(activeSysCmds, s)
+			}
+		}
+	}
 	phase(fmt.Sprintf("[%s] System commands (%d parallel)", hostname, cmdWorkers))
-	sysOutputs := runCommandsParallel(systemCommands, cmdTimeout, cmdWorkers)
-	for i, spec := range systemCommands {
+	sysOutputs := runCommandsParallel(activeSysCmds, cmdTimeout, cmdWorkers)
+	for i, spec := range activeSysCmds {
 		co := sysOutputs[i]
 		manifest.Commands = append(manifest.Commands, co.result)
 		if co.result.Error != "" {
@@ -3520,6 +3534,9 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 		}
 		if verbose {
 			extra = append(extra, "--verbose")
+		}
+		if noShellHistory {
+			extra = append(extra, "--no-shell-history")
 		}
 		if len(containerNames) > 0 {
 			extra = append(extra, "--container-name", strings.Join(containerNames, ","))
@@ -4469,7 +4486,7 @@ _weka_log_collector() {
 
     opts="--local --upload --upload-file --clients --clients-only --verbose --version
           --start-time --end-time --profile --output --host --container-id
-          --extra-commands --cmd-timeout --compression --anonymize --anonymize-key --force
+          --extra-commands --cmd-timeout --no-shell-history --compression --anonymize --anonymize-key --force
           --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers
           --collect-traces --trace-filter --trace-extractor-path"
 
@@ -5464,6 +5481,7 @@ func runK8sMode(args []string) {
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
+	noShellHistoryFlagK8s := fs.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes")
 	ver := fs.Bool("version", false, "Print version and exit")
 	compression := fs.String("compression", "gzip", "Compression format: gzip|xz")
 
@@ -5482,6 +5500,7 @@ func runK8sMode(args []string) {
 	}
 
 	verbose = *verboseFlag
+	noShellHistory = *noShellHistoryFlagK8s
 
 	// Open debug log (best-effort; use same logs dir as regular collection)
 	_ = os.MkdirAll(wlcLogsDir, 0755)
@@ -5966,6 +5985,7 @@ func main() {
 		cmdTimeout         = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
 		statsTimeout       = flag.Duration("stats-timeout", 5*time.Minute, "Timeout per weka stats command (stats queries can be slow on large clusters)")
 		noStats            = flag.Bool("no-stats", false, "Skip weka stats commands (useful on large or heavily loaded clusters)")
+		noShellHistoryFlag = flag.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes")
 		clusterWorkers     = flag.Int("cluster-cmd-workers", 8, "Max parallel non-stats cluster-wide commands (weka stats are always capped at 2 regardless)")
 		extraCommands      = flag.Bool("extra-commands", false, fmt.Sprintf("Run extra commands from %s and include output in the archive", extraCommandsFile))
 		ver                = flag.Bool("version", false, "Print version and exit")
@@ -6015,6 +6035,7 @@ func main() {
 		os.Exit(1)
 	}
 	clusterCmdWorkers = *clusterWorkers
+	noShellHistory = *noShellHistoryFlag
 
 	if *ver {
 		fmt.Printf("weka-log-collector %s\n", version)
@@ -6727,6 +6748,9 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	if verbose {
 		args = append(args, "--verbose")
 	}
+	if noShellHistory {
+		args = append(args, "--no-shell-history")
+	}
 	if len(containerNames) > 0 {
 		args = append(args, "--container-name", strings.Join(containerNames, ","))
 	}
@@ -7213,6 +7237,7 @@ OPTIONS
   --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
   --cmd-timeout DUR    Per-command timeout (default: 60s)
+  --no-shell-history   Skip collecting /root/.bash_history from nodes
   --force              Override the run lock (use only when an earlier run is known to be hung)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
