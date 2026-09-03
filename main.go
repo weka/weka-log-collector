@@ -1507,7 +1507,7 @@ var systemCommands = []CommandSpec{
 	// ── security software ─────────────────────────────────────────────────────
 	{Name: "falcon_sensor_status", Cmd: "systemctl status falcon-sensor --no-pager", NodeOptional: true},
 	// ── shell history ─────────────────────────────────────────────────────────
-	{Name: "bash_history", Cmd: "tail -n 1000 /root/.bash_history 2>/dev/null", NodeOptional: true},
+	{Name: "bash_history", Cmd: "tail -n 1000 /root/.bash_history 2>/dev/null || true", NodeOptional: true},
 	// weka-agent journal — collected separately in CollectLocal with time window support
 }
 
@@ -5439,6 +5439,7 @@ OPTIONS
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
+  --no-shell-history   Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)
   --verbose            Verbose output (show every kubectl call)
   --version            Print version and exit
 
@@ -5481,7 +5482,7 @@ func runK8sMode(args []string) {
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
-	noShellHistoryFlagK8s := fs.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes")
+	noShellHistoryFlagK8s := fs.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)")
 	ver := fs.Bool("version", false, "Print version and exit")
 	compression := fs.String("compression", "gzip", "Compression format: gzip|xz")
 
@@ -5985,7 +5986,7 @@ func main() {
 		cmdTimeout         = flag.Duration("cmd-timeout", 120*time.Second, "Timeout per command")
 		statsTimeout       = flag.Duration("stats-timeout", 5*time.Minute, "Timeout per weka stats command (stats queries can be slow on large clusters)")
 		noStats            = flag.Bool("no-stats", false, "Skip weka stats commands (useful on large or heavily loaded clusters)")
-		noShellHistoryFlag = flag.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes")
+		noShellHistoryFlag = flag.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)")
 		clusterWorkers     = flag.Int("cluster-cmd-workers", 8, "Max parallel non-stats cluster-wide commands (weka stats are always capped at 2 regardless)")
 		extraCommands      = flag.Bool("extra-commands", false, fmt.Sprintf("Run extra commands from %s and include output in the archive", extraCommandsFile))
 		ver                = flag.Bool("version", false, "Print version and exit")
@@ -7236,8 +7237,8 @@ OPTIONS
   --upload             Upload archive to Weka Home (requires weka cloud enabled)
   --upload-file FILE   Upload a specific file to Weka Home (must be under /opt/weka/weka-log-collector, ≤50 MB, .tar.gz/.tar.xz/.log/.txt/.json/.out)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands (orchestrator only)
-  --cmd-timeout DUR    Per-command timeout (default: 60s)
-  --no-shell-history   Skip collecting /root/.bash_history from nodes
+  --cmd-timeout DUR    Per-command timeout (default: 120s)
+  --no-shell-history   Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)
   --force              Override the run lock (use only when an earlier run is known to be hung)
   --verbose            Detailed per-file/command progress
   --version            Print version and exit
