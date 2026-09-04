@@ -1967,8 +1967,8 @@ type cmdOutput struct {
 
 // runCommandsParallel runs specs concurrently (up to cmdWorkers at a time) and
 // commandFileContent builds the bytes written to a collected output file.
-// Always prepends "# command: <cmd>\n" so the file is self-documenting,
-// then appends the error line if the command failed.
+// Always prepends "# command: <cmd>\n" so the file is self-documenting.
+// If the command failed, "# error: <msg>\n" is added to the header.
 func commandFileContent(spec CommandSpec, out []byte, errStr string) []byte {
 	header := "# command: " + spec.Cmd + "\n"
 	if errStr != "" {
@@ -2829,18 +2829,14 @@ func CollectLocal(tw *tar.Writer, archiveRoot, profile string, from, to time.Tim
 	// disk after a container is removed or renamed.
 	activeContainerDirs := map[string]bool{}
 	{
-		var localPSOut []byte
-		for i, spec := range wekaToRun {
-			if spec.Name == "weka_local_ps" {
-				localPSOut = wekaOutputs[i].out
-				break
-			}
-		}
+		// Run weka local ps -J separately for container discovery — the collected
+		// weka_local_ps command runs without -J for human readability and cannot
+		// be reused here.
 		var containers []struct {
 			Name string `json:"name"`
 		}
-		if len(localPSOut) > 0 {
-			_ = json.Unmarshal(localPSOut, &containers)
+		if localPSJSON, err := exec.Command("weka", "local", "ps", "-v", "-J").Output(); err == nil {
+			_ = json.Unmarshal(localPSJSON, &containers)
 		}
 		for _, c := range containers {
 			activeContainerDirs[c.Name] = true
