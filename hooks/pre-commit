@@ -1,5 +1,8 @@
 #!/bin/sh
-# Build the Linux binary and stage it so every commit includes the latest binary.
-# Backend nodes only need `git pull` to get the updated binary.
+# Build all binaries and stage them so every commit includes the latest builds.
+# Nodes and users only need `git pull` to get the updated binary.
 ~/go/bin/task build-linux
-git add weka-log-collector
+~/go/bin/task build-linux-arm64
+~/go/bin/task build-darwin
+~/go/bin/task build-darwin-arm64
+git add weka-log-collector weka-log-collector-arm64 weka-log-collector-darwin weka-log-collector-darwin-arm64
