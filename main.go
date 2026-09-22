@@ -168,9 +168,22 @@ var ipv4Re = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 // Matches MAC addresses in colon-separated form (lowercase or uppercase hex).
 var macRe = regexp.MustCompile(`\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b`)
 
-// Matches IPv6 addresses (full, compressed, and IPv4-mapped forms).
-// Requires at least two colon-separated hex groups to avoid false-positives.
-var ipv6Re = regexp.MustCompile(`\b(?:[0-9a-fA-F]{1,4}:){2,7}(?:[0-9a-fA-F]{1,4}|:)\b|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b`)
+// Matches complete IPv6 addresses in three forms so each address is consumed
+// in a single match — the previous single-alternative pattern split compressed
+// addresses at ::, leaving host-identifier groups after :: unmasked.
+//
+//	h[:{h}]...::h[:{h}]...  groups before and optionally after ::  (fe80::1, 2001:db8::8a2e:370:7334)
+//	::h[:{h}]...             leading :: with trailing groups         (::1, ::ffff:c0a8:1)
+//	full form (5-8 groups)   no ::                                   (2001:db8:85a3:0:0:8a2e:370:7334)
+//
+// The 5-group minimum on the full form keeps timestamps (3 groups) and PCI
+// slot IDs (3-4 groups) from matching; those are handled by maskIPv6's guard.
+var ipv6Re = regexp.MustCompile(
+	`\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6}::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?\b` +
+		`|` +
+		`::[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6}\b` +
+		`|` +
+		`\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){4,7}\b`)
 
 // trailingDigitsRe extracts the trailing run of digits from a hostname.
 var trailingDigitsRe = regexp.MustCompile(`(\d+)$`)

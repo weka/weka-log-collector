@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -117,21 +116,23 @@ func TestMaskIPv6_PCISlotNotRedacted(t *testing.T) {
 func TestMaskIPv6_RealIPv6Redacted(t *testing.T) {
 	a := newAnonymizer(true)
 	a.finalize()
-	// Real IPv6 addresses must still be anonymized.
+	// Real IPv6 addresses must be fully masked to x:x:x:x:x:x:x:<last>.
+	// The full address must be consumed in one regex match so host-identifier
+	// groups after :: are not left unmasked.
 	cases := []struct {
-		input    string
-		wantLast string // last group preserved
+		input string
+		want  string
 	}{
-		{"fe80::1", "1"},
-		{"2001:db8:85a3::8a2e:370:7334", "7334"},
+		{"fe80::1", "x:x:x:x:x:x:x:1"},
+		// Compressed form: trailing groups after :: must also be masked.
+		{"2001:db8:85a3::8a2e:370:7334", "x:x:x:x:x:x:x:7334"},
+		// Leading-:: form.
+		{"::1", "x:x:x:x:x:x:x:1"},
 	}
 	for _, tc := range cases {
 		got := string(a.Apply([]byte(tc.input)))
-		if got == tc.input {
-			t.Errorf("real IPv6 not anonymized: %q", tc.input)
-		}
-		if !strings.HasSuffix(got, ":"+tc.wantLast) {
-			t.Errorf("last group not preserved: input=%q got=%q wantSuffix=:%s", tc.input, got, tc.wantLast)
+		if got != tc.want {
+			t.Errorf("IPv6 masking:\ninput: %q\ngot:   %q\nwant:  %q", tc.input, got, tc.want)
 		}
 	}
 }
