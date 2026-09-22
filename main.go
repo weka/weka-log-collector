@@ -5429,8 +5429,11 @@ OPTIONS
                        (default: auto-detect via WekaCluster CRD)
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
-  --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz,
-                       or ./<cluster>-weka-logs-<ts>.tar.gz when that directory is not writable, e.g. on macOS)
+  --output PATH        Output .tar.gz path. When omitted, the path is chosen automatically:
+                         /opt/weka exists  → /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz
+                         /opt/weka absent  → <cwd>/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz
+                       Debug log follows the same base directory (in logs/ when using the default path,
+                       or alongside the bundle when --output is specified).
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
@@ -5476,7 +5479,7 @@ func runK8sMode(args []string) {
 	operatorNS := fs.String("operator-ns", "", "Override Weka Operator namespace")
 	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
-	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz, or ./ when that path is not writable)", wlcBundlesDir))
+	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz when /opt/weka exists, otherwise ./weka-log-collector/bundles/)", wlcBundlesDir))
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
@@ -5503,23 +5506,36 @@ func runK8sMode(args []string) {
 	verbose = *verboseFlag
 	noShellHistory = *noShellHistoryFlagK8s
 
-	// Determine the output directory early so the debug log lands next to the bundle.
-	// When --output is given, use its parent directory.
-	// Otherwise, try the standard bundles directory; fall back to "." (CWD) when it is
-	// not writable (e.g. running on macOS without a Weka node installation).
-	logDir := ""
+	// Determine where bundles and debug logs are stored.
+	//
+	// Rules (in priority order):
+	//   1. --output given          → bundle at that exact path; log in the same parent dir
+	//   2. /opt/weka exists        → standard on-node layout: /opt/weka/weka-log-collector/{bundles,logs}/
+	//   3. /opt/weka absent        → running on a laptop/jump-host; mirror the layout under CWD:
+	//                                 <cwd>/weka-log-collector/{bundles,logs}/
+	var bundlesDir, logsDir string
 	if *outputPath != "" {
-		logDir = filepath.Dir(*outputPath)
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			logDir = "."
+		dir := filepath.Dir(*outputPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			dir = "."
 		}
-	} else if err := os.MkdirAll(wlcBundlesDir, 0755); err == nil {
-		logDir = wlcBundlesDir
+		bundlesDir = dir
+		logsDir = dir
+	} else if _, statErr := os.Stat("/opt/weka"); statErr == nil {
+		bundlesDir = wlcBundlesDir
+		logsDir = wlcLogsDir
+		os.MkdirAll(bundlesDir, 0755) //nolint:errcheck
+		os.MkdirAll(logsDir, 0755)    //nolint:errcheck
 	} else {
-		logDir = "."
+		cwd, _ := os.Getwd()
+		base := filepath.Join(cwd, "weka-log-collector")
+		bundlesDir = filepath.Join(base, "bundles")
+		logsDir = filepath.Join(base, "logs")
+		os.MkdirAll(bundlesDir, 0755) //nolint:errcheck
+		os.MkdirAll(logsDir, 0755)    //nolint:errcheck
 	}
 
-	logFilePath := filepath.Join(logDir, fmt.Sprintf("weka-log-collector-k8s-%s.log",
+	logFilePath := filepath.Join(logsDir, fmt.Sprintf("weka-log-collector-k8s-%s.log",
 		time.Now().Format("2006-01-02T15-04-05")))
 	if lf, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
 		debugLog = lf
@@ -5595,8 +5611,6 @@ func runK8sMode(args []string) {
 	}
 
 	// Resolve default output path now that we have the cluster name and anonymizer.
-	// Bundle goes into logDir (determined above) so the debug log and archive always
-	// land in the same directory.
 	if outPath == "" {
 		clusterLabel := ns.ClusterName
 		if globalAnonymizer.enabled {
@@ -5609,7 +5623,7 @@ func runK8sMode(args []string) {
 			anonSuffix = "-anon"
 		}
 		ts := time.Now().Format("2006-01-02T15-04-05")
-		outPath = filepath.Join(logDir, fmt.Sprintf("%s-weka-logs-%s%s%s", clusterLabel, ts, anonSuffix, archiveExt(*compression)))
+		outPath = filepath.Join(bundlesDir, fmt.Sprintf("%s-weka-logs-%s%s%s", clusterLabel, ts, anonSuffix, archiveExt(*compression)))
 	}
 
 	// Compute anonymization key path (written after collection, next to the bundle).
