@@ -5241,7 +5241,7 @@ var clusterWideCLICommands = []struct {
 	cmd  []string
 }{
 	// identity & status
-	{"weka_status.txt", []string{"weka", "status", "-v"}},
+	{"weka_status.txt", []string{"weka", "status"}},
 	{"weka_status_rebuild.txt", []string{"weka", "status", "rebuild"}},
 	{"weka_alerts.txt", []string{"weka", "alerts"}},
 	{"weka_version.txt", []string{"weka", "version"}},
