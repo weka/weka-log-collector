@@ -4,6 +4,8 @@ vars:
   BINARY: weka-log-collector
   LINUX_BINARY: weka-log-collector
   LINUX_ARM64_BINARY: weka-log-collector-arm64
+  DARWIN_BINARY: weka-log-collector-darwin
+  DARWIN_ARM64_BINARY: weka-log-collector-darwin-arm64
 
 tasks:
   fmt:
@@ -41,8 +43,18 @@ tasks:
     cmds:
       - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o {{.LINUX_ARM64_BINARY}} ./...
 
+  build-darwin:
+    desc: Build portable static macOS binary for amd64 (Intel Macs)
+    cmds:
+      - CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o {{.DARWIN_BINARY}} ./...
+
+  build-darwin-arm64:
+    desc: Build portable static macOS binary for arm64 (Apple Silicon)
+    cmds:
+      - CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o {{.DARWIN_ARM64_BINARY}} ./...
+
   check:
-    desc: Run all quality checks (fmt, vet, lint, test, build, build-linux, build-linux-arm64)
+    desc: Run all quality checks (fmt, vet, lint, test, build, build-linux, build-linux-arm64, build-darwin, build-darwin-arm64)
     cmds:
       - task: fmt
       - task: vet
@@ -51,6 +63,8 @@ tasks:
       - task: build
       - task: build-linux
       - task: build-linux-arm64
+      - task: build-darwin
+      - task: build-darwin-arm64
 
   install-hooks:
     desc: Install git hooks (builds Linux binary and stages it on every commit)
@@ -62,4 +76,4 @@ tasks:
   clean:
     desc: Remove built binaries
     cmds:
-      - rm -f {{.BINARY}} {{.LINUX_BINARY}} {{.LINUX_ARM64_BINARY}}
+      - rm -f {{.BINARY}} {{.LINUX_BINARY}} {{.LINUX_ARM64_BINARY}} {{.DARWIN_BINARY}} {{.DARWIN_ARM64_BINARY}}

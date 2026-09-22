@@ -42,10 +42,12 @@ Both Linux binaries are committed to the repo. Nodes update with:
 
 No build step needed on the node — the binaries are always up to date in git.
 
-| Binary                    | Architecture         | Nodes               |
-|---------------------------|----------------------|---------------------|
-| `weka-log-collector`      | Linux amd64 (x86_64) | Standard Weka nodes |
-| `weka-log-collector-arm64`| Linux arm64 (aarch64)| ARM nodes (aarch64) |
+| Binary                          | Architecture         | Nodes / Users              |
+|---------------------------------|----------------------|----------------------------|
+| `weka-log-collector`            | Linux amd64 (x86_64) | Standard Weka nodes        |
+| `weka-log-collector-arm64`      | Linux arm64 (aarch64)| ARM nodes (aarch64)        |
+| `weka-log-collector-darwin`     | macOS amd64 (Intel)  | Intel Macs                 |
+| `weka-log-collector-darwin-arm64`| macOS arm64 (Apple Silicon) | M-series Macs     |
 
 ## Code Layout
 
@@ -57,7 +59,7 @@ No build step needed on the node — the binaries are always up to date in git.
 
 - NEVER commit without running `task check` first
 - Fix ALL fmt, vet, lint, and test failures before committing
-- ALWAYS stage and commit BOTH binaries alongside code changes (`git add weka-log-collector weka-log-collector-arm64`)
+- ALWAYS stage and commit ALL FOUR binaries alongside code changes (`git add weka-log-collector weka-log-collector-arm64 weka-log-collector-darwin weka-log-collector-darwin-arm64`)
 - No external dependencies — stdlib only
 - No CGo
 - Both binaries must build statically via `task build-linux` (amd64) and `task build-linux-arm64` (arm64)

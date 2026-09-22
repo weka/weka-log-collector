@@ -449,15 +449,26 @@ The k8s bundle is structured as:
   wekacluster/
     pods_wide.txt
     events.txt
-    weka-cli/
-      weka_status.json
-      weka_alerts.json
+    weka-commands/
+      weka_status.txt
+      weka_alerts.txt
+      weka_version.txt
+      weka_fs.txt
+      weka_cluster_container.txt
+      ... (24 cluster-wide weka commands)
     <cluster>-compute-xxx/
       logs/current.log
       logs/previous.log
       describe.txt
-      weka_local_ps.txt
-      weka_local_resources.json
+      weka-local-commands/
+        weka_local_ps.txt
+        weka_local_status.txt
+        weka_local_resources.json
+      os/
+        uname.txt
+        df.txt
+        ip_addr.txt
+        ... (OS diagnostics)
       opt-weka-logs/
         syslog
         output
