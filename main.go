@@ -559,6 +559,20 @@ func (a *anonymizer) maskIPv6(b []byte) []byte {
 	if !hasEmpty && len(parts) < 5 {
 		return b
 	}
+	// Reject matches with no decimal digit: C++ scope expressions (abc::def,
+	// dead::beef) consist entirely of hex letters and would otherwise be
+	// treated as IPv6. Real IPv6 addresses almost always contain at least one
+	// digit (fe80 has '8' and '0'; 2001:db8 has '2','0','0','1','8').
+	hasDigit := false
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return b
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -5429,6 +5443,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 				errStr := err.Error()
 				if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot get resource") || strings.Contains(errStr, "cannot list resource") {
 					warnf("k8s: %s: RBAC permission denied — skipping (grant exec access in a ClusterRole/RoleBinding)", spec.name)
+					break // RBAC denial is cluster-wide; retrying other pods will not help
 				}
 				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
 				continue

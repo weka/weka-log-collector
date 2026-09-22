@@ -97,6 +97,24 @@ func TestMaskIPv6_TimestampNotRedacted(t *testing.T) {
 	}
 }
 
+func TestMaskIPv6_CppScopeNotRedacted(t *testing.T) {
+	a := newAnonymizer(true)
+	a.finalize()
+	// C++ scope expressions that are all hex-letter (no digits) must not be
+	// anonymized — they have no decimal digit unlike real IPv6 addresses.
+	cases := []string{
+		"abc::def",
+		"dead::beef",
+		"cafe::babe",
+	}
+	for _, input := range cases {
+		got := string(a.Apply([]byte(input)))
+		if got != input {
+			t.Errorf("C++ scope falsely anonymized:\ninput: %q\ngot:   %q", input, got)
+		}
+	}
+}
+
 func TestMaskIPv6_PCISlotNotRedacted(t *testing.T) {
 	a := newAnonymizer(true)
 	a.finalize()
