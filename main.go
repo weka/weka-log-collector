@@ -97,7 +97,7 @@ var jsonSensitiveValueRe = regexp.MustCompile(
 // a credential-like substring and the value is a JSON array. Needed for fields
 // like join_secret that Weka stores as single-element string arrays.
 var jsonSensitiveArrayRe = regexp.MustCompile(
-	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)\[[^\]]*\]`)
+	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)\[(?:"[^"]*"|[^"\]])*\]`)
 
 // redactSensitiveYAML replaces the value of any YAML/text line whose key matches
 // sensitiveKeyRe with [REDACTED]. Only single-line scalar values are redacted;
@@ -4464,7 +4464,7 @@ _weka_log_collector() {
         # k8s-specific flags
         local k8s_opts="--k8s-host --kubeconfig --operator-ns --cluster-ns --cluster-name --csi-ns
                         --output --upload --cmd-timeout --verbose --version
-                        --no-shell-history --compression --anonymize --anonymize-key"
+                        --compression --anonymize --anonymize-key"
         case "$prev" in
             --output|--kubeconfig|--anonymize-key)
                 COMPREPLY=( $(compgen -f -- "$cur") )
@@ -5413,6 +5413,10 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 			out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
 			if err != nil {
 				m.FailedCommands++
+				errStr := err.Error()
+				if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot get resource") || strings.Contains(errStr, "cannot list resource") {
+					warnf("k8s: %s: RBAC permission denied — skipping (grant exec access in a ClusterRole/RoleBinding)", spec.name)
+				}
 				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
 				continue
 			}
@@ -5441,6 +5445,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 				_ = addBytesToArchive(tw, podDir+"/weka-local-commands/"+spec.name, out)
 			}
 			for _, spec := range perPodOSCommands {
+				m.TotalCommands++
 				out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
 				if err != nil {
 					vlogf("k8s: os cmd %s in %s: %v", spec.name, pod, err)
@@ -5515,7 +5520,6 @@ OPTIONS
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
-  --no-shell-history   Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)
   --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name) with placeholders.
                        Anonymization mapping JSON is written next to the bundle (kept at your site; not in the archive).
   --anonymize-key PATH Override path for the anonymization mapping JSON (default: alongside the bundle)
@@ -5561,7 +5565,6 @@ func runK8sMode(args []string) {
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
-	noShellHistoryFlagK8s := fs.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)")
 	ver := fs.Bool("version", false, "Print version and exit")
 	compression := fs.String("compression", "gzip", "Compression format: gzip|xz")
 	anonymize := fs.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name) with placeholders. Mapping JSON written next to the bundle.")
@@ -5582,7 +5585,6 @@ func runK8sMode(args []string) {
 	}
 
 	verbose = *verboseFlag
-	noShellHistory = *noShellHistoryFlagK8s
 
 	// outPath is the final bundle file path. It may be empty here and resolved
 	// after namespace discovery (when --output is a directory or not given).

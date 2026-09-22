@@ -24,6 +24,16 @@ func TestRedactSensitiveJSON_ArrayValue(t *testing.T) {
 	}
 }
 
+func TestRedactSensitiveJSON_ArrayValueWithBracket(t *testing.T) {
+	// Array element containing ] must not truncate the match.
+	input := `{"join_secret": ["abc]def"], "other": "ok"}`
+	got := string(redactSensitiveJSON([]byte(input)))
+	want := `{"join_secret": ["[REDACTED]"], "other": "ok"}`
+	if got != want {
+		t.Errorf("array value with bracket:\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
 func TestRedactSensitiveJSON_Password(t *testing.T) {
 	input := `{"password": "hunter2", "name": "bob"}`
 	got := string(redactSensitiveJSON([]byte(input)))
