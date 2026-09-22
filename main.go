@@ -93,6 +93,12 @@ var sensitiveKeyRe = regexp.MustCompile(
 var jsonSensitiveValueRe = regexp.MustCompile(
 	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)"[^"]*"`)
 
+// jsonSensitiveArrayRe matches a JSON `"key": [...]` pair where the key contains
+// a credential-like substring and the value is a JSON array. Needed for fields
+// like join_secret that Weka stores as single-element string arrays.
+var jsonSensitiveArrayRe = regexp.MustCompile(
+	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)\[[^\]]*\]`)
+
 // redactSensitiveYAML replaces the value of any YAML/text line whose key matches
 // sensitiveKeyRe with [REDACTED]. Only single-line scalar values are redacted;
 // multiline blocks are left as-is (they do not contain credentials in practice).
@@ -110,11 +116,14 @@ func redactSensitiveYAML(b []byte) []byte {
 	return bytes.Join(lines, []byte("\n"))
 }
 
-// redactSensitiveJSON replaces the string value of any JSON key whose name
-// contains a credential-like substring with "[REDACTED]". Preserves original
-// formatting (whitespace, indentation, key order).
+// redactSensitiveJSON replaces the value of any JSON key whose name contains a
+// credential-like substring with [REDACTED]. Handles both string scalar values
+// ("key": "val") and array values ("key": [...]) — the latter covers fields like
+// join_secret that Weka stores as single-element arrays.
 func redactSensitiveJSON(b []byte) []byte {
-	return jsonSensitiveValueRe.ReplaceAll(b, []byte(`$1"[REDACTED]"`))
+	b = jsonSensitiveValueRe.ReplaceAll(b, []byte(`$1"[REDACTED]"`))
+	b = jsonSensitiveArrayRe.ReplaceAll(b, []byte(`$1["[REDACTED]"]`))
+	return b
 }
 
 // redactSensitive auto-detects JSON content (starts with `{` or `[` after
@@ -4655,6 +4664,19 @@ func (k *kubectlRunner) buildKubectlArgs(args []string) []string {
 	return args
 }
 
+// sanitizeErrStr strips non-printable bytes from s so that binary protocol
+// framing (e.g. SPDY/websocket artifacts from kubectl exec) does not produce
+// garbled output in log messages.
+func sanitizeErrStr(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == '\n' || r == '\t' || (r >= 32 && r != 127) {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // run invokes kubectl (locally or via SSH jump host) with a timeout and returns
 // combined stdout+stderr. Non-zero exit returns an error containing the output.
 func (k *kubectlRunner) run(args ...string) ([]byte, error) {
@@ -4679,7 +4701,7 @@ func (k *kubectlRunner) run(args ...string) ([]byte, error) {
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return out, fmt.Errorf("kubectl %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
+		return out, fmt.Errorf("kubectl %s: %w: %s", args[0], err, sanitizeErrStr(string(out)))
 	}
 	return out, nil
 }
@@ -4956,6 +4978,10 @@ func kubectlToArchive(tw *tar.Writer, kc *kubectlRunner, archivePath string, arg
 		_ = addBytesToArchive(tw, archivePath, out)
 	}
 	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot list resource") || strings.Contains(errStr, "cannot get resource") {
+			warnf("k8s: %s: RBAC permission denied — skipping (grant list/get access in a ClusterRole/RoleBinding)", archivePath)
+		}
 		vlogf("k8s: %s: %v", archivePath, err)
 		return false
 	}
@@ -5403,11 +5429,15 @@ OPTIONS
                        (default: auto-detect via WekaCluster CRD)
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
-  --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz)
+  --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz,
+                       or ./<cluster>-weka-logs-<ts>.tar.gz when that directory is not writable, e.g. on macOS)
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
   --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
   --no-shell-history   Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)
+  --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name) with placeholders.
+                       Anonymization mapping JSON is written next to the bundle (kept at your site; not in the archive).
+  --anonymize-key PATH Override path for the anonymization mapping JSON (default: alongside the bundle)
   --verbose            Verbose output (show every kubectl call)
   --version            Print version and exit
 
@@ -5446,13 +5476,15 @@ func runK8sMode(args []string) {
 	operatorNS := fs.String("operator-ns", "", "Override Weka Operator namespace")
 	clusterNS := fs.String("cluster-ns", "", "Override WekaCluster pod namespace")
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
-	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz)", wlcBundlesDir))
+	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz, or ./ when that path is not writable)", wlcBundlesDir))
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
 	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
 	noShellHistoryFlagK8s := fs.Bool("no-shell-history", false, "Skip collecting /root/.bash_history from nodes (history may contain credentials or tokens)")
 	ver := fs.Bool("version", false, "Print version and exit")
 	compression := fs.String("compression", "gzip", "Compression format: gzip|xz")
+	anonymize := fs.Bool("anonymize", false, "Replace identifying values (hostnames, IPs, MACs, cluster name) with placeholders. Mapping JSON written next to the bundle.")
+	anonymizeKey := fs.String("anonymize-key", "", "Override path for the anonymization mapping JSON (default: alongside the bundle)")
 
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
@@ -5471,21 +5503,35 @@ func runK8sMode(args []string) {
 	verbose = *verboseFlag
 	noShellHistory = *noShellHistoryFlagK8s
 
-	// Open debug log (best-effort; use same logs dir as regular collection)
-	_ = os.MkdirAll(wlcLogsDir, 0755)
-	logPath := filepath.Join(wlcLogsDir, fmt.Sprintf("weka-log-collector-k8s-%s.log",
+	// Determine the output directory early so the debug log lands next to the bundle.
+	// When --output is given, use its parent directory.
+	// Otherwise, try the standard bundles directory; fall back to "." (CWD) when it is
+	// not writable (e.g. running on macOS without a Weka node installation).
+	logDir := ""
+	if *outputPath != "" {
+		logDir = filepath.Dir(*outputPath)
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			logDir = "."
+		}
+	} else if err := os.MkdirAll(wlcBundlesDir, 0755); err == nil {
+		logDir = wlcBundlesDir
+	} else {
+		logDir = "."
+	}
+
+	logFilePath := filepath.Join(logDir, fmt.Sprintf("weka-log-collector-k8s-%s.log",
 		time.Now().Format("2006-01-02T15-04-05")))
-	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+	if lf, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
 		debugLog = lf
 		defer lf.Close()
-		fmt.Fprintf(os.Stderr, "Debug log: %s\n", logPath)
+		fmt.Fprintf(os.Stderr, "Debug log: %s\n", logFilePath)
+	} else {
+		warnf("Cannot open debug log %s: %v", logFilePath, err)
 	}
 
 	collectionStart := time.Now()
 
 	outPath := *outputPath
-	// Default output goes to the standard bundles directory, named after the cluster.
-	// Resolved after namespace discovery so we have the cluster name.
 
 	kc := &kubectlRunner{
 		jumpHost:   *k8sHost,
@@ -5535,17 +5581,47 @@ func runK8sMode(args []string) {
 		logf("  (operator and cluster share namespace — operator pods will be separated by name prefix)")
 	}
 
-	// Resolve default output path now that we have the cluster name.
+	// Build anonymizer now that we know the cluster name.
+	// The k8s anonymizer pre-registers the cluster name; IP/MAC masking applies
+	// automatically to all archived content. Unlike the non-k8s path we cannot
+	// run 'weka status' locally, so we only populate what discovery provides.
+	if *anonymize {
+		a := newAnonymizer(true)
+		if ns.ClusterName != "" {
+			a.addClusterName(ns.ClusterName)
+		}
+		a.finalize()
+		globalAnonymizer = a
+	}
+
+	// Resolve default output path now that we have the cluster name and anonymizer.
+	// Bundle goes into logDir (determined above) so the debug log and archive always
+	// land in the same directory.
 	if outPath == "" {
-		_ = os.MkdirAll(wlcBundlesDir, 0755)
 		clusterLabel := ns.ClusterName
-		if clusterLabel == "" {
+		if globalAnonymizer.enabled {
+			clusterLabel = "weka-cluster"
+		} else if clusterLabel == "" {
 			clusterLabel = "k8s"
 		}
+		anonSuffix := ""
+		if globalAnonymizer.enabled {
+			anonSuffix = "-anon"
+		}
 		ts := time.Now().Format("2006-01-02T15-04-05")
-		outPath = filepath.Join(wlcBundlesDir, fmt.Sprintf("%s-weka-logs-%s%s", clusterLabel, ts, archiveExt(*compression)))
+		outPath = filepath.Join(logDir, fmt.Sprintf("%s-weka-logs-%s%s%s", clusterLabel, ts, anonSuffix, archiveExt(*compression)))
 	}
+
+	// Compute anonymization key path (written after collection, next to the bundle).
+	keyPath := *anonymizeKey
+	if globalAnonymizer.enabled && keyPath == "" {
+		keyPath = strings.TrimSuffix(strings.TrimSuffix(outPath, ".tar.gz"), ".tar.xz") + ".anonymization-key.json"
+	}
+
 	logf("  Output: %s", outPath)
+	if globalAnonymizer.enabled {
+		logf("  Anonymize: ON  (mapping → %s)", keyPath)
+	}
 
 	// Open output archive
 	outFile, err := os.Create(outPath)
@@ -5606,6 +5682,15 @@ func runK8sMode(args []string) {
 	if *upload {
 		if err := uploadK8sBundle(kc, ns.Cluster, outPath); err != nil {
 			errorf("Upload failed: %v", err)
+		}
+	}
+
+	if globalAnonymizer.enabled {
+		if err := globalAnonymizer.writeKey(keyPath); err != nil {
+			warnf("Could not write anonymization mapping: %v", err)
+		} else {
+			logf("\nAnonymization mapping → %s", keyPath)
+			logf("Keep this file at your site — it is needed to decode anonymized values when troubleshooting.")
 		}
 	}
 }
