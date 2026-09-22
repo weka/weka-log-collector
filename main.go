@@ -5506,21 +5506,37 @@ func runK8sMode(args []string) {
 	verbose = *verboseFlag
 	noShellHistory = *noShellHistoryFlagK8s
 
+	// outPath is the final bundle file path. It may be empty here and resolved
+	// after namespace discovery (when --output is a directory or not given).
+	outPath := *outputPath
+
 	// Determine where bundles and debug logs are stored.
 	//
 	// Rules (in priority order):
-	//   1. --output given          → bundle at that exact path; log in the same parent dir
-	//   2. /opt/weka exists        → standard on-node layout: /opt/weka/weka-log-collector/{bundles,logs}/
-	//   3. /opt/weka absent        → running on a laptop/jump-host; mirror the layout under CWD:
-	//                                 <cwd>/weka-log-collector/{bundles,logs}/
+	//   1. --output is a directory (existing or ends with /) → bundle auto-named inside it; log there too
+	//   2. --output is a file path                          → bundle at that path; log in same parent dir
+	//   3. /opt/weka exists                                 → /opt/weka/weka-log-collector/{bundles,logs}/
+	//   4. /opt/weka absent                                 → <cwd>/weka-log-collector/{bundles,logs}/
 	var bundlesDir, logsDir string
 	if *outputPath != "" {
-		dir := filepath.Dir(*outputPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			dir = "."
+		info, statErr := os.Stat(*outputPath)
+		isDir := (statErr == nil && info.IsDir()) || strings.HasSuffix(*outputPath, string(os.PathSeparator))
+		if isDir {
+			// --output /some/dir/ or an existing directory: auto-generate filename inside it.
+			dir := filepath.Clean(*outputPath)
+			os.MkdirAll(dir, 0755) //nolint:errcheck
+			bundlesDir = dir
+			logsDir = dir
+			outPath = "" // filename resolved after namespace discovery below
+		} else {
+			// --output /some/file.tar.gz: use it as-is, log goes in the same dir.
+			dir := filepath.Dir(*outputPath)
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				dir = "."
+			}
+			bundlesDir = dir
+			logsDir = dir
 		}
-		bundlesDir = dir
-		logsDir = dir
 	} else if _, statErr := os.Stat("/opt/weka"); statErr == nil {
 		bundlesDir = wlcBundlesDir
 		logsDir = wlcLogsDir
@@ -5546,8 +5562,6 @@ func runK8sMode(args []string) {
 	}
 
 	collectionStart := time.Now()
-
-	outPath := *outputPath
 
 	kc := &kubectlRunner{
 		jumpHost:   *k8sHost,
