@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -67,5 +68,60 @@ func TestSanitizeErrStr_PreservesText(t *testing.T) {
 	got := sanitizeErrStr(input)
 	if got != input {
 		t.Errorf("sanitizeErrStr modified clean text:\ngot:  %q\nwant: %q", got, input)
+	}
+}
+
+func TestMaskIPv6_TimestampNotRedacted(t *testing.T) {
+	a := newAnonymizer(true)
+	a.finalize()
+	// HH:MM:SS timestamps must not be anonymized — they are not IPv6 addresses.
+	cases := []string{
+		"collected at 10:58:19 today",
+		"10:58:20",
+		"00:00:00",
+	}
+	for _, input := range cases {
+		got := string(a.Apply([]byte(input)))
+		if got != input {
+			t.Errorf("timestamp falsely anonymized:\ninput: %q\ngot:   %q", input, got)
+		}
+	}
+}
+
+func TestMaskIPv6_PCISlotNotRedacted(t *testing.T) {
+	a := newAnonymizer(true)
+	a.finalize()
+	// PCI slot IDs (all-decimal, ≤4 groups) must not be anonymized.
+	cases := []string{
+		"pci slot 0000:00:02",
+		"0000:00:1f",
+	}
+	for _, input := range cases {
+		got := string(a.Apply([]byte(input)))
+		if got != input {
+			t.Errorf("PCI slot falsely anonymized:\ninput: %q\ngot:   %q", input, got)
+		}
+	}
+}
+
+func TestMaskIPv6_RealIPv6Redacted(t *testing.T) {
+	a := newAnonymizer(true)
+	a.finalize()
+	// Real IPv6 addresses must still be anonymized.
+	cases := []struct {
+		input    string
+		wantLast string // last group preserved
+	}{
+		{"fe80::1", "1"},
+		{"2001:db8:85a3::8a2e:370:7334", "7334"},
+	}
+	for _, tc := range cases {
+		got := string(a.Apply([]byte(tc.input)))
+		if got == tc.input {
+			t.Errorf("real IPv6 not anonymized: %q", tc.input)
+		}
+		if !strings.HasSuffix(got, ":"+tc.wantLast) {
+			t.Errorf("last group not preserved: input=%q got=%q wantSuffix=:%s", tc.input, got, tc.wantLast)
+		}
 	}
 }

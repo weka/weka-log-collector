@@ -529,13 +529,30 @@ func (a *anonymizer) maskIPv4(b []byte) []byte {
 
 func (a *anonymizer) maskIPv6(b []byte) []byte {
 	s := string(b)
+	parts := strings.Split(s, ":")
+
+	// True IPv6 uses "::" compressed notation (produces an empty part in
+	// Split) or has many groups (full form needs 8). Timestamps (HH:MM:SS)
+	// and PCI slot IDs (0000:00:1f) have only 3-4 non-empty groups and no
+	// "::", so they fall through here and are returned unchanged. Loopback
+	// "::1" and link-local "fe80::1" both produce at least one empty part.
+	hasEmpty := false
+	for _, p := range parts {
+		if p == "" {
+			hasEmpty = true
+			break
+		}
+	}
+	if !hasEmpty && len(parts) < 5 {
+		return b
+	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if v, ok := a.mapIPs[s]; ok {
 		return []byte(v)
 	}
 	// Preserve the last group for correlation (same strategy as IPv4).
-	parts := strings.Split(s, ":")
 	last := parts[len(parts)-1]
 	if last == "" && len(parts) > 1 {
 		last = parts[len(parts)-2]
@@ -4446,14 +4463,19 @@ _weka_log_collector() {
     if [[ $in_k8s -eq 1 ]]; then
         # k8s-specific flags
         local k8s_opts="--k8s-host --kubeconfig --operator-ns --cluster-ns --cluster-name --csi-ns
-                        --output --upload --cmd-timeout --verbose --version"
+                        --output --upload --cmd-timeout --verbose --version
+                        --no-shell-history --compression --anonymize --anonymize-key"
         case "$prev" in
-            --output|--kubeconfig)
+            --output|--kubeconfig|--anonymize-key)
                 COMPREPLY=( $(compgen -f -- "$cur") )
                 return 0
                 ;;
             --cmd-timeout)
                 COMPREPLY=( $(compgen -W "30s 60s 120s 180s 300s" -- "$cur") )
+                return 0
+                ;;
+            --compression)
+                COMPREPLY=( $(compgen -W "gzip xz" -- "$cur") )
                 return 0
                 ;;
         esac
@@ -5218,8 +5240,37 @@ var clusterWideCLICommands = []struct {
 	name string
 	cmd  []string
 }{
-	{"weka_status.json", []string{"weka", "status", "--json"}},
-	{"weka_alerts.json", []string{"weka", "alerts", "--json"}},
+	// identity & status
+	{"weka_status.txt", []string{"weka", "status", "-v"}},
+	{"weka_status_rebuild.txt", []string{"weka", "status", "rebuild"}},
+	{"weka_alerts.txt", []string{"weka", "alerts"}},
+	{"weka_version.txt", []string{"weka", "version"}},
+	{"weka_version_current.txt", []string{"weka", "version", "current"}},
+	{"weka_user.txt", []string{"weka", "user"}},
+	// cluster topology
+	{"weka_cluster_servers.txt", []string{"weka", "cluster", "servers", "list"}},
+	{"weka_cluster_container.txt", []string{"weka", "cluster", "container"}},
+	{"weka_cluster_container_net.txt", []string{"weka", "cluster", "container", "net"}},
+	{"weka_cluster_process.txt", []string{"weka", "cluster", "process"}},
+	{"weka_cluster_drive.txt", []string{"weka", "cluster", "drive"}},
+	{"weka_cluster_bucket.txt", []string{"weka", "cluster", "bucket"}},
+	{"weka_cluster_failure_domain.txt", []string{"weka", "cluster", "failure-domain"}},
+	{"weka_cluster_task.txt", []string{"weka", "cluster", "task"}},
+	// filesystems & snapshots
+	{"weka_fs.txt", []string{"weka", "fs", "-v"}},
+	{"weka_fs_group.txt", []string{"weka", "fs", "group"}},
+	{"weka_fs_snapshot.txt", []string{"weka", "fs", "snapshot", "-v"}},
+	{"weka_fs_tier_s3.txt", []string{"weka", "fs", "tier", "s3", "-v"}},
+	// events (last 8 hours)
+	{"weka_events_major.txt", []string{"weka", "events", "--severity", "major", "--start-time", "-8h"}},
+	// security
+	{"weka_security_kms.txt", []string{"weka", "security", "kms"}},
+	// debug
+	{"weka_debug_traces_status.txt", []string{"weka", "debug", "traces", "status"}},
+	{"weka_debug_override_list.txt", []string{"weka", "debug", "override", "list"}},
+	{"weka_debug_net_links.txt", []string{"weka", "debug", "net", "links"}},
+	{"weka_debug_blacklist.txt", []string{"weka", "debug", "blacklist", "list"}},
+	{"weka_debug_buckets_dist.txt", []string{"weka", "debug", "buckets", "dist"}},
 }
 
 // perPodCLICommands are run on each compute/drive pod individually because
@@ -5228,8 +5279,27 @@ var perPodCLICommands = []struct {
 	name string
 	cmd  []string
 }{
-	{"weka_local_ps.txt", []string{"weka", "local", "ps"}},
+	{"weka_local_ps.txt", []string{"weka", "local", "ps", "-v"}},
+	{"weka_local_status.txt", []string{"weka", "local", "status", "-v"}},
 	{"weka_local_resources.json", []string{"weka", "local", "resources", "--json"}},
+}
+
+// perPodOSCommands are OS-level diagnostics run on each compute/drive pod.
+// Failures are logged at verbose level only — some tools may not be installed
+// in the container image.
+var perPodOSCommands = []struct {
+	name string
+	cmd  []string
+}{
+	{"uname.txt", []string{"uname", "-a"}},
+	{"os_release.txt", []string{"cat", "/etc/os-release"}},
+	{"df.txt", []string{"df", "-h"}},
+	{"meminfo.txt", []string{"cat", "/proc/meminfo"}},
+	{"cpuinfo_count.txt", []string{"sh", "-c", "grep -c ^processor /proc/cpuinfo"}},
+	{"ip_addr.txt", []string{"ip", "addr"}},
+	{"ip_route.txt", []string{"ip", "route"}},
+	{"ps_aux.txt", []string{"ps", "aux"}},
+	{"dmesg.txt", []string{"dmesg", "-T"}},
 }
 
 // collectK8sOptWekaLogs enumerates and archives weka process log files from
@@ -5369,6 +5439,14 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 					continue
 				}
 				_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, out)
+			}
+			for _, spec := range perPodOSCommands {
+				out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
+				if err != nil {
+					vlogf("k8s: os cmd %s in %s: %v", spec.name, pod, err)
+					continue
+				}
+				_ = addBytesToArchive(tw, podDir+"/os/"+spec.name, out)
 			}
 			collectK8sOptWekaLogs(tw, kc, clusterNS, pod, podDir+"/opt-weka-logs", m)
 		}
