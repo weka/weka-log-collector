@@ -41,12 +41,14 @@ git pull
 
 ### Architecture
 
-| Binary                     | Architecture | Nodes                        |
-|----------------------------|--------------|------------------------------|
-| `weka-log-collector`       | Linux amd64  | Standard Weka nodes (x86_64) |
-| `weka-log-collector-arm64` | Linux arm64  | ARM nodes (aarch64)          |
+| Binary                          | Architecture  | Target                             |
+|---------------------------------|---------------|------------------------------------|
+| `weka-log-collector`            | Linux amd64   | Standard Weka nodes (x86_64)       |
+| `weka-log-collector-arm64`      | Linux arm64   | ARM nodes (aarch64)                |
+| `weka-log-collector-darwin`     | macOS amd64   | Intel Macs                         |
+| `weka-log-collector-darwin-arm64` | macOS arm64 | Apple Silicon Macs (M-series)      |
 
-Both binaries are included — `git pull` keeps them up to date automatically.
+All four binaries are included — `git pull` keeps them up to date automatically on any platform.
 
 > The tool stores all files (archives, debug logs, the self-deployed binary) under `/opt/weka/weka-log-collector/`. This directory is created automatically on first use and on remote nodes during cluster-wide collection. `/opt/weka/` is used instead of `/tmp` to avoid `noexec` mount restrictions common on hardened systems.
 
@@ -357,9 +359,14 @@ Flags:
                        (required when multiple WekaCluster CRDs exist in the same namespace)
   --csi-ns NS          Override auto-detected CSI plugin namespace
                        (default: auto-detect, fall back to weka-csi-plugin)
-  --output PATH        Output .tar.gz path (default: ~/wlc-bundles/<cluster>-weka-logs-<ts>.tar.gz)
-  --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' on this node)
-  --cmd-timeout        Timeout per kubectl command (default: 120s)
+  --output PATH        Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz
+                       when /opt/weka exists on the local host, otherwise ./weka-log-collector/bundles/)
+  --compression        Compression format: gzip|xz  (default: gzip; xz requires system xz binary, falls back to gzip if not found)
+  --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name) with placeholders.
+                       Mapping written next to the bundle as <bundle>.anonymization-key.json.
+  --anonymize-key      Override path for the anonymization mapping JSON (default: alongside the bundle)
+  --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
+  --cmd-timeout        Timeout per kubectl command (default: 60s)
   --verbose            Print detailed progress
 ```
 
@@ -380,6 +387,9 @@ weka-log-collector k8s --k8s-host jump.internal --cluster-name production-cluste
 
 # Save bundle to specific path
 weka-log-collector k8s --k8s-host jump.internal --output /tmp/k8s-bundle.tar.gz
+
+# Anonymize identifying values before sharing
+weka-log-collector k8s --k8s-host jump.internal --anonymize
 ```
 
 ### Namespace auto-detection
@@ -405,10 +415,17 @@ The tool automatically discovers Weka namespaces by querying the `wekacluster` C
 **WekaCluster pods** (compute, drive, frontend)
 - Pod logs for all containers (current + previous)
 - Pod describe + events per pod
-- `weka status --json` — collected once cluster-wide from first responsive compute pod
-- `weka alerts --json` — collected once cluster-wide
-- `weka local ps` — per pod (node-local data)
-- `weka local resources --json` — per pod (node-local data)
+- **Cluster-wide weka commands** (run once from first responsive compute pod, stored under `weka-commands/`):
+  identity & status (`weka status`, `weka status rebuild`, `weka alerts`, `weka version`, `weka version current`, `weka user`),
+  cluster topology (`weka cluster servers list`, `weka cluster container`, `weka cluster container net`, `weka cluster process`, `weka cluster drive`, `weka cluster bucket`, `weka cluster failure-domain`, `weka cluster task`),
+  filesystems (`weka fs -v`, `weka fs group`, `weka fs snapshot -v`, `weka fs tier s3 -v`),
+  events (`weka events --severity major --start-time -8h`),
+  security (`weka security kms`),
+  debug (`weka debug traces status`, `weka debug override list`, `weka debug net links`, `weka debug blacklist list`, `weka debug buckets dist`)
+- **Per-pod weka local commands** (stored under each pod's `weka-local-commands/`):
+  `weka local ps -v`, `weka local status -v`, `weka local resources --json`
+- **Per-pod OS diagnostics** (stored under each pod's `os/`):
+  `uname -a`, `/etc/os-release`, `df -h`, `/proc/meminfo`, CPU count, `ip addr`, `ip route`, `ps aux`, `dmesg -T`
 - Full `/opt/weka/logs/` tree via `kubectl exec` — syslog, output, supervisord, shelld, nginx, events, api logs, wtracer logs (PVC-backed, survives pod restarts)
 
 **CSI plugin** (if installed)
@@ -592,7 +609,7 @@ This tool is designed to collect diagnostic data only — no credentials or secr
 - Any files outside `/opt/weka/logs/` and `/opt/weka/data/`
 
 **Credential redaction (applied to every collected command output):**
-Any value whose key name contains a credential-like substring is automatically replaced with `[REDACTED]` before being written to the archive. This covers all weka CLI JSON outputs (e.g. `weka smb cluster info -J` → `pcsPass`), system command outputs, k8s ConfigMaps, and extra-command outputs. Patterns matched: `password`, `passwd`, `pwd`, `pass` (catches camelCase like `pcsPass`, `dbPass`), `token`, `secret`, `api-key` / `api_key`, `auth`, `credential`, `private-key`, `access-key`, `signing-key`. JSON formatting is preserved exactly (only the string value inside the quotes is replaced).
+Any value whose key name contains a credential-like substring is automatically replaced with `[REDACTED]` before being written to the archive. This covers all weka CLI outputs (e.g. fields like `pcsPass`, `dbPass`, `join_secret`), system command outputs, k8s ConfigMaps, and extra-command outputs. Patterns matched: `password`, `passwd`, `pwd`, `pass` (catches camelCase like `pcsPass`, `dbPass`), `token`, `secret`, `api-key` / `api_key`, `auth`, `credential`, `private-key`, `access-key`, `signing-key`. JSON and YAML formatting is preserved exactly (only the value is replaced).
 
 **What IS in the bundle that you should be aware of:**
 - Pod logs and container logs — may contain hostnames, IP addresses, filesystem paths, and internal service URLs
@@ -604,7 +621,7 @@ Any value whose key name contains a credential-like substring is automatically r
 
 ### Anonymization (`--anonymize`)
 
-For environments where bundles cannot leave the customer site without identifying information removed (Federal, regulated industries, dark sites), pass `--anonymize`. The tool replaces customer-identifying values with placeholders that preserve enough structure for support engineers to follow a single host across files:
+For environments where bundles cannot leave the customer site without identifying information removed (Federal, regulated industries, dark sites), pass `--anonymize`. Supported by both the standard collection mode and the `k8s` subcommand. The tool replaces customer-identifying values with placeholders that preserve enough structure for support engineers to follow a single host across files:
 
 | Type | Original | Replacement |
 |---|---|---|
@@ -655,15 +672,18 @@ go install honnef.co/go/tools/cmd/staticcheck@latest
 | `task lint` | Linter (staticcheck) |
 | `task test` | Unit tests |
 | `task build` | Build binary for current platform |
-| `task build-linux` | Cross-compile static Linux binary |
+| `task build-linux` | Cross-compile static Linux binary (amd64) |
+| `task build-linux-arm64` | Cross-compile static Linux binary (arm64) |
+| `task build-darwin` | Cross-compile macOS binary (Intel) |
+| `task build-darwin-arm64` | Cross-compile macOS binary (Apple Silicon) |
 | `task check` | All of the above in order |
 
-Run `task check` before every commit. All fmt, vet, lint, and test failures must be resolved.
+Run `task check` before every commit. All fmt, vet, lint, and test failures must be resolved. Stage and commit all four platform binaries alongside code changes (`weka-log-collector`, `weka-log-collector-arm64`, `weka-log-collector-darwin`, `weka-log-collector-darwin-arm64`).
 
 ### Constraints
 
 - No external dependencies — stdlib only
-- No CGo — static Linux binary
+- No CGo — static binaries for all platforms
 - Single file — all implementation in `main.go`
 
 ---
