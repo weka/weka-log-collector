@@ -5416,7 +5416,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
 				continue
 			}
-			_ = addBytesToArchive(tw, root+"/weka-cli/"+spec.name, out)
+			_ = addBytesToArchive(tw, root+"/weka-commands/"+spec.name, out)
 			break // success — no need to try other pods
 		}
 	}
@@ -5438,7 +5438,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 					vlogf("k8s: exec %s %s: %v", pod, spec.cmd[0], err)
 					continue
 				}
-				_ = addBytesToArchive(tw, podDir+"/weka-cli/"+spec.name, out)
+				_ = addBytesToArchive(tw, podDir+"/weka-local-commands/"+spec.name, out)
 			}
 			for _, spec := range perPodOSCommands {
 				out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
