@@ -126,16 +126,52 @@ func redactSensitiveJSON(b []byte) []byte {
 	return b
 }
 
+// valuePatternRes matches credential values by their shape or context, not by
+// a preceding key name. Applied after the key-based passes so they catch the
+// cases that fall through (e.g. CLI args in ps aux, Authorization headers in
+// shelld.log, bare Weka SRT tokens).
+//
+//	[1] HTTP Authorization header: "Authorization: Bearer <token>" or "Authorization: Token <token>"
+//	[2] CLI flag whose name contains a credential substring (aligned with sensitiveKeyRe):
+//	    --token, --access-token, --refresh-token, --join-secret, --private-key, etc.
+//	[3] Weka SRT token: a bare SRT… string of ≥20 chars (download/activation tokens)
+//
+// Values are bounded by [^\s"',;]+ rather than \S+ so that structural
+// delimiters (quotes, commas, semicolons) in JSON/YAML context are never
+// consumed, preventing corruption of surrounding structured output.
+var (
+	authHeaderRe = regexp.MustCompile(
+		`(?i)(Authorization\s*:\s*(?:Bearer|Token)\s+)[^\s"',;]+`)
+	cliFlagRe = regexp.MustCompile(
+		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|\s+))[^\s"',;]+`)
+	srtTokenRe = regexp.MustCompile(
+		`\bSRT[A-Za-z0-9+/._=-]{20,}`)
+)
+
+// redactSensitiveValues applies value-shape redaction that the key-name passes
+// miss: HTTP Authorization headers, CLI flag values, and bare Weka SRT tokens.
+// Safe to run on arbitrary text — content without matches is returned unchanged.
+func redactSensitiveValues(b []byte) []byte {
+	b = authHeaderRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
+	b = cliFlagRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
+	b = srtTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
+	return b
+}
+
 // redactSensitive auto-detects JSON content (starts with `{` or `[` after
 // whitespace) and applies the JSON redactor; otherwise falls back to the
-// line-based YAML/text redactor. Safe to call on arbitrary command output —
-// content without sensitive keys is returned unchanged.
+// line-based YAML/text redactor. A final value-pattern pass then catches tokens
+// that appear without a structured key (CLI args, HTTP headers, bare SRT tokens).
+// Safe to call on arbitrary command output — content without sensitive keys is
+// returned unchanged.
 func redactSensitive(b []byte) []byte {
 	trimmed := bytes.TrimLeft(b, " \t\r\n")
 	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-		return redactSensitiveJSON(b)
+		b = redactSensitiveJSON(b)
+	} else {
+		b = redactSensitiveYAML(b)
 	}
-	return redactSensitiveYAML(b)
+	return redactSensitiveValues(b)
 }
 
 // ─── anonymizer ──────────────────────────────────────────────────────────────
@@ -2230,45 +2266,19 @@ func collectLogFile(tw *tar.Writer, srcPath, destPath string) FileResult {
 	result.DestPath = archiveDest
 	result.SizeBytes = size
 
-	// When credential redaction or anonymization is active, route log content
-	// through addBytesToArchive (which applies them transparently). Streaming
-	// io.Copy is preserved for the no-transform case so unmodified runs avoid
-	// loading whole files into memory.
-	if globalAnonymizer.enabled {
-		data, readErr := io.ReadAll(reader)
-		if readErr != nil {
-			result.Error = fmt.Sprintf("read: %v", readErr)
-			return result
-		}
-		if err := addBytesToArchiveWithMtime(tw, archiveDest, data, info.ModTime()); err != nil {
-			result.Error = fmt.Sprintf("tar write: %v", err)
-			return result
-		}
-		vlogf("  file %s: OK (%d bytes)", srcPath, size)
+	// Always read log content into memory so credential redaction and (when
+	// --anonymize is set) anonymization can be applied before archiving.
+	// addBytesToArchiveWithMtime skips regex passes on binary content via
+	// isLikelyText, so the in-memory round-trip is safe for all file types.
+	data, readErr := io.ReadAll(reader)
+	if readErr != nil {
+		result.Error = fmt.Sprintf("read: %v", readErr)
 		return result
 	}
-
-	hdr := &tar.Header{
-		Name:    archiveDest,
-		Mode:    0644,
-		Size:    size,
-		ModTime: info.ModTime(),
-	}
-	if err := tw.WriteHeader(hdr); err != nil {
-		result.Error = fmt.Sprintf("tar header: %v", err)
+	if err := addBytesToArchiveWithMtime(tw, archiveDest, data, info.ModTime()); err != nil {
+		result.Error = fmt.Sprintf("tar write: %v", err)
 		return result
 	}
-	if _, err := io.Copy(tw, reader); err != nil {
-		result.Error = fmt.Sprintf("tar copy: %v", err)
-		return result
-	}
-	// Apply credential redaction to streaming content too — but content was
-	// already streamed at this point. For credential redaction without
-	// anonymization we don't bake the in-memory roundtrip cost; the tradeoff
-	// is that log files (e.g. system messages) skip credential redaction.
-	// In practice, system log files do not embed JSON credential dumps, so
-	// this is acceptable. Command outputs always go through addBytesToArchive
-	// and are redacted there.
 	vlogf("  file %s: OK (%d bytes)", srcPath, size)
 	return result
 }

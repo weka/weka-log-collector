@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -56,6 +57,140 @@ func TestRedactSensitiveYAML_JoinSecret(t *testing.T) {
 	// join_secret contains "secret" so it should be redacted by the YAML redactor too.
 	if got == input {
 		t.Errorf("YAML redactor did not redact join_secret:\n%s", got)
+	}
+}
+
+// fakeBearer and fakeSRT are placeholder strings used in tests below.
+// They are intentionally low-entropy (all-X padding) so that secret-scanning
+// tools do not flag them as real credentials.
+const (
+	fakeBearer = "FAKE-TEST-BEARER-TOKEN-XXXXXXXXXXXX"
+	fakeSRT    = "SRTFAKE-TEST-TOKEN-XXXXXXXXXXXXXXXXX"
+	fakePW     = "FAKE-TEST-PW-XXXXXXXXXX"
+)
+
+func TestRedactSensitiveValues_AuthHeader(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+		desc  string
+	}{
+		{"Authorization: Bearer " + fakeBearer, "Authorization: Bearer [REDACTED]", "Bearer header"},
+		{"Authorization: Token " + fakeBearer, "Authorization: Token [REDACTED]", "Token header"},
+		{"authorization: bearer " + fakeBearer, "authorization: bearer [REDACTED]", "lowercase bearer"},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		if bytes.Contains([]byte(got), []byte(fakeBearer)) {
+			t.Errorf("%s: token not redacted:\n%s", tc.desc, got)
+		}
+		if got != tc.want {
+			t.Errorf("%s: unexpected output:\ngot:  %q\nwant: %q", tc.desc, got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_CLIFlag(t *testing.T) {
+	cases := []struct {
+		input string
+		desc  string
+	}{
+		{"weka agent --token " + fakeSRT + " --other arg", "space-separated --token flag"},
+		{"weka agent --token=" + fakeSRT, "equals-separated --token flag"},
+		{"proc --password=" + fakePW + " --verbose", "--password flag"},
+		{"weka --access-token=" + fakeBearer, "compound --access-token flag"},
+		{"weka --refresh-token " + fakeBearer, "compound --refresh-token flag"},
+		{"weka --join-secret=" + fakeBearer, "compound --join-secret flag"},
+		{"weka --private-key=" + fakeBearer, "compound --private-key flag"},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		for _, secret := range []string{fakeSRT, fakePW, fakeBearer} {
+			if bytes.Contains([]byte(got), []byte(secret)) {
+				t.Errorf("%s: credential not redacted:\n%s", tc.desc, got)
+			}
+		}
+		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
+			t.Errorf("%s: [REDACTED] not present:\n%s", tc.desc, got)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_StructuralDelimiters(t *testing.T) {
+	// Verify that surrounding JSON/structured text is not consumed by the regex.
+	cases := []struct {
+		input       string
+		mustContain string
+		desc        string
+	}{
+		{
+			`{"cmd":"weka --token=` + fakeSRT + `","other":"ok"}`,
+			`","other":"ok"}`,
+			"JSON trailing text preserved after --token=",
+		},
+		{
+			`Authorization: Bearer ` + fakeBearer + `, X-Other: val`,
+			`, X-Other: val`,
+			"comma-delimited header suffix preserved",
+		},
+		{
+			`"Authorization: Bearer ` + fakeBearer + `","key":"val"`,
+			`","key":"val"`,
+			"JSON quote delimiter preserved after Bearer token",
+		},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		if !bytes.Contains([]byte(got), []byte(tc.mustContain)) {
+			t.Errorf("%s: structural text corrupted:\ngot:  %q\nwant to contain: %q", tc.desc, got, tc.mustContain)
+		}
+		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
+			t.Errorf("%s: [REDACTED] not present:\n%s", tc.desc, got)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_SRTToken(t *testing.T) {
+	input := "download token: " + fakeSRT
+	got := string(redactSensitiveValues([]byte(input)))
+	if bytes.Contains([]byte(got), []byte(fakeSRT)) {
+		t.Errorf("bare SRT token not redacted:\n%s", got)
+	}
+	if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
+		t.Errorf("[REDACTED] not present:\n%s", got)
+	}
+}
+
+func TestRedactSensitiveValues_NoFalsePositives(t *testing.T) {
+	cases := []struct {
+		input string
+		desc  string
+	}{
+		{"Authorization: negotiate", "negotiate auth (no token value)"},
+		{"--verbose --output /tmp/out.tar.gz", "innocent flags"},
+		{"status: SRT", "SRT too short to be a token"},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		if got != tc.input {
+			t.Errorf("%s: false positive — input was modified:\ninput: %q\ngot:   %q", tc.desc, tc.input, got)
+		}
+	}
+}
+
+func TestRedactSensitive_PsAuxLine(t *testing.T) {
+	line := "root  1234  0.0  0.1  weka agent --token " + fakeSRT + " --debug"
+	got := string(redactSensitive([]byte(line)))
+	if bytes.Contains([]byte(got), []byte(fakeSRT)) {
+		t.Errorf("SRT token survived redactSensitive on ps aux line:\n%s", got)
+	}
+}
+
+func TestRedactSensitive_ShelldLogBearerLine(t *testing.T) {
+	line := "2026-09-21T10:00:00Z GET https://get.weka.io/dist/v1/pkg Authorization: Bearer " + fakeBearer
+	got := string(redactSensitive([]byte(line)))
+	if bytes.Contains([]byte(got), []byte(fakeBearer)) {
+		t.Errorf("Bearer token survived redactSensitive on shelld.log line:\n%s", got)
 	}
 }
 
