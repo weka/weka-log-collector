@@ -95,14 +95,54 @@ func TestRedactSensitiveValues_CLIFlag(t *testing.T) {
 		input string
 		desc  string
 	}{
-		{"weka agent --token " + fakeSRT + " --other arg", "space-separated token flag"},
-		{"weka agent --token=" + fakeSRT, "equals-separated token flag"},
-		{"proc --password=" + fakePW + " --verbose", "password flag"},
+		{"weka agent --token " + fakeSRT + " --other arg", "space-separated --token flag"},
+		{"weka agent --token=" + fakeSRT, "equals-separated --token flag"},
+		{"proc --password=" + fakePW + " --verbose", "--password flag"},
+		{"weka --access-token=" + fakeBearer, "compound --access-token flag"},
+		{"weka --refresh-token " + fakeBearer, "compound --refresh-token flag"},
+		{"weka --join-secret=" + fakeBearer, "compound --join-secret flag"},
+		{"weka --private-key=" + fakeBearer, "compound --private-key flag"},
 	}
 	for _, tc := range cases {
 		got := string(redactSensitiveValues([]byte(tc.input)))
-		if bytes.Contains([]byte(got), []byte(fakeSRT)) || bytes.Contains([]byte(got), []byte(fakePW)) {
-			t.Errorf("%s: credential not redacted:\n%s", tc.desc, got)
+		for _, secret := range []string{fakeSRT, fakePW, fakeBearer} {
+			if bytes.Contains([]byte(got), []byte(secret)) {
+				t.Errorf("%s: credential not redacted:\n%s", tc.desc, got)
+			}
+		}
+		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
+			t.Errorf("%s: [REDACTED] not present:\n%s", tc.desc, got)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_StructuralDelimiters(t *testing.T) {
+	// Verify that surrounding JSON/structured text is not consumed by the regex.
+	cases := []struct {
+		input       string
+		mustContain string
+		desc        string
+	}{
+		{
+			`{"cmd":"weka --token=` + fakeSRT + `","other":"ok"}`,
+			`","other":"ok"}`,
+			"JSON trailing text preserved after --token=",
+		},
+		{
+			`Authorization: Bearer ` + fakeBearer + `, X-Other: val`,
+			`, X-Other: val`,
+			"comma-delimited header suffix preserved",
+		},
+		{
+			`"Authorization: Bearer ` + fakeBearer + `","key":"val"`,
+			`","key":"val"`,
+			"JSON quote delimiter preserved after Bearer token",
+		},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		if !bytes.Contains([]byte(got), []byte(tc.mustContain)) {
+			t.Errorf("%s: structural text corrupted:\ngot:  %q\nwant to contain: %q", tc.desc, got, tc.mustContain)
 		}
 		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
 			t.Errorf("%s: [REDACTED] not present:\n%s", tc.desc, got)
