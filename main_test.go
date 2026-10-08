@@ -60,22 +60,32 @@ func TestRedactSensitiveYAML_JoinSecret(t *testing.T) {
 	}
 }
 
+// fakeBearer and fakeSRT are placeholder strings used in tests below.
+// They are intentionally low-entropy (all-X padding) so that secret-scanning
+// tools do not flag them as real credentials.
+const (
+	fakeBearer = "FAKE-TEST-BEARER-TOKEN-XXXXXXXXXXXX"
+	fakeSRT    = "SRTFAKE-TEST-TOKEN-XXXXXXXXXXXXXXXXX"
+	fakePW     = "FAKE-TEST-PW-XXXXXXXXXX"
+)
+
 func TestRedactSensitiveValues_AuthHeader(t *testing.T) {
 	cases := []struct {
 		input string
+		want  string
 		desc  string
 	}{
-		{"Authorization: Bearer SRTabcdefghijklmnopqrstuvwxyz1234", "Bearer header"},
-		{"Authorization: Token SRTabcdefghijklmnopqrstuvwxyz1234", "Token header"},
-		{"authorization: bearer someOtherLongToken12345678901234", "lowercase bearer"},
+		{"Authorization: Bearer " + fakeBearer, "Authorization: Bearer [REDACTED]", "Bearer header"},
+		{"Authorization: Token " + fakeBearer, "Authorization: Token [REDACTED]", "Token header"},
+		{"authorization: bearer " + fakeBearer, "authorization: bearer [REDACTED]", "lowercase bearer"},
 	}
 	for _, tc := range cases {
 		got := string(redactSensitiveValues([]byte(tc.input)))
-		if bytes.Contains([]byte(got), []byte("SRTabcdef")) || bytes.Contains([]byte(got), []byte("someOther")) {
+		if bytes.Contains([]byte(got), []byte(fakeBearer)) {
 			t.Errorf("%s: token not redacted:\n%s", tc.desc, got)
 		}
-		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
-			t.Errorf("%s: [REDACTED] not present:\n%s", tc.desc, got)
+		if got != tc.want {
+			t.Errorf("%s: unexpected output:\ngot:  %q\nwant: %q", tc.desc, got, tc.want)
 		}
 	}
 }
@@ -85,13 +95,13 @@ func TestRedactSensitiveValues_CLIFlag(t *testing.T) {
 		input string
 		desc  string
 	}{
-		{"weka agent --token SRTabcdefghijklmnopqrstuvwxyz1234 --other arg", "space-separated token flag"},
-		{"weka agent --token=SRTabcdefghijklmnopqrstuvwxyz1234", "equals-separated token flag"},
-		{"proc --password=hunter2 --verbose", "password flag"},
+		{"weka agent --token " + fakeSRT + " --other arg", "space-separated token flag"},
+		{"weka agent --token=" + fakeSRT, "equals-separated token flag"},
+		{"proc --password=" + fakePW + " --verbose", "password flag"},
 	}
 	for _, tc := range cases {
 		got := string(redactSensitiveValues([]byte(tc.input)))
-		if bytes.Contains([]byte(got), []byte("SRTabcdef")) || bytes.Contains([]byte(got), []byte("hunter2")) {
+		if bytes.Contains([]byte(got), []byte(fakeSRT)) || bytes.Contains([]byte(got), []byte(fakePW)) {
 			t.Errorf("%s: credential not redacted:\n%s", tc.desc, got)
 		}
 		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
@@ -101,10 +111,9 @@ func TestRedactSensitiveValues_CLIFlag(t *testing.T) {
 }
 
 func TestRedactSensitiveValues_SRTToken(t *testing.T) {
-	token := "SRTsomeverylongtokenvalue1234567890abcdef"
-	input := "download token: " + token
+	input := "download token: " + fakeSRT
 	got := string(redactSensitiveValues([]byte(input)))
-	if bytes.Contains([]byte(got), []byte(token)) {
+	if bytes.Contains([]byte(got), []byte(fakeSRT)) {
 		t.Errorf("bare SRT token not redacted:\n%s", got)
 	}
 	if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
@@ -130,19 +139,17 @@ func TestRedactSensitiveValues_NoFalsePositives(t *testing.T) {
 }
 
 func TestRedactSensitive_PsAuxLine(t *testing.T) {
-	// Simulate a ps aux line where weka runs with a token in its args.
-	line := "root  1234  0.0  0.1  weka agent --token SRTabcdefghijklmnopqrstuvwxyz1234 --debug"
+	line := "root  1234  0.0  0.1  weka agent --token " + fakeSRT + " --debug"
 	got := string(redactSensitive([]byte(line)))
-	if bytes.Contains([]byte(got), []byte("SRTabcdef")) {
+	if bytes.Contains([]byte(got), []byte(fakeSRT)) {
 		t.Errorf("SRT token survived redactSensitive on ps aux line:\n%s", got)
 	}
 }
 
 func TestRedactSensitive_ShelldLogBearerLine(t *testing.T) {
-	// Simulate a shelld.log HTTP request line with an Authorization header.
-	line := `2026-09-21T10:00:00Z GET https://get.weka.io/dist/v1/pkg Authorization: Bearer SRTabcdefghijklmnopqrstuvwxyz1234`
+	line := "2026-09-21T10:00:00Z GET https://get.weka.io/dist/v1/pkg Authorization: Bearer " + fakeBearer
 	got := string(redactSensitive([]byte(line)))
-	if bytes.Contains([]byte(got), []byte("SRTabcdef")) {
+	if bytes.Contains([]byte(got), []byte(fakeBearer)) {
 		t.Errorf("Bearer token survived redactSensitive on shelld.log line:\n%s", got)
 	}
 }
