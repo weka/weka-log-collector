@@ -126,16 +126,47 @@ func redactSensitiveJSON(b []byte) []byte {
 	return b
 }
 
+// valuePatternRes matches credential values by their shape or context, not by
+// a preceding key name. Applied after the key-based passes so they catch the
+// cases that fall through (e.g. CLI args in ps aux, Authorization headers in
+// shelld.log, bare Weka SRT tokens).
+//
+//	[1] HTTP Authorization header: "Authorization: Bearer <token>" or "Authorization: Token <token>"
+//	[2] CLI flag with = or space: --token=VALUE / --password VALUE (any sensitive flag name)
+//	[3] Weka SRT token: a bare SRT… string of ≥20 chars (download/activation tokens)
+var (
+	authHeaderRe = regexp.MustCompile(
+		`(?i)(Authorization\s*:\s*(?:Bearer|Token)\s+)\S+`)
+	cliFlagRe = regexp.MustCompile(
+		`(?i)(--(?:password|passwd|pwd|token|secret|api[-_]?key|auth[-_]?token|access[-_]?key|signing[-_]?key)(?:=|\s+))\S+`)
+	srtTokenRe = regexp.MustCompile(
+		`\bSRT[A-Za-z0-9+/._=-]{20,}`)
+)
+
+// redactSensitiveValues applies value-shape redaction that the key-name passes
+// miss: HTTP Authorization headers, CLI flag values, and bare Weka SRT tokens.
+// Safe to run on arbitrary text — content without matches is returned unchanged.
+func redactSensitiveValues(b []byte) []byte {
+	b = authHeaderRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
+	b = cliFlagRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
+	b = srtTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
+	return b
+}
+
 // redactSensitive auto-detects JSON content (starts with `{` or `[` after
 // whitespace) and applies the JSON redactor; otherwise falls back to the
-// line-based YAML/text redactor. Safe to call on arbitrary command output —
-// content without sensitive keys is returned unchanged.
+// line-based YAML/text redactor. A final value-pattern pass then catches tokens
+// that appear without a structured key (CLI args, HTTP headers, bare SRT tokens).
+// Safe to call on arbitrary command output — content without sensitive keys is
+// returned unchanged.
 func redactSensitive(b []byte) []byte {
 	trimmed := bytes.TrimLeft(b, " \t\r\n")
 	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-		return redactSensitiveJSON(b)
+		b = redactSensitiveJSON(b)
+	} else {
+		b = redactSensitiveYAML(b)
 	}
-	return redactSensitiveYAML(b)
+	return redactSensitiveValues(b)
 }
 
 // ─── anonymizer ──────────────────────────────────────────────────────────────

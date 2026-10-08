@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -56,6 +57,93 @@ func TestRedactSensitiveYAML_JoinSecret(t *testing.T) {
 	// join_secret contains "secret" so it should be redacted by the YAML redactor too.
 	if got == input {
 		t.Errorf("YAML redactor did not redact join_secret:\n%s", got)
+	}
+}
+
+func TestRedactSensitiveValues_AuthHeader(t *testing.T) {
+	cases := []struct {
+		input string
+		desc  string
+	}{
+		{"Authorization: Bearer SRTabcdefghijklmnopqrstuvwxyz1234", "Bearer header"},
+		{"Authorization: Token SRTabcdefghijklmnopqrstuvwxyz1234", "Token header"},
+		{"authorization: bearer someOtherLongToken12345678901234", "lowercase bearer"},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		if bytes.Contains([]byte(got), []byte("SRTabcdef")) || bytes.Contains([]byte(got), []byte("someOther")) {
+			t.Errorf("%s: token not redacted:\n%s", tc.desc, got)
+		}
+		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
+			t.Errorf("%s: [REDACTED] not present:\n%s", tc.desc, got)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_CLIFlag(t *testing.T) {
+	cases := []struct {
+		input string
+		desc  string
+	}{
+		{"weka agent --token SRTabcdefghijklmnopqrstuvwxyz1234 --other arg", "space-separated token flag"},
+		{"weka agent --token=SRTabcdefghijklmnopqrstuvwxyz1234", "equals-separated token flag"},
+		{"proc --password=hunter2 --verbose", "password flag"},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		if bytes.Contains([]byte(got), []byte("SRTabcdef")) || bytes.Contains([]byte(got), []byte("hunter2")) {
+			t.Errorf("%s: credential not redacted:\n%s", tc.desc, got)
+		}
+		if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
+			t.Errorf("%s: [REDACTED] not present:\n%s", tc.desc, got)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_SRTToken(t *testing.T) {
+	token := "SRTsomeverylongtokenvalue1234567890abcdef"
+	input := "download token: " + token
+	got := string(redactSensitiveValues([]byte(input)))
+	if bytes.Contains([]byte(got), []byte(token)) {
+		t.Errorf("bare SRT token not redacted:\n%s", got)
+	}
+	if !bytes.Contains([]byte(got), []byte("[REDACTED]")) {
+		t.Errorf("[REDACTED] not present:\n%s", got)
+	}
+}
+
+func TestRedactSensitiveValues_NoFalsePositives(t *testing.T) {
+	cases := []struct {
+		input string
+		desc  string
+	}{
+		{"Authorization: negotiate", "negotiate auth (no token value)"},
+		{"--verbose --output /tmp/out.tar.gz", "innocent flags"},
+		{"status: SRT", "SRT too short to be a token"},
+	}
+	for _, tc := range cases {
+		got := string(redactSensitiveValues([]byte(tc.input)))
+		if got != tc.input {
+			t.Errorf("%s: false positive — input was modified:\ninput: %q\ngot:   %q", tc.desc, tc.input, got)
+		}
+	}
+}
+
+func TestRedactSensitive_PsAuxLine(t *testing.T) {
+	// Simulate a ps aux line where weka runs with a token in its args.
+	line := "root  1234  0.0  0.1  weka agent --token SRTabcdefghijklmnopqrstuvwxyz1234 --debug"
+	got := string(redactSensitive([]byte(line)))
+	if bytes.Contains([]byte(got), []byte("SRTabcdef")) {
+		t.Errorf("SRT token survived redactSensitive on ps aux line:\n%s", got)
+	}
+}
+
+func TestRedactSensitive_ShelldLogBearerLine(t *testing.T) {
+	// Simulate a shelld.log HTTP request line with an Authorization header.
+	line := `2026-09-21T10:00:00Z GET https://get.weka.io/dist/v1/pkg Authorization: Bearer SRTabcdefghijklmnopqrstuvwxyz1234`
+	got := string(redactSensitive([]byte(line)))
+	if bytes.Contains([]byte(got), []byte("SRTabcdef")) {
+		t.Errorf("Bearer token survived redactSensitive on shelld.log line:\n%s", got)
 	}
 }
 
