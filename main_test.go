@@ -866,8 +866,6 @@ func TestRedactSensitive_ConfigCredentialNames(t *testing.T) {
 	}
 	for _, in := range []string{
 		"Token timeouts used for authentication were updated: access=1d, refresh=30d, max_mount_token=30d",
-		"WEKA_TOKEN=/opt/weka/data/agent/token",
-		"driver: token=<32 chars> mask",
 		"PWD=/root OLDPWD=/home",
 	} {
 		if got := string(redactSensitive([]byte(in))); got != in {
@@ -976,5 +974,132 @@ func TestOneLine(t *testing.T) {
 	}
 	if got := oneLine("abcdef", 3); got != "abc" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestRedactAssignments_NoLeaks(t *testing.T) {
+	// Each of these must lose the secret (round-3 review: an earlier
+	// structure-preserving heuristic let them through).
+	for _, in := range []string{
+		`bash -c "export PGPASSWORD='` + fakePW + `'"`,
+		`"cmd": "export VAULT_TOKEN='` + fakePW + `'"`,
+		`sh -c 'export DB_PASSWORD="` + fakePW + `"'`,
+		`<user name="bob" password="` + fakePW + `"/>`,
+		`login failed, password="` + fakePW + `".`,
+		`login failed: password="` + fakePW + `": bad`,
+		`Environment="DB_PASSWORD='` + fakePW + `'"`,
+		`[{"env":"VAULT_TOKEN='` + fakePW + `'"}]`,
+		"DB_PASSWORD=Xy)9k}Lm]" + fakePW,
+		"export API_TOKEN=ab]" + fakePW,
+		"client_secret=ab}" + fakePW,
+		"password=)" + fakePW,
+		"AWS_SECRET_ACCESS_KEY=/3kRtYbE9xQ+" + fakePW,
+		"aws_secret_access_key = /3kRtYbE9xQ+" + fakePW,
+		"WEKA_TOKEN=/opt/weka/" + fakePW,
+	} {
+		got := string(redactSensitive([]byte(in)))
+		if strings.Contains(got, fakePW) {
+			t.Errorf("secret leaked:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+	// A duration-shaped value ("2024y") under a password name is still a
+	// password. Built from parts so secret scanners do not flag the test.
+	durationShaped := "DB_" + "PASSWORD=" + "2024" + "y"
+	if got := string(redactSensitive([]byte(durationShaped))); got != "DB_PASSWORD=[REDACTED]" {
+		t.Errorf("duration-shaped password kept: %q", got)
+	}
+	// Structure that must survive.
+	for in, want := range map[string]string{
+		`\"VAULT_TOKEN=\",\"PATH=/usr/bin\"`:        `\"VAULT_TOKEN=\",\"PATH=/usr/bin\"`,
+		"(hostId=1, secret=" + fakePW + ")":         "(hostId=1, secret=[REDACTED])",
+		"Config{user=bob, password=" + fakePW + "}": "Config{user=bob, password=[REDACTED]}",
+		"[password=" + fakePW + "]":                 "[password=[REDACTED]]",
+		`{"url":"https://h/api?token=","next":"v"}`: `{"url":"https://h/api?token=","next":"v"}`,
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %q\nwant %q", got, want)
+		}
+	}
+}
+
+func TestRedactSensitive_CLIValuelessFlagsAndCase(t *testing.T) {
+	for in, want := range map[string]string{
+		"weka smb domain join Administrator --debug " + fakePW:      "weka smb domain join Administrator --debug [REDACTED]",
+		"weka nfs ldap setup-openldap s d cn=r --force " + fakePW:   "weka nfs ldap setup-openldap s d cn=r --force [REDACTED]",
+		"Weka user login admin " + fakePW:                           "Weka user login admin [REDACTED]",
+		"weka smb domain join Administrator " + fakePW + " --debug": "weka smb domain join Administrator [REDACTED] --debug",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %q\nwant %q", got, want)
+		}
+	}
+}
+
+// refRedactAll is redactSensitive without any prefilter: every pass on every
+// line. The fast path must give byte-identical output.
+func refRedactAll(b []byte) []byte {
+	trimmed := bytes.TrimLeft(b, " \t\r\n")
+	isJSON := len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+	if isJSON {
+		b = redactSensitiveJSON(b)
+	}
+	lines := bytes.Split(b, []byte("\n"))
+	for i, line := range lines {
+		lines[i] = redactLine(line, nil, isJSON, false)
+	}
+	return bytes.Join(lines, []byte("\n"))
+}
+
+func TestRedactSensitive_PrefilterEquivalence(t *testing.T) {
+	src, err := os.ReadFile("main_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := strings.Join([]string{
+		"password\r: " + fakePW,
+		"secret\f: " + fakePW,
+		"to\u212aen: " + fakePW,
+		"pa\u017f\u017fword=" + fakePW,
+		"API_\u212aEY=" + fakePW,
+		"plain line without anything",
+	}, "\n")
+	for _, in := range [][]byte{src, []byte(strings.ToUpper(string(src))), []byte(extra)} {
+		fast, ref := redactSensitive(in), refRedactAll(in)
+		if !bytes.Equal(fast, ref) {
+			fl, rl := bytes.Split(fast, []byte("\n")), bytes.Split(ref, []byte("\n"))
+			for i := range fl {
+				if i < len(rl) && !bytes.Equal(fl[i], rl[i]) {
+					t.Errorf("line %d differs:\nfast: %q\nref:  %q", i, fl[i], rl[i])
+				}
+			}
+		}
+	}
+	got := string(redactSensitive([]byte(extra)))
+	if strings.Count(got, fakePW) != 0 {
+		t.Errorf("secret survived in folded/whitespace cases:\n%s", got)
+	}
+}
+
+func TestRemoteFailure(t *testing.T) {
+	log := "weka-log-collector 0.1.0\nProfile: default\n[WARN]  x\n[ERROR] Upload failed: no uploader\nCleanup done\n"
+	if err := remoteFailure(1, log); err.Error() != "remote run failed (exit 1): Upload failed: no uploader" {
+		t.Errorf("got %v", err)
+	}
+	if err := remoteFailure(255, "ssh: connect to host x port 22: Connection refused\n"); !strings.HasPrefix(err.Error(), "SSH failed (exit 255): ssh: connect") {
+		t.Errorf("got %v", err)
+	}
+	if err := remoteFailure(2, "a\nlast line\n"); err.Error() != "remote run failed (exit 2): last line" {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestParseExtractorOutput_ShardVsHistogramParseFailures(t *testing.T) {
+	out := "verbose: /opt/weka/traces: 5 files match glob *.shard\n" +
+		"verbose: /opt/weka/traces/histograms: 4 skipped (parse), 0 skipped (filter), 0 remaining\n" +
+		"verbose: /opt/weka/traces: 1 skipped (parse), 4 skipped (filter), 0 remaining\nCollecting:\n  0 shards\n"
+	var r TraceResult
+	seen, unparsed := parseExtractorOutput(out, &r)
+	if seen != 5 || unparsed != 1 || r.UnparsedFiles != 5 {
+		t.Errorf("seen=%d unparsed=%d total=%d", seen, unparsed, r.UnparsedFiles)
 	}
 }
