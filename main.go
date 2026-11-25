@@ -1980,6 +1980,21 @@ type HostManifest struct {
 	FailedFiles    int             `json:"failed_files"`
 	TotalCommands  int             `json:"total_commands"`
 	FailedCommands int             `json:"failed_commands"`
+	Traces         *TraceResult    `json:"traces,omitempty"`
+}
+
+// TraceResult records what trace collection did on one host. It is written to
+// collection_manifest.json and summarised in cluster_summary.json so that a
+// skipped, failed or empty trace collection is visible in the bundle.
+type TraceResult struct {
+	Status        string   `json:"status"` // ok | no_shards | failed | timeout | skipped
+	Reason        string   `json:"reason,omitempty"`
+	Shards        int      `json:"shards"`
+	Histograms    int      `json:"histograms"`
+	UnparsedFiles int      `json:"unparsed_files,omitempty"` // files trace_extractor could not parse and skipped
+	ExitCode      int      `json:"exit_code,omitempty"`
+	Duration      string   `json:"duration,omitempty"`
+	Archives      []string `json:"archives,omitempty"`
 }
 
 // ── progress output ───────────────────────────────────────────────────────────
@@ -3166,7 +3181,17 @@ var (
 	collectTraces              bool
 	traceFilters               []string // values from --trace-filter; empty → pass --all to trace_extractor
 	resolvedTraceExtractorPath string   // validated binary path, set after findTraceExtractor succeeds
+	traceTimeout               = defaultTraceTimeout
+	// traceSkipReason explains why --collect-traces was requested but will not
+	// run on this node; recorded in the host manifest so the skip is visible.
+	traceSkipReason string
+	// traceDeployFailed records hosts (key: host) where copying trace_extractor
+	// failed (value: error text). Those hosts collect logs without traces.
+	traceDeployFailed sync.Map
 )
+
+// defaultTraceTimeout bounds one trace_extractor run (--trace-timeout).
+const defaultTraceTimeout = 15 * time.Minute
 
 // sshUser returns the username to use for SSH connections.
 // Priority: --ssh-user flag > current OS user > "root" (fallback).
@@ -3329,11 +3354,63 @@ func addRawFileToArchive(tw *tar.Writer, destPath, srcPath string) error {
 	return err
 }
 
+var (
+	reExtractorShards     = regexp.MustCompile(`(?m)^\s+(\d+) shards\s*$`)
+	reExtractorHistograms = regexp.MustCompile(`(?m)^\s+(\d+) histogram files\s*$`)
+	reExtractorUnparsed   = regexp.MustCompile(`(?m): (\d+) skipped \(parse\)`)
+	reExtractorDirWarning = regexp.MustCompile(`(?m)^warning: cannot read trace directory .*$`)
+)
+
+// parseExtractorOutput fills the shard, histogram and unparsed-file counts from
+// trace_extractor's stderr (its "Collecting:" summary and --verbose lines).
+func parseExtractorOutput(out string, r *TraceResult) {
+	if m := reExtractorShards.FindStringSubmatch(out); m != nil {
+		r.Shards, _ = strconv.Atoi(m[1])
+	}
+	if m := reExtractorHistograms.FindStringSubmatch(out); m != nil {
+		r.Histograms, _ = strconv.Atoi(m[1])
+	}
+	for _, m := range reExtractorUnparsed.FindAllStringSubmatch(out, -1) {
+		n, _ := strconv.Atoi(m[1])
+		r.UnparsedFiles += n
+	}
+	if m := reExtractorDirWarning.FindString(out); m != "" && r.Reason == "" {
+		r.Reason = m
+	}
+}
+
+// traceResultLine renders a TraceResult as one summary line.
+func traceResultLine(r *TraceResult) string {
+	line := fmt.Sprintf("%s, %d shards", r.Status, r.Shards)
+	if r.UnparsedFiles > 0 {
+		line += fmt.Sprintf(", %d unparsed files skipped", r.UnparsedFiles)
+	}
+	if r.Reason != "" && r.Status != "ok" {
+		line += ": " + r.Reason
+	}
+	return line
+}
+
+// lastNonEmptyLine returns the last non-blank line of s, for short error text.
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			return l
+		}
+	}
+	return ""
+}
+
 // runTraceExtractor invokes trace_extractor for the local node and adds its
-// output archive(s) into the bundle under hosts/<hostname>/traces/.
-// Uses the package-level resolvedTraceExtractorPath and traceFilters globals.
-func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, to time.Time) {
-	args := []string{}
+// output archive(s) into the bundle under hosts/<hostname>/traces/, together
+// with extractor.log (command, timing, exit status and the extractor's
+// --verbose output). It returns the outcome for the host manifest.
+// Uses the package-level resolvedTraceExtractorPath, traceFilters and
+// traceTimeout globals.
+func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, to time.Time) *TraceResult {
+	res := &TraceResult{}
+	args := []string{"--verbose"}
 	if len(traceFilters) == 0 {
 		args = append(args, "--all")
 	} else {
@@ -3351,29 +3428,65 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 	tmpDir, err := os.MkdirTemp("", "wlc-traces-*")
 	if err != nil {
 		warnf("[traces] could not create temp dir: %v", err)
-		return
+		res.Status = "failed"
+		res.Reason = fmt.Sprintf("could not create temp dir: %v", err)
+		return res
 	}
 	defer os.RemoveAll(tmpDir)
 
 	logf("[traces] running trace_extractor %s", strings.Join(args, " "))
-	cmd := exec.Command(resolvedTraceExtractorPath, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), traceTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, resolvedTraceExtractorPath, args...)
 	cmd.Dir = tmpDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		warnf("[traces] trace_extractor failed: %v\n%s", err, strings.TrimSpace(string(out)))
-		return
+	cmd.WaitDelay = 10 * time.Second
+	start := time.Now()
+	out, runErr := cmd.CombinedOutput()
+	res.Duration = time.Since(start).Round(time.Second).String()
+	parseExtractorOutput(string(out), res)
+
+	exitDesc := "0"
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		res.Status = "timeout"
+		res.ExitCode = -1
+		res.Reason = fmt.Sprintf("trace_extractor did not finish within %s (--trace-timeout)", traceTimeout)
+		exitDesc = "killed after timeout"
+	case runErr != nil:
+		res.Status = "failed"
+		res.ExitCode = -1
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			res.ExitCode = exitErr.ExitCode()
+		}
+		if l := lastNonEmptyLine(string(out)); l != "" {
+			res.Reason = l
+		} else {
+			res.Reason = runErr.Error()
+		}
+		exitDesc = runErr.Error()
 	}
-	if len(out) > 0 {
-		vlogf("[traces] %s", strings.TrimSpace(string(out)))
+
+	logHeader := fmt.Sprintf("command: %s %s\nstarted: %s\nduration: %s\nexit: %s\n\n",
+		resolvedTraceExtractorPath, strings.Join(args, " "),
+		start.UTC().Format(time.RFC3339), res.Duration, exitDesc)
+	logDest := filepath.Join(archiveRoot, "hosts", pathHostname, "traces", "extractor.log")
+	if err := addBytesToArchive(tw, logDest, append([]byte(logHeader), out...)); err != nil {
+		warnf("[traces] could not add extractor.log to archive: %v", err)
+	}
+
+	if res.Status != "" {
+		warnf("[traces] %s: %s (details in traces/extractor.log)", res.Status, res.Reason)
+		return res
 	}
 
 	entries, readErr := os.ReadDir(tmpDir)
 	if readErr != nil {
 		warnf("[traces] could not list output dir: %v", readErr)
-		return
+		res.Status = "failed"
+		res.Reason = fmt.Sprintf("could not list output dir: %v", readErr)
+		return res
 	}
 
-	added := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
 			continue
@@ -3384,12 +3497,29 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 			warnf("[traces] could not add %s to archive: %v", e.Name(), err)
 		} else {
 			logf("[traces] added %s", e.Name())
-			added++
+			res.Archives = append(res.Archives, e.Name())
 		}
 	}
-	if added == 0 {
+
+	switch {
+	case len(res.Archives) == 0:
+		res.Status = "failed"
+		res.Reason = "trace_extractor ran but no archive was added"
 		warnf("[traces] trace_extractor ran but produced no output files")
+	case res.Shards == 0:
+		res.Status = "no_shards"
+		if res.Reason == "" {
+			res.Reason = "no shard files matched the time window and filter"
+		}
+		warnf("[traces] 0 shards collected: %s", res.Reason)
+	default:
+		res.Status = "ok"
+		logf("[traces] %d shards, %d histogram files in %s", res.Shards, res.Histograms, res.Duration)
 	}
+	if res.UnparsedFiles > 0 {
+		warnf("[traces] %d trace file(s) had names trace_extractor could not parse and were skipped (see traces/extractor.log)", res.UnparsedFiles)
+	}
+	return res
 }
 
 // scpFileToRemote copies localPath to sshTarget:remotePath using the standard
@@ -3426,7 +3556,13 @@ func deployToHost(host, selfPath string) error {
 	target := sshTarget(host)
 	remoteBin := remoteBinPath()
 
-	mkdirArgs := append(sshArgs(), target, maybeRemoteSudo("mkdir -p "+wlcBaseDir))
+	prep := maybeRemoteSudo("mkdir -p " + wlcBaseDir)
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		// Remove any copy left by an earlier run so a failed copy below can
+		// never leave a stale trace_extractor in place.
+		prep += " && " + maybeRemoteSudo("rm -f "+remoteTraceExtractorPath)
+	}
+	mkdirArgs := append(sshArgs(), target, prep)
 	if out, err := exec.Command("ssh", mkdirArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("mkdir %s: %v: %s", wlcBaseDir, err, strings.TrimSpace(string(out)))
 	}
@@ -3437,7 +3573,8 @@ func deployToHost(host, selfPath string) error {
 
 	if collectTraces && resolvedTraceExtractorPath != "" {
 		if err := scpFileToRemote(target, resolvedTraceExtractorPath, remoteTraceExtractorPath); err != nil {
-			warnf("[%s] trace_extractor deploy failed (trace collection may fail on this node): %v", host, err)
+			traceDeployFailed.Store(host, err.Error())
+			warnf("[%s] trace_extractor deploy failed; collecting logs without traces on this node: %v", host, err)
 		}
 	}
 	return nil
@@ -3544,6 +3681,68 @@ func deployAllInner(hosts []string, displayNames map[string]string, selfPath str
 	return succeeded
 }
 
+// tracesEnabledForHost reports whether the remote run on host should collect
+// traces: --collect-traces is on and trace_extractor was copied successfully.
+func tracesEnabledForHost(host string) bool {
+	if !collectTraces || resolvedTraceExtractorPath == "" {
+		return false
+	}
+	_, failed := traceDeployFailed.Load(host)
+	return !failed
+}
+
+// remoteNodeArgs returns the flags shared by every remote --local --node-only
+// invocation (collection and upload): time window, verbosity, privacy,
+// container scoping and trace collection.
+func remoteNodeArgs(host string, from, to time.Time, containerNames []string) []string {
+	var extra []string
+	if !from.IsZero() {
+		extra = append(extra, "--start-time", from.Format("2006-01-02T15:04"))
+	}
+	if !to.IsZero() {
+		extra = append(extra, "--end-time", to.Format("2006-01-02T15:04"))
+	}
+	if verbose {
+		extra = append(extra, "--verbose")
+	}
+	if noShellHistory {
+		extra = append(extra, "--no-shell-history")
+	}
+	if len(containerNames) > 0 {
+		extra = append(extra, "--container-name", strings.Join(containerNames, ","))
+	}
+	if tracesEnabledForHost(host) {
+		extra = append(extra, "--collect-traces")
+		extra = append(extra, "--trace-extractor-path", remoteTraceExtractorPath)
+		extra = append(extra, "--trace-timeout", traceTimeout.String())
+		for _, f := range traceFilters {
+			extra = append(extra, "--trace-filter", f)
+		}
+	}
+	return extra
+}
+
+// remoteShellCommand wraps a remote collection command: chmod the deployed
+// binaries, remove them on exit (also on failure or a dropped connection) and
+// bound the run with timeout(1) so no orphan is left behind.
+func remoteShellCommand(host, remoteBin, collectionCmd string, timeout time.Duration) string {
+	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
+	cleanup := "rm -f " + remoteBin
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		cleanup += " " + remoteTraceExtractorPath
+		if tracesEnabledForHost(host) {
+			chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath)
+		}
+	}
+	return fmt.Sprintf(
+		"%s; trap '%s' EXIT; timeout %d %s",
+		chmodSetup,
+		maybeRemoteSudo(cleanup),
+		int(timeout.Seconds()),
+		maybeRemoteSudo(collectionCmd),
+	)
+}
+
 // collectFromHost SSHs into a host, runs weka-log-collector --local (binary already
 // deployed by deployAll), streams the tar.gz back, then removes the deployed binary on exit.
 // The caller prints start/completion lines with progress counters; this function is silent.
@@ -3571,45 +3770,8 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 		"--node-only",
 		"--profile", profile,
 		"--output", "-",
-	}, func() []string {
-		var extra []string
-		if !from.IsZero() {
-			extra = append(extra, "--start-time", from.Format("2006-01-02T15:04"))
-		}
-		if !to.IsZero() {
-			extra = append(extra, "--end-time", to.Format("2006-01-02T15:04"))
-		}
-		if verbose {
-			extra = append(extra, "--verbose")
-		}
-		if noShellHistory {
-			extra = append(extra, "--no-shell-history")
-		}
-		if len(containerNames) > 0 {
-			extra = append(extra, "--container-name", strings.Join(containerNames, ","))
-		}
-		if collectTraces && resolvedTraceExtractorPath != "" {
-			extra = append(extra, "--collect-traces")
-			extra = append(extra, "--trace-extractor-path", remoteTraceExtractorPath)
-			for _, f := range traceFilters {
-				extra = append(extra, "--trace-filter", f)
-			}
-		}
-		return extra
-	}()...))
-
-	timeoutSecs := int(sshTimeout.Seconds())
-	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
-	if collectTraces && resolvedTraceExtractorPath != "" {
-		chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath)
-	}
-	remoteShellCmd := fmt.Sprintf(
-		"%s; trap '%s' EXIT; timeout %d %s",
-		chmodSetup,
-		maybeRemoteSudo("rm -f "+remoteBin),
-		timeoutSecs,
-		maybeRemoteSudo(collectionCmd),
-	)
+	}, remoteNodeArgs(host, from, to, containerNames)...))
+	remoteShellCmd := remoteShellCommand(host, remoteBin, collectionCmd, sshTimeout)
 
 	// ── run collection via SSH, streaming output to a temp file ──────────
 	// Streaming to disk (not RAM) prevents accumulating 200-400 MB per host
@@ -4582,10 +4744,11 @@ complete -F _weka_log_collector weka-log-collector ./weka-log-collector
 
 // mergeArchive reads a tar.gz from src and re-writes every entry into
 // the destination tar.Writer under a new root prefix.
-func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
+func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) (*HostManifest, error) {
+	var hostManifest *HostManifest
 	gr, err := gzip.NewReader(src)
 	if err != nil {
-		return fmt.Errorf("gzip open: %w", err)
+		return nil, fmt.Errorf("gzip open: %w", err)
 	}
 	defer gr.Close()
 	tr := tar.NewReader(gr)
@@ -4596,7 +4759,7 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("tar read: %w", err)
+			return nil, fmt.Errorf("tar read: %w", err)
 		}
 		// strip old root prefix (first path component) and replace with newRoot
 		parts := strings.SplitN(hdr.Name, "/", 2)
@@ -4605,6 +4768,7 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			rest = parts[1]
 		}
 		hdr.Name = filepath.Join(newRoot, rest)
+		isHostManifest := strings.HasPrefix(rest, "hosts/") && strings.HasSuffix(rest, "/collection_manifest.json")
 
 		// Anonymize the path itself when --anonymize is on. Remote nodes
 		// wrote these paths as hosts/<real-hostname>/... because the
@@ -4622,7 +4786,7 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			// substitution of known sensitive values, no regex on binary).
 			data, readErr := io.ReadAll(tr)
 			if readErr != nil {
-				return fmt.Errorf("tar read entry: %w", readErr)
+				return nil, fmt.Errorf("tar read entry: %w", readErr)
 			}
 			if isLikelyText(data) {
 				data = redactSensitive(data)
@@ -4630,24 +4794,54 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			} else {
 				data = globalAnonymizer.ApplyLiteralOnly(data)
 			}
+			if isHostManifest {
+				hostManifest = parseHostManifest(data)
+			}
 			hdr.Size = int64(len(data))
 			if err := tw.WriteHeader(hdr); err != nil {
-				return fmt.Errorf("tar write header: %w", err)
+				return nil, fmt.Errorf("tar write header: %w", err)
 			}
 			if _, err := tw.Write(data); err != nil {
-				return fmt.Errorf("tar write data: %w", err)
+				return nil, fmt.Errorf("tar write data: %w", err)
 			}
 			continue
 		}
 
+		if isHostManifest && hdr.Size <= maxManifestSize {
+			data, readErr := io.ReadAll(tr)
+			if readErr != nil {
+				return nil, fmt.Errorf("tar read entry: %w", readErr)
+			}
+			hostManifest = parseHostManifest(data)
+			if err := tw.WriteHeader(hdr); err != nil {
+				return nil, fmt.Errorf("tar write header: %w", err)
+			}
+			if _, err := tw.Write(data); err != nil {
+				return nil, fmt.Errorf("tar write data: %w", err)
+			}
+			continue
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("tar write header: %w", err)
+			return nil, fmt.Errorf("tar write header: %w", err)
 		}
 		if _, err := io.Copy(tw, tr); err != nil {
-			return fmt.Errorf("tar copy: %w", err)
+			return nil, fmt.Errorf("tar copy: %w", err)
 		}
 	}
-	return nil
+	return hostManifest, nil
+}
+
+// maxManifestSize bounds how much of a host's collection_manifest.json the
+// merge reads into memory to extract the per-host summary.
+const maxManifestSize = 16 << 20
+
+// parseHostManifest decodes a host's collection_manifest.json; nil on error.
+func parseHostManifest(data []byte) *HostManifest {
+	var m HostManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil
+	}
+	return &m
 }
 
 // archiveExt returns the file extension for the given compression format.
@@ -6217,6 +6411,7 @@ func main() {
 		force              = flag.Bool("force", false, "Override the run lock (use only when an earlier run is known to be hung)")
 		collectTracesFlag  = flag.Bool("collect-traces", false, "Collect traces via trace_extractor (WEKA v5.x+ only; requires --start-time; window capped at 1 hour)")
 		traceExtractorPath = flag.String("trace-extractor-path", "", "Path to trace_extractor binary (default: auto-discover alongside wlc binary or in PATH)")
+		traceTimeoutFlag   = flag.Duration("trace-timeout", defaultTraceTimeout, "Maximum run time of trace_extractor on each node (e.g. 10m, 30m)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -6372,10 +6567,16 @@ func main() {
 	}
 
 	// ── validate trace collection window and resolve binary ───────────────
+	if *traceTimeoutFlag <= 0 {
+		errorf("--trace-timeout must be positive")
+		os.Exit(1)
+	}
+	traceTimeout = *traceTimeoutFlag
 	if *collectTracesFlag {
 		if from.IsZero() {
 			// No explicit --start-time: default window (8h) is too large for traces.
-			logf("Note: --collect-traces skipped — requires an explicit --start-time (max 1 hour).")
+			traceSkipReason = "no --start-time given (traces need an explicit window of at most 1 hour)"
+			warnf("--collect-traces skipped: requires an explicit --start-time (max 1 hour).")
 			logf("      Traces are targeted; use e.g. --start-time -30m --collect-traces")
 			*collectTracesFlag = false
 		} else {
@@ -6384,7 +6585,8 @@ func main() {
 				effectiveTo = time.Now()
 			}
 			if effectiveTo.Sub(from) > traceMaxWindow {
-				logf("Note: --collect-traces skipped — time window is %.0f minutes (max: 60 minutes).",
+				traceSkipReason = fmt.Sprintf("time window is %.0f minutes (max: 60 minutes)", effectiveTo.Sub(from).Minutes())
+				warnf("--collect-traces skipped: time window is %.0f minutes (max: 60 minutes).",
 					effectiveTo.Sub(from).Minutes())
 				logf("      Narrow the window with --start-time / --end-time to at most 1 hour.")
 				*collectTracesFlag = false
@@ -6402,14 +6604,23 @@ func main() {
 		}
 		var err error
 		resolvedTraceExtractorPath, err = findTraceExtractor(*traceExtractorPath)
-		if err != nil {
+		if err != nil && *nodeOnly {
+			// Sub-invocation on a remote node: keep the node's logs and record
+			// why traces are missing instead of losing the whole host.
+			traceSkipReason = fmt.Sprintf("trace_extractor not usable on this node: %v", err)
+			warnf("--collect-traces skipped: %s", traceSkipReason)
+			collectTraces = false
+			resolvedTraceExtractorPath = ""
+		} else if err != nil {
 			errorf("--collect-traces: %v", err)
 			os.Exit(1)
 		}
 		// Ensure the binary is executable for local invocations. The SSH path
 		// does chmod +x on remote nodes, but the orchestrating node runs the
 		// binary directly without going through that path.
-		_ = os.Chmod(resolvedTraceExtractorPath, 0755)
+		if resolvedTraceExtractorPath != "" {
+			_ = os.Chmod(resolvedTraceExtractorPath, 0755)
+		}
 	}
 
 	// ── default time window ───────────────────────────────────────────────
@@ -6686,6 +6897,10 @@ func main() {
 		remoteBin := remoteBinPath()
 		killCmd := fmt.Sprintf("pkill -f '%s' 2>/dev/null; rm -f %s; true",
 			filepath.Base(remoteBin), remoteBin)
+		if collectTraces && resolvedTraceExtractorPath != "" {
+			killCmd = fmt.Sprintf("pkill -f '%s' 2>/dev/null; pkill -f '%s' 2>/dev/null; rm -f %s %s; true",
+				filepath.Base(remoteBin), remoteTraceExtractorPath, remoteBin, remoteTraceExtractorPath)
+		}
 		var cleanupWg sync.WaitGroup
 		activeRemoteHosts.Range(func(k, _ interface{}) bool {
 			host := k.(string)
@@ -6955,44 +7170,12 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	// timeout kills the process if it exceeds the SSH timeout, preventing orphans.
 	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile,
 		"--upload-session-id", strconv.FormatInt(sessionID, 10)}
-	if !from.IsZero() {
-		args = append(args, "--start-time", from.Format("2006-01-02T15:04"))
-	}
-	if !to.IsZero() {
-		args = append(args, "--end-time", to.Format("2006-01-02T15:04"))
-	}
-	if verbose {
-		args = append(args, "--verbose")
-	}
-	if noShellHistory {
-		args = append(args, "--no-shell-history")
-	}
-	if len(containerNames) > 0 {
-		args = append(args, "--container-name", strings.Join(containerNames, ","))
-	}
 	if compression != "" && compression != "gzip" {
 		args = append(args, "--compression", compression)
 	}
-	if collectTraces && resolvedTraceExtractorPath != "" {
-		args = append(args, "--collect-traces")
-		args = append(args, "--trace-extractor-path", remoteTraceExtractorPath)
-		for _, f := range traceFilters {
-			args = append(args, "--trace-filter", f)
-		}
-	}
+	args = append(args, remoteNodeArgs(host, from, to, containerNames)...)
 	collectionCmd := shellJoin(args)
-	timeoutSecs := int(sshTimeout.Seconds())
-	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
-	if collectTraces && resolvedTraceExtractorPath != "" {
-		chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath)
-	}
-	remoteShellCmd := fmt.Sprintf(
-		"%s; trap '%s' EXIT; timeout %d %s",
-		chmodSetup,
-		maybeRemoteSudo("rm -f "+remoteBin),
-		timeoutSecs,
-		maybeRemoteSudo(collectionCmd),
-	)
+	remoteShellCmd := remoteShellCommand(host, remoteBin, collectionCmd, sshTimeout)
 
 	var stderrBuf bytes.Buffer
 	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
@@ -7117,7 +7300,9 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 			pathHostname = string(globalAnonymizer.Apply([]byte(hostname)))
 		}
 		phase(fmt.Sprintf("[%s] Collecting traces", hostname))
-		runTraceExtractor(tw, archiveRoot, pathHostname, from, to)
+		manifest.Traces = runTraceExtractor(tw, archiveRoot, pathHostname, from, to)
+	} else if traceSkipReason != "" {
+		manifest.Traces = &TraceResult{Status: "skipped", Reason: traceSkipReason}
 	}
 
 	// When acting as orchestrator (not a --node-only sub-invocation), also run
@@ -7165,6 +7350,9 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	logf("  Commands: %d total, %d failed", manifest.TotalCommands+clusterTotal, manifest.FailedCommands+clusterFailed)
 	logf("  Files:    %d collected, %d failed",
 		manifest.CollectedFiles, manifest.FailedFiles)
+	if manifest.Traces != nil {
+		logf("  Traces:   %s", traceResultLine(manifest.Traces))
+	}
 	if !toStdout {
 		if info, err := os.Stat(outPath); err == nil {
 			logf("  Size:     %d KB", info.Size()/1024)
@@ -7313,6 +7501,8 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 
 	var succeeded, failed int
 	var failedHosts []string
+	traces := map[string]*TraceResult{}
+	var traceProblems []string
 
 	for _, r := range results {
 		if r.Err != nil {
@@ -7340,7 +7530,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			logf("  [%s] anonymizing and merging (%d KB)...", r.Host, stat.Size()/1024)
 		}
 		mergeStart := time.Now()
-		mergeErr := mergeArchive(tw, f, archiveRoot)
+		hostManifest, mergeErr := mergeArchive(tw, f, archiveRoot)
 		f.Close()
 		os.Remove(r.TempFile)
 		if mergeErr != nil {
@@ -7355,18 +7545,33 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		} else {
 			logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
 		}
+		if tr := hostTraceResult(r.Host, hostManifest); tr != nil {
+			key := r.Host
+			if globalAnonymizer.enabled {
+				key = string(globalAnonymizer.Apply([]byte(key)))
+			}
+			traces[key] = tr
+			if tr.Status != "ok" || tr.UnparsedFiles > 0 {
+				warnf("  [%s] traces: %s", r.Host, traceResultLine(tr))
+				traceProblems = append(traceProblems, r.Host)
+			} else {
+				logf("  [%s] traces: %s", r.Host, traceResultLine(tr))
+			}
+		}
 	}
 
 	// Write cluster-level summary
 	type clusterSummary struct {
-		CollectedAt time.Time `json:"collected_at"`
-		Profile     string    `json:"profile"`
-		From        string    `json:"from,omitempty"`
-		To          string    `json:"to,omitempty"`
-		TotalHosts  int       `json:"total_hosts"`
-		Succeeded   int       `json:"succeeded"`
-		Failed      int       `json:"failed"`
-		FailedHosts []string  `json:"failed_hosts,omitempty"`
+		CollectedAt time.Time               `json:"collected_at"`
+		Profile     string                  `json:"profile"`
+		From        string                  `json:"from,omitempty"`
+		To          string                  `json:"to,omitempty"`
+		TotalHosts  int                     `json:"total_hosts"`
+		Succeeded   int                     `json:"succeeded"`
+		Failed      int                     `json:"failed"`
+		FailedHosts []string                `json:"failed_hosts,omitempty"`
+		Traces      map[string]*TraceResult `json:"traces,omitempty"`
+		TraceSkip   string                  `json:"traces_skipped,omitempty"`
 	}
 	summary := clusterSummary{
 		CollectedAt: time.Now(),
@@ -7376,6 +7581,10 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		Failed:      failed,
 		FailedHosts: failedHosts,
 	}
+	if len(traces) > 0 {
+		summary.Traces = traces
+	}
+	summary.TraceSkip = traceSkipReason
 	if !from.IsZero() {
 		summary.From = from.Format(time.RFC3339)
 	}
@@ -7399,12 +7608,33 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		logf("  Failed:   %s", strings.Join(failedHosts, ", "))
 		logf("  Tip: check SSH access and ensure weka-log-collector binary is at the expected path on failed hosts.")
 	}
+	if len(traces) > 0 {
+		logf("  Traces:   %d host(s) reported, %d with problems", len(traces), len(traceProblems))
+		if len(traceProblems) > 0 {
+			logf("            check: %s (details in cluster_summary.json and hosts/<host>/traces/extractor.log)", strings.Join(traceProblems, ", "))
+		}
+	}
 	if !toStdout {
 		if info, err := os.Stat(outPath); err == nil {
 			logf("  Size:     %d KB", info.Size()/1024)
 		}
 	}
 	logf("  Duration: %s", elapsed)
+}
+
+// hostTraceResult returns the trace outcome for one merged host: from its
+// manifest, or "skipped" when trace_extractor could not be copied there.
+func hostTraceResult(host string, m *HostManifest) *TraceResult {
+	if m != nil && m.Traces != nil {
+		return m.Traces
+	}
+	if v, failed := traceDeployFailed.Load(host); failed {
+		return &TraceResult{Status: "skipped", Reason: "trace_extractor deploy failed: " + v.(string)}
+	}
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		return &TraceResult{Status: "failed", Reason: "host archive has no trace result (older wlc on the node?)"}
+	}
+	return nil
 }
 
 func sanitizeHostname(h string) string {
@@ -7461,8 +7691,12 @@ TRACES  (requires WEKA v5.x+ on each node; window is capped at 1 hour)
                                e.g. --trace-filter "container=drives0 and slot=7"
                                Default when omitted: collect all traces (--all).
   --trace-extractor-path PATH  Override the trace_extractor binary path.
-                               Default: auto-discovered alongside the wlc binary, in PATH,
-                               or at /opt/weka/weka-log-collector/trace_extractor.
+                               Default: alongside the wlc binary (trace_extractor-arm64 on
+                               aarch64), then PATH, then /opt/weka/weka-log-collector/.
+  --trace-timeout DURATION     Maximum trace_extractor run time per node (default: 15m).
+                               The outcome per node (status, shard count, skipped files)
+                               is in collection_manifest.json, cluster_summary.json and
+                               hosts/<host>/traces/extractor.log.
 
 BUNDLE MANAGEMENT
   --list-bundles       List bundles in /opt/weka/weka-log-collector/bundles

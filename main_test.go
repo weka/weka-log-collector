@@ -1,8 +1,17 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRedactSensitiveJSON_StringValue(t *testing.T) {
@@ -305,5 +314,175 @@ func TestBundledTraceExtractorNames(t *testing.T) {
 		if len(got) == 0 || got[0] != c.want {
 			t.Errorf("%s/%s: got %v, want first %q", c.goos, c.goarch, got, c.want)
 		}
+	}
+}
+
+const sampleExtractorOutput = `verbose: /opt/weka/traces: 120 files match glob *.shard
+verbose:   skip (filename parse failed): weird_name.shard
+verbose: /opt/weka/traces: 1 skipped (parse), 30 skipped (filter), 89 remaining
+verbose: /opt/weka/traces/histograms: 4 skipped (parse), 0 skipped (filter), 10 remaining
+Collecting:
+  42 shards
+  7 histogram files
+  3 cache files
+  weka local ps -J: OK
+Writing host-traces.tar.gz ...
+Done: host-traces.tar.gz
+`
+
+func TestParseExtractorOutput(t *testing.T) {
+	var r TraceResult
+	parseExtractorOutput(sampleExtractorOutput, &r)
+	if r.Shards != 42 || r.Histograms != 7 || r.UnparsedFiles != 5 {
+		t.Errorf("got shards=%d histograms=%d unparsed=%d, want 42/7/5", r.Shards, r.Histograms, r.UnparsedFiles)
+	}
+	if r.Reason != "" {
+		t.Errorf("unexpected reason %q", r.Reason)
+	}
+}
+
+func TestParseExtractorOutput_DirWarning(t *testing.T) {
+	var r TraceResult
+	parseExtractorOutput("warning: cannot read trace directory /opt/weka/traces: permission denied\nCollecting:\n  0 shards\n  0 histogram files\n", &r)
+	if r.Shards != 0 || !strings.Contains(r.Reason, "cannot read trace directory") {
+		t.Errorf("got shards=%d reason=%q", r.Shards, r.Reason)
+	}
+}
+
+// writeFakeExtractor creates a shell script that mimics trace_extractor:
+// prints body to stderr, optionally sleeps, and writes an archive into cwd.
+func writeFakeExtractor(t *testing.T, body string, sleepSecs int, exitCode int) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake_extractor")
+	script := fmt.Sprintf("#!/bin/sh\ncat >&2 <<'OUT'\n%sOUT\n[ %d -gt 0 ] && exec sleep %d\necho data > host-traces-x.tar.gz\nexit %d\n", body, sleepSecs, sleepSecs, exitCode)
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func runFakeExtractor(t *testing.T, path string, timeout time.Duration) (*TraceResult, map[string]string) {
+	t.Helper()
+	oldPath, oldTimeout := resolvedTraceExtractorPath, traceTimeout
+	resolvedTraceExtractorPath, traceTimeout = path, timeout
+	defer func() { resolvedTraceExtractorPath, traceTimeout = oldPath, oldTimeout }()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	res := runTraceExtractor(tw, "root", "h1", time.Now().Add(-30*time.Minute), time.Now())
+	tw.Close()
+
+	files := map[string]string{}
+	tr := tar.NewReader(&buf)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		data, _ := io.ReadAll(tr)
+		files[hdr.Name] = string(data)
+	}
+	return res, files
+}
+
+func TestRunTraceExtractor_OK(t *testing.T) {
+	res, files := runFakeExtractor(t, writeFakeExtractor(t, sampleExtractorOutput, 0, 0), time.Minute)
+	if res.Status != "ok" || res.Shards != 42 || len(res.Archives) != 1 {
+		t.Fatalf("got %+v", res)
+	}
+	if _, ok := files["root/hosts/h1/traces/host-traces-x.tar.gz"]; !ok {
+		t.Errorf("archive not added; files=%v", files)
+	}
+	log := files["root/hosts/h1/traces/extractor.log"]
+	if !strings.Contains(log, "--verbose") || !strings.Contains(log, "42 shards") {
+		t.Errorf("extractor.log missing args or output:\n%s", log)
+	}
+}
+
+func TestRunTraceExtractor_NoShards(t *testing.T) {
+	res, _ := runFakeExtractor(t, writeFakeExtractor(t, "Collecting:\n  0 shards\n  0 histogram files\n", 0, 0), time.Minute)
+	if res.Status != "no_shards" {
+		t.Errorf("got %+v", res)
+	}
+}
+
+func TestRunTraceExtractor_Failed(t *testing.T) {
+	res, files := runFakeExtractor(t, writeFakeExtractor(t, "error: --from: bad time\n", 0, 1), time.Minute)
+	if res.Status != "failed" || res.ExitCode != 1 || !strings.Contains(res.Reason, "bad time") {
+		t.Errorf("got %+v", res)
+	}
+	if _, ok := files["root/hosts/h1/traces/extractor.log"]; !ok {
+		t.Errorf("extractor.log not written on failure")
+	}
+}
+
+func TestRunTraceExtractor_Timeout(t *testing.T) {
+	start := time.Now()
+	res, _ := runFakeExtractor(t, writeFakeExtractor(t, "Collecting:\n", 30, 0), time.Second)
+	if res.Status != "timeout" {
+		t.Errorf("got %+v", res)
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Errorf("timeout not enforced: took %s", d)
+	}
+}
+
+func TestRemoteNodeArgs_TraceDeployFailed(t *testing.T) {
+	oldCT, oldPath := collectTraces, resolvedTraceExtractorPath
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	defer func() { collectTraces, resolvedTraceExtractorPath = oldCT, oldPath }()
+
+	traceDeployFailed.Store("bad-host", "scp failed")
+	defer traceDeployFailed.Delete("bad-host")
+
+	has := func(args []string, s string) bool {
+		for _, a := range args {
+			if a == s {
+				return true
+			}
+		}
+		return false
+	}
+	if args := remoteNodeArgs("good-host", time.Time{}, time.Time{}, nil); !has(args, "--collect-traces") {
+		t.Errorf("good host should collect traces: %v", args)
+	}
+	if args := remoteNodeArgs("bad-host", time.Time{}, time.Time{}, nil); has(args, "--collect-traces") {
+		t.Errorf("host with failed extractor deploy should not collect traces: %v", args)
+	}
+	if tr := hostTraceResult("bad-host", nil); tr == nil || tr.Status != "skipped" {
+		t.Errorf("hostTraceResult for failed deploy: %+v", tr)
+	}
+	cmd := remoteShellCommand("good-host", "/opt/weka/weka-log-collector/wlc", "true", time.Minute)
+	if !strings.Contains(cmd, remoteTraceExtractorPath) {
+		t.Errorf("remote cleanup should remove trace_extractor: %s", cmd)
+	}
+}
+
+func TestMergeArchive_ReturnsHostManifest(t *testing.T) {
+	m := HostManifest{Hostname: "h1", Traces: &TraceResult{Status: "no_shards"}}
+	mj, _ := json.Marshal(m)
+	var src bytes.Buffer
+	gw := gzip.NewWriter(&src)
+	tw := tar.NewWriter(gw)
+	for name, data := range map[string][]byte{
+		"old/hosts/h1/collection_manifest.json": mj,
+		"old/hosts/h1/system/uptime.txt":        []byte("up"),
+	} {
+		_ = tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(data))})
+		_, _ = tw.Write(data)
+	}
+	tw.Close()
+	gw.Close()
+
+	var out bytes.Buffer
+	otw := tar.NewWriter(&out)
+	got, err := mergeArchive(otw, &src, "new")
+	otw.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Traces == nil || got.Traces.Status != "no_shards" {
+		t.Errorf("manifest not returned: %+v", got)
 	}
 }

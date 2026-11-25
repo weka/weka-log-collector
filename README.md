@@ -116,6 +116,12 @@ Flags:
                        Override path to the trace_extractor binary. By default the tool
                        looks alongside itself (trace_extractor-arm64 on aarch64), then in
                        PATH, then at /opt/weka/weka-log-collector/trace_extractor.
+  --trace-timeout DURATION
+                       Maximum trace_extractor run time per node (default: 15m). Each
+                       node's outcome (status, shard count, unparsed files skipped) is
+                       recorded in collection_manifest.json ("traces"), summarised in
+                       cluster_summary.json and printed at the end of the run; the
+                       extractor's full output is in hosts/<host>/traces/extractor.log.
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands
