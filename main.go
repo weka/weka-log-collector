@@ -1159,11 +1159,14 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_cloud_status", Cmd: "weka cloud status"},
 	// ── cluster topology ──────────────────────────────────────────
 	{Name: "weka_cluster_servers", Cmd: "weka cluster servers list"},
-	{Name: "weka_cluster_container", Cmd: "weka cluster container"},
+	// -v keeps the verbose-only columns: container mode / kernel release,
+	// process fencing / join-reject / blacklisting reasons, drive serial /
+	// firmware (needsPhaseOut on 5.1), bucket fill level.
+	{Name: "weka_cluster_container", Cmd: "weka cluster container -v"},
 	{Name: "weka_cluster_container_net", Cmd: "weka cluster container net"},
-	{Name: "weka_cluster_process", Cmd: "weka cluster process"},
-	{Name: "weka_cluster_drive", Cmd: "weka cluster drive"},
-	{Name: "weka_cluster_bucket", Cmd: "weka cluster bucket"},
+	{Name: "weka_cluster_process", Cmd: "weka cluster process -v"},
+	{Name: "weka_cluster_drive", Cmd: "weka cluster drive -v"},
+	{Name: "weka_cluster_bucket", Cmd: "weka cluster bucket -v"},
 	{Name: "weka_cluster_failure_domain", Cmd: "weka cluster failure-domain"},
 	{Name: "weka_cluster_task", Cmd: "weka cluster task"},
 	{Name: "weka_cluster_resources", Cmd: "weka cluster container resources 0"},
@@ -1209,23 +1212,43 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_stats_obs_errors", Cmd: "weka stats --category object_storage --stat RESPONSE_COUNT_BAD_GATEWAY,RESPONSE_COUNT_GATEWAY_TIMEOUT,RESPONSE_COUNT_HTTP_VERSION_NOT_SUPPORTED,RESPONSE_COUNT_NOT_IMPLEMENTED,RESPONSE_COUNT_SERVER_ERROR,RESPONSE_COUNT_SERVICE_UNAVAILABLE --start-time -30m -Z"},
 }
 
+// eventsMaxResults is passed as --num-results to weka events. The CLI default
+// is the 50 newest events, which on a busy cluster pushes the incident's
+// events out of the window; an explicit large number works on 4.4 and 5.1.
+const eventsMaxResults = "100000"
+
 // buildWindowedDefaultCmds returns default commands whose --start-time must align with
-// the collection window. Uses a relative offset (e.g. -9h) rather than an absolute
-// timestamp — weka events only reliably accepts relative offsets for --start-time.
+// the collection window. Uses relative offsets (e.g. -9h, -37m) rather than absolute
+// timestamps — weka events only reliably accepts relative offsets.
 // Contrast with the diagnostic stats in defaultCommands that intentionally use short
 // fixed windows (e.g. -10m for RDMA errors) to capture current cluster state.
 func buildWindowedDefaultCmds(from, to time.Time) []CommandSpec {
+	return buildWindowedDefaultCmdsAt(from, to, time.Now())
+}
+
+func buildWindowedDefaultCmdsAt(from, to, now time.Time) []CommandSpec {
 	effectiveFrom := from
 	if from.IsZero() {
-		effectiveFrom = time.Now().Add(-8 * time.Hour)
+		effectiveFrom = now.Add(-8 * time.Hour)
 	}
 	// Convert absolute time to a relative offset that weka events accepts.
 	// Round up by one hour so we don't miss events right at the window boundary.
-	hours := int(time.Since(effectiveFrom).Hours()) + 1
-	startFlag := fmt.Sprintf(" --start-time -%dh", hours)
+	hours := int(now.Sub(effectiveFrom).Hours()) + 1
+	window := fmt.Sprintf(" --start-time -%dh", hours)
+	// End of the window, rounded down to whole minutes (so the window only
+	// grows). Omitted when the window ends within the last minute.
+	if !to.IsZero() {
+		if mins := int(now.Sub(to).Minutes()); mins >= 1 {
+			window += fmt.Sprintf(" --end-time -%dm", mins)
+		}
+	}
+	window += " --num-results " + eventsMaxResults
 	return []CommandSpec{
-		// All events at major+ severity within the collection window.
-		{Name: "weka_events_major", Cmd: "weka events --severity major" + startFlag},
+		// Events at major+ severity within the collection window.
+		{Name: "weka_events_major", Cmd: "weka events --severity major" + window},
+		// Warning+ within the window: disconnects and other early signs that
+		// are not major (a superset of weka_events_major).
+		{Name: "weka_events_warning", Cmd: "weka events --severity warning" + window},
 	}
 }
 
@@ -5569,11 +5592,11 @@ var clusterWideCLICommands = []struct {
 	{"weka_user.txt", []string{"weka", "user"}},
 	// cluster topology
 	{"weka_cluster_servers.txt", []string{"weka", "cluster", "servers", "list"}},
-	{"weka_cluster_container.txt", []string{"weka", "cluster", "container"}},
+	{"weka_cluster_container.txt", []string{"weka", "cluster", "container", "-v"}},
 	{"weka_cluster_container_net.txt", []string{"weka", "cluster", "container", "net"}},
-	{"weka_cluster_process.txt", []string{"weka", "cluster", "process"}},
-	{"weka_cluster_drive.txt", []string{"weka", "cluster", "drive"}},
-	{"weka_cluster_bucket.txt", []string{"weka", "cluster", "bucket"}},
+	{"weka_cluster_process.txt", []string{"weka", "cluster", "process", "-v"}},
+	{"weka_cluster_drive.txt", []string{"weka", "cluster", "drive", "-v"}},
+	{"weka_cluster_bucket.txt", []string{"weka", "cluster", "bucket", "-v"}},
 	{"weka_cluster_failure_domain.txt", []string{"weka", "cluster", "failure-domain"}},
 	{"weka_cluster_task.txt", []string{"weka", "cluster", "task"}},
 	// filesystems & snapshots
@@ -5582,7 +5605,7 @@ var clusterWideCLICommands = []struct {
 	{"weka_fs_snapshot.txt", []string{"weka", "fs", "snapshot", "-v"}},
 	{"weka_fs_tier_s3.txt", []string{"weka", "fs", "tier", "s3", "-v"}},
 	// events (last 8 hours)
-	{"weka_events_major.txt", []string{"weka", "events", "--severity", "major", "--start-time", "-8h"}},
+	{"weka_events_major.txt", []string{"weka", "events", "--severity", "major", "--start-time", "-8h", "--num-results", eventsMaxResults}},
 	// security
 	{"weka_security_kms.txt", []string{"weka", "security", "kms"}},
 	// debug

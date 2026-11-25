@@ -626,3 +626,29 @@ func TestRedactSensitiveValues_AssignmentNoFalsePositives(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildWindowedDefaultCmds_Events(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	cmds := buildWindowedDefaultCmdsAt(now.Add(-90*time.Minute), now.Add(-37*time.Minute-30*time.Second), now)
+	byName := map[string]string{}
+	for _, c := range cmds {
+		byName[c.Name] = c.Cmd
+	}
+	major, warning := byName["weka_events_major"], byName["weka_events_warning"]
+	for name, cmd := range map[string]string{"major": major, "warning": warning} {
+		for _, want := range []string{"--start-time -2h", "--end-time -37m", "--num-results " + eventsMaxResults} {
+			if !strings.Contains(cmd, want) {
+				t.Errorf("%s events command %q missing %q", name, cmd, want)
+			}
+		}
+	}
+	if !strings.Contains(major, "--severity major") || !strings.Contains(warning, "--severity warning") {
+		t.Errorf("severity: major=%q warning=%q", major, warning)
+	}
+	// Window ending now: no --end-time.
+	for _, c := range buildWindowedDefaultCmdsAt(now.Add(-30*time.Minute), now.Add(-20*time.Second), now) {
+		if strings.Contains(c.Cmd, "--end-time") {
+			t.Errorf("window ending now should not pass --end-time: %q", c.Cmd)
+		}
+	}
+}

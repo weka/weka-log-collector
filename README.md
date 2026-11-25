@@ -204,7 +204,9 @@ weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
 
 **Clock sync** — timedatectl, timedatectl show-timesync, systemd-timesyncd status, chronyc tracking/sources, chronyd status, ntpd status, ptp4l/phc2sys status — whichever sync daemon is present on each node
 
-**Weka CLI commands** — weka status, alerts, cluster topology, filesystems, snapshots, debug traces, local container resources, and profile-specific commands (events, cfgdump, perf stats, NFS/S3/SMB-W commands)
+**Weka CLI commands** — weka status, alerts, cluster topology (`weka cluster container|process|drive|bucket -v`, so fencing/join-reject reasons, drive serial/firmware and bucket fill level are included), filesystems, snapshots, debug traces, local container resources, and profile-specific commands (events, cfgdump, perf stats, NFS/S3/SMB-W commands)
+
+**Weka events** — `weka_events_major.txt` (major and above) and `weka_events_warning.txt` (warning and above), both scoped to the collection window (`--start-time`/`--end-time` as relative offsets) and asking for up to 100000 events instead of the CLI default of the 50 newest
 
 **System log files** — `/var/log/messages*`, `secure*`, `cron*`, `syslog*`, `kern.log*`, `audit/audit.log*`, `cloud-init*`, `dnf/yum.log*` — active files always; rotated variants kept only when their mtime falls inside the time window
 
@@ -437,7 +439,7 @@ The tool automatically discovers Weka namespaces by querying the `wekacluster` C
   identity & status (`weka status`, `weka status rebuild`, `weka alerts`, `weka version`, `weka version current`, `weka user`),
   cluster topology (`weka cluster servers list`, `weka cluster container`, `weka cluster container net`, `weka cluster process`, `weka cluster drive`, `weka cluster bucket`, `weka cluster failure-domain`, `weka cluster task`),
   filesystems (`weka fs -v`, `weka fs group`, `weka fs snapshot -v`, `weka fs tier s3 -v`),
-  events (`weka events --severity major --start-time -8h`),
+  events (`weka events --severity major --start-time -8h --num-results 100000`),
   security (`weka security kms`),
   debug (`weka debug traces status`, `weka debug override list`, `weka debug net links`, `weka debug blacklist list`, `weka debug buckets dist`)
 - **Per-pod weka local commands** (stored under each pod's `weka-local-commands/`):
