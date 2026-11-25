@@ -24,6 +24,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -3257,11 +3258,24 @@ func maybeRemoteSudo(cmd string) string {
 	return cmd
 }
 
+// bundledTraceExtractorNames returns the trace_extractor file names to look for
+// next to the wlc binary, most specific first. The repo ships
+// trace_extractor (linux/amd64) and trace_extractor-arm64 (linux/arm64).
+// A non-Linux wlc (macOS) only orchestrates remote hosts, which are x86_64 in
+// the common case, so it keeps using the amd64 build.
+func bundledTraceExtractorNames(goos, goarch string) []string {
+	if goos == "linux" && goarch == "arm64" {
+		return []string{traceExtractorBin + "-arm64"}
+	}
+	return []string{traceExtractorBin}
+}
+
 // findTraceExtractor locates the trace_extractor binary. Discovery order:
 //  1. override (--trace-extractor-path flag)
-//  2. PATH (which trace_extractor)
-//  3. wlcBaseDir/trace_extractor (matches the remote deploy path)
-//  4. Same directory as the running wlc binary (typical in the git repo layout)
+//  2. Same directory as the running wlc binary (the copy bundled in the git
+//     repo, whose version is known), arch-specific name first
+//  3. PATH (which trace_extractor)
+//  4. wlcBaseDir/trace_extractor (matches the remote deploy path)
 func findTraceExtractor(override string) (string, error) {
 	if override != "" {
 		if _, err := os.Stat(override); err != nil {
@@ -3269,17 +3283,19 @@ func findTraceExtractor(override string) (string, error) {
 		}
 		return override, nil
 	}
+	if self, err := os.Executable(); err == nil {
+		for _, name := range bundledTraceExtractorNames(runtime.GOOS, runtime.GOARCH) {
+			p := filepath.Join(filepath.Dir(self), name)
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+	}
 	if p, err := exec.LookPath(traceExtractorBin); err == nil {
 		return p, nil
 	}
 	if _, err := os.Stat(remoteTraceExtractorPath); err == nil {
 		return remoteTraceExtractorPath, nil
-	}
-	if self, err := os.Executable(); err == nil {
-		p := filepath.Join(filepath.Dir(self), traceExtractorBin)
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
 	}
 	return "", fmt.Errorf("trace_extractor binary not found; place it alongside the wlc binary or use --trace-extractor-path")
 }

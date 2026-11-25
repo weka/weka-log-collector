@@ -289,3 +289,21 @@ func TestMaskIPv6_RealIPv6Redacted(t *testing.T) {
 		}
 	}
 }
+
+func TestBundledTraceExtractorNames(t *testing.T) {
+	cases := []struct {
+		goos, goarch string
+		want         string
+	}{
+		{"linux", "amd64", "trace_extractor"},
+		{"linux", "arm64", "trace_extractor-arm64"},
+		{"darwin", "arm64", "trace_extractor"},
+		{"darwin", "amd64", "trace_extractor"},
+	}
+	for _, c := range cases {
+		got := bundledTraceExtractorNames(c.goos, c.goarch)
+		if len(got) == 0 || got[0] != c.want {
+			t.Errorf("%s/%s: got %v, want first %q", c.goos, c.goarch, got, c.want)
+		}
+	}
+}

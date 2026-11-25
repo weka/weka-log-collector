@@ -114,8 +114,8 @@ Flags:
                        Multiple --trace-filter flags are OR'd together by trace_extractor.
   --trace-extractor-path PATH
                        Override path to the trace_extractor binary. By default the tool
-                       looks alongside itself, in PATH, and at
-                       /opt/weka/weka-log-collector/trace_extractor.
+                       looks alongside itself (trace_extractor-arm64 on aarch64), then in
+                       PATH, then at /opt/weka/weka-log-collector/trace_extractor.
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands
@@ -245,6 +245,13 @@ weka-log-collector \
 ## Trace collection
 
 `--collect-traces` bundles Weka traces alongside the standard log collection. The tool uses the `trace_extractor` binary, which is **shipped in this repo** — a `git pull` on any Weka node picks it up automatically alongside `weka-log-collector`.
+
+| Binary | Architecture |
+|---|---|
+| `trace_extractor` | Linux amd64 (x86_64) |
+| `trace_extractor-arm64` | Linux arm64 (aarch64) |
+
+Both are built from the WEKA source tree (`scripts/tracing/trace_extractor`); the exact source commit and SHA-256 of each binary are recorded in `TRACE_EXTRACTOR_SOURCE`. Rebuild them when the upstream tool changes.
 
 ### Requirements
 
