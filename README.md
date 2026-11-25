@@ -117,8 +117,9 @@ Flags:
                        Multiple --trace-filter flags are OR'd together by trace_extractor.
   --trace-extractor-path PATH
                        Override path to the trace_extractor binary. By default the tool
-                       looks alongside itself (trace_extractor-arm64 on aarch64), then in
-                       PATH, then at /opt/weka/weka-log-collector/trace_extractor.
+                       looks alongside itself (trace_extractor-amd64, or trace_extractor-arm64
+                       on aarch64, then trace_extractor), then in PATH, then at
+                       /opt/weka/weka-log-collector/trace_extractor.
                        The window is passed as RFC3339 (2026-03-20T14:00:00+02:00), so
                        an override must be a trace_extractor that accepts zoned times
                        (the bundled build does).
@@ -264,15 +265,16 @@ weka-log-collector \
 
 | Binary | Architecture |
 |---|---|
-| `trace_extractor` | Linux amd64 (x86_64) |
+| `trace_extractor-amd64` | Linux amd64 (x86_64) |
 | `trace_extractor-arm64` | Linux arm64 (aarch64) |
+| `trace_extractor` | older amd64 build, kept unchanged only as a fallback (see below) |
 
-Both are built from the WEKA source tree (`scripts/tracing/trace_extractor`); the exact source commit and SHA-256 of each binary are recorded in `TRACE_EXTRACTOR_SOURCE`. Rebuild them when the upstream tool changes.
+Both current binaries are built from the WEKA source tree (`scripts/tracing/trace_extractor`); the exact source commit and SHA-256 of each are recorded in `TRACE_EXTRACTOR_SOURCE`. Rebuild them when the upstream tool changes. The older `trace_extractor` skips shard files with 5-digit serials; it is not used when the arch-specific binaries are present. It stays untouched because older wlc versions ran `chmod +x` on it inside the checkout, and changing a file that is modified locally would make `git pull` refuse on those nodes. wlc no longer modifies files in the checkout; if the extractor is not executable it runs a temporary copy.
 
 ### Requirements
 
 - `--start-time` is **required** — traces have no safe default window.
-- Time window (`--end-time` minus `--start-time`) must be **≤ 1 hour**. If the window is larger, or if `--start-time` is omitted, trace collection is silently skipped with an explanatory message; the rest of log collection continues normally.
+- Time window (`--end-time` minus `--start-time`) must be **≤ 1 hour** (one minute of slack, so `--start-time -1h` works). If the window is larger, or if `--start-time` is omitted, trace collection is skipped with a `[WARN]`, recorded as `"status": "skipped"` in the manifest and summary; the rest of log collection continues normally.
 
 ### Filter expressions
 
@@ -440,7 +442,7 @@ The tool automatically discovers Weka namespaces by querying the `wekacluster` C
 - Pod describe + events per pod
 - **Cluster-wide weka commands** (run once from first responsive compute pod, stored under `weka-commands/`):
   identity & status (`weka status`, `weka status rebuild`, `weka alerts`, `weka version`, `weka version current`, `weka user`),
-  cluster topology (`weka cluster servers list`, `weka cluster container`, `weka cluster container net`, `weka cluster process`, `weka cluster drive`, `weka cluster bucket`, `weka cluster failure-domain`, `weka cluster task`),
+  cluster topology (`weka cluster servers list`, `weka cluster container -v`, `weka cluster container net`, `weka cluster process -v`, `weka cluster drive -v`, `weka cluster bucket -v`, `weka cluster failure-domain`, `weka cluster task`),
   filesystems (`weka fs -v`, `weka fs group`, `weka fs snapshot -v`, `weka fs tier s3 -v`),
   events (`weka events --severity major --start-time -8h --num-results 100000`),
   security (`weka security kms`),

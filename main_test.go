@@ -305,15 +305,15 @@ func TestBundledTraceExtractorNames(t *testing.T) {
 		goos, goarch string
 		want         string
 	}{
-		{"linux", "amd64", "trace_extractor"},
+		{"linux", "amd64", "trace_extractor-amd64"},
 		{"linux", "arm64", "trace_extractor-arm64"},
-		{"darwin", "arm64", "trace_extractor"},
-		{"darwin", "amd64", "trace_extractor"},
+		{"darwin", "arm64", "trace_extractor-amd64"},
+		{"darwin", "amd64", "trace_extractor-amd64"},
 	}
 	for _, c := range cases {
 		got := bundledTraceExtractorNames(c.goos, c.goarch)
-		if len(got) == 0 || got[0] != c.want {
-			t.Errorf("%s/%s: got %v, want first %q", c.goos, c.goarch, got, c.want)
+		if len(got) != 2 || got[0] != c.want || got[1] != "trace_extractor" {
+			t.Errorf("%s/%s: got %v, want [%s trace_extractor]", c.goos, c.goarch, got, c.want)
 		}
 	}
 }
@@ -544,27 +544,34 @@ func TestRemoteKillCommand(t *testing.T) {
 	defer func() { collectTraces, resolvedTraceExtractorPath = oldCT, oldPath }()
 
 	cmd := remoteKillCommand("/opt/weka/weka-log-collector/weka-log-collector-123")
+	tePat := pkillSelfSafePattern(remoteTraceExtractorPath()) + "( |$)"
 	for _, want := range []string{
-		"pkill -f '[w]eka-log-collector-123'",
-		"pkill -f '" + filepath.Dir(remoteTraceExtractorPath()) + "/[t]race_extractor-",
+		"pkill -f '[w]eka-log-collector-123( |$)'",
+		"pkill -f '" + tePat + "'",
 		"rm -f /opt/weka/weka-log-collector/[w]eka-log-collector-123 " + pkillSelfSafePattern(remoteTraceExtractorPath()),
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("kill command %q missing %q", cmd, want)
 		}
 	}
-	// The pkill patterns must not match their own command line, but must
-	// match the real process and file names.
-	for _, c := range []struct{ pat, real string }{
-		{"[w]eka-log-collector-123", "/opt/weka/weka-log-collector/weka-log-collector-123 --local"},
-		{pkillSelfSafePattern(remoteTraceExtractorPath()), remoteTraceExtractorPath() + " --verbose"},
+	if remoteNeedsSudo() && !strings.Contains(cmd, `sudo sh -c "rm -f `) {
+		t.Errorf("non-root cleanup must run the glob rm in a root shell: %q", cmd)
+	}
+	// The pkill patterns must not match their own command line, must match
+	// the real process, and must not match a longer PID.
+	for _, c := range []struct{ pat, real, other string }{
+		{"[w]eka-log-collector-123( |$)", "/opt/weka/weka-log-collector/weka-log-collector-123 --local", "/opt/weka/weka-log-collector/weka-log-collector-1234 --local"},
+		{tePat, remoteTraceExtractorPath() + " --verbose", remoteTraceExtractorPath() + "9 --verbose"},
 	} {
 		re := regexp.MustCompile(c.pat)
 		if re.MatchString(cmd) {
 			t.Errorf("pattern %q matches the cleanup command itself", c.pat)
 		}
-		if !re.MatchString(c.real) {
+		if !re.MatchString(c.real) || !re.MatchString(strings.Fields(c.real)[0]) {
 			t.Errorf("pattern %q does not match the process %q", c.pat, c.real)
+		}
+		if re.MatchString(c.other) {
+			t.Errorf("pattern %q also matches another run %q", c.pat, c.other)
 		}
 	}
 }
@@ -784,5 +791,190 @@ func TestRedactSensitive_SecretID(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "Nov 25 10:00:01 host app: ") {
 		t.Errorf("line context lost: %q", got)
+	}
+}
+
+func TestRedactAssignments_StringBoundaries(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{`{"url":"https://h/api?token=","next":"value"}`, `{"url":"https://h/api?token=","next":"value"}`},
+		{`["PATH=/usr/bin","VAULT_TOKEN=","HOME=/root"]`, `["PATH=/usr/bin","VAULT_TOKEN=","HOME=/root"]`},
+		{`["A_TOKEN=","B_TOKEN=` + fakePW + `"]`, `["A_TOKEN=","B_TOKEN=[REDACTED]"]`},
+		{`export DB_PASSWORD=\"` + fakePW + `\" && run`, `export DB_PASSWORD=[REDACTED] && run`},
+		{`"cmd":"export DB_PASSWORD=\"` + fakePW + `\" && run"`, `"cmd":"export DB_PASSWORD=[REDACTED] && run"`},
+		{"GITHUB_TOKEN= HOME=/root", "GITHUB_TOKEN= HOME=/root"},
+		{"API_KEY= --y", "API_KEY= --y"},
+		{"(hostId=1, secret=" + fakePW + ")", "(hostId=1, secret=[REDACTED])"},
+		{"Config{user=bob, password=" + fakePW + "}", "Config{user=bob, password=[REDACTED]}"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %s\nwant %s", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitive_QuotedKeysInText(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{
+			"# command: journalctl\nNov 25 10:00:01 h weka-agent[1]:     \"access_token\": \"" + fakeBearer + "\",",
+			"# command: journalctl\nNov 25 10:00:01 h weka-agent[1]:     \"access_token\": \"[REDACTED]\",",
+		},
+		{"log: {'password': '" + fakePW + "', 'user': 'bob'}", "log: {'password': '[REDACTED]', 'user': 'bob'}"},
+		{`msg="{\"refresh_token\": \"` + fakeBearer + `\", \"x\": 1}"`, `msg="{\"refresh_token\": \"[REDACTED]\", \"x\": 1}"`},
+		{`{"Authorization": "Bearer ` + fakeBearer + `"}`, `{"Authorization": "[REDACTED]"}`},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitive([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitive_MoreCLIPasswords(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"weka smb domain join Administrator " + fakePW, "weka smb domain join Administrator [REDACTED]"},
+		{"weka smb domain leave Administrator " + fakePW, "weka smb domain leave Administrator [REDACTED]"},
+		{"weka tenant create acme admin " + fakePW + " --ssd-quota 1TB", "weka tenant create acme admin [REDACTED] --ssd-quota 1TB"},
+		{"weka org create acme admin " + fakePW, "weka org create acme admin [REDACTED]"},
+		{"weka user ldap setup-ad ldap://dc1 corp.local reader " + fakePW, "weka user ldap setup-ad ldap://dc1 corp.local reader [REDACTED]"},
+		{"weka user ldap setup ldap://h dc=x,dc=y person uid group member gid reader " + fakePW, "weka user ldap setup ldap://h dc=x,dc=y person uid group member gid reader [REDACTED]"},
+		{"weka nfs ldap setup-ad-nokrb dc1 corp.local nfs01 Administrator " + fakePW, "weka nfs ldap setup-ad-nokrb dc1 corp.local nfs01 Administrator [REDACTED]"},
+		{"weka nfs ldap setup-openldap ldap1 example.com cn=reader,dc=example,dc=com " + fakePW, "weka nfs ldap setup-openldap ldap1 example.com cn=reader,dc=example,dc=com [REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitive([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+	// Without the password the CLI prompts; nothing to redact.
+	for _, in := range []string{"weka smb domain join Administrator", "weka user ldap setup-ad ldap://dc1 corp.local reader", "weka tenant create acme admin"} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("false positive: %q -> %q", in, got)
+		}
+	}
+}
+
+func TestRedactSensitive_ConfigCredentialNames(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"ldap_default_authtok = " + fakePW, "ldap_default_authtok = [REDACTED]"},
+		{"MYSQL_PWD=" + fakePW, "MYSQL_PWD=[REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitive([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+	for _, in := range []string{
+		"Token timeouts used for authentication were updated: access=1d, refresh=30d, max_mount_token=30d",
+		"WEKA_TOKEN=/opt/weka/data/agent/token",
+		"driver: token=<32 chars> mask",
+		"PWD=/root OLDPWD=/home",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("non-secret value redacted:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+}
+
+func TestRedactSensitive_PreservesLayout(t *testing.T) {
+	for _, in := range []string{"", "\n", "a\nb", "a\nb\n", "\n\nx\n\n", "no secrets here\nweka status\n"} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("layout changed: %q -> %q", in, got)
+		}
+	}
+	in := "l1\npassword: " + fakePW + "\nl3\n"
+	if got := string(redactSensitive([]byte(in))); got != "l1\npassword: [REDACTED]\nl3\n" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestExecutableTraceExtractor(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "te-0644")
+	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	p, cleanup, err := executableTraceExtractor(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(p)
+	orig, _ := os.Stat(plain)
+	if p == plain || fi.Mode()&0111 == 0 || orig.Mode().Perm() != 0644 {
+		t.Errorf("want an executable copy and the original untouched: path=%s mode=%v orig=%v", p, fi.Mode(), orig.Mode())
+	}
+	cleanup()
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("cleanup did not remove %s", p)
+	}
+
+	exe := filepath.Join(dir, "te-0755")
+	_ = os.WriteFile(exe, []byte("#!/bin/sh\n"), 0755)
+	if p, _, err := executableTraceExtractor(exe); err != nil || p != exe {
+		t.Errorf("executable file should be used as is: %s %v", p, err)
+	}
+}
+
+func TestRemoteNodeArgs_TraceSkipReason(t *testing.T) {
+	oldCT, oldPath := collectTraces, resolvedTraceExtractorPath
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	defer func() { collectTraces, resolvedTraceExtractorPath = oldCT, oldPath }()
+	traceDeployFailed.Store("bad-host", "scp: write failed\nno space left")
+	defer traceDeployFailed.Delete("bad-host")
+
+	args := remoteNodeArgs("bad-host", time.Time{}, time.Time{}, nil)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--trace-skip-reason trace_extractor deploy failed: scp: write failed no space left") {
+		t.Errorf("deploy-failed host should get a one-line --trace-skip-reason: %q", args)
+	}
+	if strings.Contains(joined, "--collect-traces") {
+		t.Errorf("deploy-failed host must not get --collect-traces: %q", args)
+	}
+}
+
+func TestRunTraceExtractor_Reasons(t *testing.T) {
+	res, _ := runFakeExtractor(t, writeFakeExtractor(t, "verbose: /opt/weka/traces: 0 files match glob *.shard\nCollecting:\n  0 shards\n  0 histogram files\n", 0, 0), time.Minute)
+	if res.Status != "no_shards" || res.Reason != "no shard files in the trace directory" {
+		t.Errorf("empty dir: %+v", res)
+	}
+	res, _ = runFakeExtractor(t, writeFakeExtractor(t, "verbose: /opt/weka/traces: 3 files match glob *.shard\nverbose: /opt/weka/traces: 3 skipped (parse), 0 skipped (filter), 0 remaining\nCollecting:\n  0 shards\n", 0, 0), time.Minute)
+	if res.Status != "no_shards" || !strings.Contains(res.Reason, "none of the 3 shard files") {
+		t.Errorf("all unparsed: %+v", res)
+	}
+	res, _ = runFakeExtractor(t, writeFakeExtractor(t, sampleExtractorOutput, 30, 0), time.Second)
+	if res.Status != "timeout" || res.Shards != 0 || !strings.Contains(res.Reason, "42 shards had been selected") {
+		t.Errorf("timeout: %+v", res)
+	}
+	res, _ = runFakeExtractor(t, writeFakeExtractor(t, "Writing x ...\n", 0, 3), time.Minute)
+	if res.Status != "failed" || !strings.HasPrefix(res.Reason, "exit status 3: Writing x") {
+		t.Errorf("exit 3: %+v", res)
+	}
+}
+
+func TestRunCommand_MinTimeout(t *testing.T) {
+	r, out := runCommand(CommandSpec{Name: "slow", Cmd: "sleep 1; echo done", MinTimeout: 10 * time.Second}, 200*time.Millisecond)
+	if r.Error != "" || !strings.Contains(string(out), "done") {
+		t.Errorf("MinTimeout not applied: %+v %q", r, out)
+	}
+}
+
+func TestBuildWindowedDefaultCmds_FutureStartAndTimeout(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	for _, c := range buildWindowedDefaultCmdsAt(now.Add(3*time.Hour), time.Time{}, now) {
+		if strings.Contains(c.Cmd, "--start-time --") || strings.Contains(c.Cmd, "--start-time -0h") {
+			t.Errorf("bad start offset: %q", c.Cmd)
+		}
+		if c.MinTimeout < eventsMinTimeout {
+			t.Errorf("%s: MinTimeout %s", c.Name, c.MinTimeout)
+		}
+	}
+}
+
+func TestOneLine(t *testing.T) {
+	if got := oneLine("a\n  b\tc ", 100); got != "a b c" {
+		t.Errorf("got %q", got)
+	}
+	if got := oneLine("abcdef", 3); got != "abc" {
+		t.Errorf("got %q", got)
 	}
 }

@@ -86,7 +86,7 @@ func stripANSI(b []byte) []byte { return ansiEscape.ReplaceAll(b, nil) }
 // positives like "bypass:" or "compass:" are accepted — over-redacting a
 // non-secret is far less harmful than leaking a credential.
 var sensitiveKeyRe = regexp.MustCompile(
-	`(?i)(password|passwd|pwd|pass|token|secret|secret[-_]?id|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\s*:`)
+	`(?i)(password|passwd|pwd|pass|token|secret|secret[-_]?id|api[-_]?key|auth|authtok|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\s*:`)
 
 // jsonSensitiveValueRe matches a JSON `"key": "value"` pair where the key
 // contains a credential-like substring. Captures the prefix (key + colon +
@@ -94,7 +94,18 @@ var sensitiveKeyRe = regexp.MustCompile(
 // is replaced with [REDACTED]. Operates on raw JSON bytes (no parse / re-marshal)
 // so Weka's grep-friendly JSON formatting is preserved exactly.
 var jsonSensitiveValueRe = regexp.MustCompile(
-	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)"[^"]*"`)
+	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)"[^"\n]*"`)
+
+// jsonSingleQuotedValueRe and jsonEscapedValueRe are the same key/value pair
+// as jsonSensitiveValueRe, written as a Python-style dict ('password': 'x')
+// or as JSON embedded in a JSON/log string (\"access_token\": \"eyJ...\").
+// Both appear inside ordinary text lines (journal, output.log).
+var (
+	jsonSingleQuotedValueRe = regexp.MustCompile(
+		`(?i)('\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*'[ \t]*:[ \t]*)'[^'\n]*'`)
+	jsonEscapedValueRe = regexp.MustCompile(
+		`(?i)(\\"\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*\\"[ \t]*:[ \t]*\\")(?:[^"\\\n]|\\[^"\n])*(\\")`)
+)
 
 // jsonSensitiveArrayRe matches a JSON `"key": [...]` pair where the key contains
 // a credential-like substring and the value is a JSON array. Needed for fields
@@ -112,11 +123,16 @@ var jsonSensitiveArrayRe = regexp.MustCompile(
 func redactSensitiveYAML(b []byte) []byte {
 	lines := bytes.Split(b, []byte("\n"))
 	for i, line := range lines {
-		if loc := sensitiveKeyRe.FindIndex(line); loc != nil && loc[1] < len(line) {
-			lines[i] = append(line[:loc[1]:loc[1]], []byte(" [REDACTED]")...)
-		}
+		lines[i] = redactSensitiveYAMLLine(line)
 	}
 	return bytes.Join(lines, []byte("\n"))
+}
+
+func redactSensitiveYAMLLine(line []byte) []byte {
+	if loc := sensitiveKeyRe.FindIndex(line); loc != nil && loc[1] < len(line) {
+		return append(line[:loc[1]:loc[1]], []byte(" [REDACTED]")...)
+	}
+	return line
 }
 
 // redactSensitiveJSON replaces the value of any JSON key whose name contains a
@@ -138,78 +154,317 @@ func redactSensitiveJSON(b []byte) []byte {
 //	[2] CLI flag whose name contains a credential substring (aligned with sensitiveKeyRe):
 //	    --token, --access-token, --refresh-token, --join-secret, --private-key, etc.
 //	[3] Weka SRT token: a bare SRT… string of ≥20 chars (download/activation tokens)
-//	[4] KEY=value assignments whose name ends in a credential word
+//	[4] KEY=value assignments whose name ends in a credential word (redactAssignments)
 //	[5] HashiCorp Vault tokens (hvs./hvb./hvr.)
-//	[6] positional passwords in weka user login/passwd/add
+//	[6] positional passwords on the weka CLI (wekaCLIPasswordRe)
 //
 // Values are bounded by [^\s"',;]+ rather than \S+ so that structural
 // delimiters (quotes, commas, semicolons) in JSON/YAML context are never
 // consumed, preventing corruption of surrounding structured output.
+// Separators use [ \t] rather than \s so a match never crosses a line break.
 var (
-	// Separators use [ \t] rather than \s so a match never crosses a line
-	// break and eats the first word of the next line.
 	authHeaderRe = regexp.MustCompile(
 		`(?i)(Authorization[ \t]*:[ \t]*(?:Bearer|Token)[ \t]+)[^\s"',;]+`)
 	cliFlagRe = regexp.MustCompile(
 		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|[ \t]+))[^\s"',;]+`)
 	srtTokenRe = regexp.MustCompile(
 		`\bSRT[A-Za-z0-9+/._=-]{20,}`)
-	// [4] KEY=value assignment (shell env, ini, URL query) whose name ends in
-	//     a credential word: VAULT_TOKEN=..., DB_PASS=..., password = ...
-	//     The name must END in the word, so max_token_count=5 or
-	//     spec_store_bypass_disable=on are left alone. Group 1 is the
-	//     boundary before the name (Go regexp has no lookbehind).
+	// [4] NAME=value (shell env, ini, URL query) where NAME ends in a
+	//     credential word: VAULT_TOKEN=..., DB_PASS=..., password = ...,
+	//     ldap_default_authtok = ... The name must END in the word, so
+	//     max_token_count=5 or spec_store_bypass_disable=on are left alone.
+	//     Spaces around "=" only in the ini form (name, space, "="), so an
+	//     empty env value (GITHUB_TOKEN= HOME=/root) never takes the next
+	//     word. Group 1 is the value: a backslash-escaped quoted string, a
+	//     quoted string, or a bare word that does not start with a quote or
+	//     backslash and stops at structural delimiters. redactAssignments
+	//     drops matches that would cross a string boundary.
 	assignmentRe = regexp.MustCompile(
-		`(?i)(^|[^A-Za-z0-9_.-])([A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|secret[-_]?id|token|api[-_]?key|access[-_]?key|private[-_]?key|signing[-_]?key|credentials?|_pass|pgpass)[ \t]*=[ \t]*)(?:"[^"\n]*"|'[^'\n]*'|[^\s"',;&]+)`)
+		`(?i)[A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|secret[-_]?id|token|authtok|api[-_]?key|access[-_]?key|private[-_]?key|signing[-_]?key|credentials?|_pass|_pwd|pgpass)(?:=|[ \t]+=[ \t]*)` +
+			`(\\"[^"\\\n]*\\"|"[^"\n]+"|'[^'\n]+'|[^\s"',;&\\)}\]][^\s"',;&)}\]]*)`)
+	// durationValueRe matches values that are durations, not secrets
+	// (max_mount_token=30d).
+	durationValueRe = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?[smhdwy]$`)
 	// [5] HashiCorp Vault tokens (service, batch, recovery) by shape.
 	vaultTokenRe = regexp.MustCompile(
 		`\bhv[sbr]\.[A-Za-z0-9_-]{20,}`)
-	// [6] Positional passwords on the weka CLI:
-	//     weka user login <user> <password>, weka user passwd <password>,
-	//     weka user add <user> <role> <password>. Options with a value
-	//     (--org acme, -H host) may appear anywhere before the password.
-	//     The password may be quoted. Tokens starting with - are options,
-	//     never the password.
-	wekaUserPasswordRe = regexp.MustCompile(
-		`(?i)(\bweka` + cliOpts + `[ \t]+user` + cliOpts +
-			`[ \t]+(?:login` + cliOpts + cliPositional + `|passwd|add` + cliOpts + cliPositional + cliOpts + cliPositional + `)` + cliOpts + `[ \t]+)` +
-			`(?:"[^"\n]*"|'[^'\n]*'|[^\s"'-][^\s"']*)`)
+	// [6] built from cliPasswordPositions.
+	wekaCLIPasswordRe = buildWekaCLIPasswordRe()
 )
 
-// Building blocks for wekaUserPasswordRe: zero or more options that each take a
+// Building blocks for wekaCLIPasswordRe: zero or more options that each take a
 // value, and one positional (non-option) argument. Same-line only.
 const (
 	cliOpts       = `(?:[ \t]+--?[A-Za-z][\w-]*(?:=\S*|[ \t]+[^\s-]\S*))*`
 	cliPositional = `[ \t]+[^\s-]\S*`
 )
 
+// cliPasswordPositions lists weka CLI commands that take a password as a
+// positional argument, with the 1-based position of the password among the
+// positionals (from the CLI definitions in 4.4 and 5.1). With the password
+// left out the CLI prompts for it, which is the safe use; these entries catch
+// the command lines (shell history, ps, logs) where it was typed inline.
+var cliPasswordPositions = []struct {
+	path string
+	pos  int
+}{
+	{"user login", 2},
+	{"user passwd", 1},
+	{"user add", 3},
+	{"user ldap setup", 9},
+	{"user ldap setup-ad", 4},
+	{"tenant create", 3},
+	{"org create", 3},
+	{"smb domain join", 2},
+	{"smb domain leave", 2},
+	{"nfs ldap setup-ad-nokrb", 5},
+	{"nfs ldap setup-openldap", 4},
+}
+
+// buildWekaCLIPasswordRe builds one regexp for all cliPasswordPositions:
+// "weka", the subcommand words, the positionals before the password (options
+// with values may appear anywhere), then the password itself, quoted or bare.
+// Group 1 is everything before the password.
+func buildWekaCLIPasswordRe() *regexp.Regexp {
+	alts := make([]string, 0, len(cliPasswordPositions))
+	for _, c := range cliPasswordPositions {
+		words := strings.Fields(c.path)
+		for i, w := range words {
+			words[i] = regexp.QuoteMeta(w)
+		}
+		alt := strings.Join(words, cliOpts+`[ \t]+`) + cliOpts
+		for i := 1; i < c.pos; i++ {
+			alt += cliPositional + cliOpts
+		}
+		alts = append(alts, alt)
+	}
+	return regexp.MustCompile(`(weka` + cliOpts + `[ \t]+(?:` + strings.Join(alts, "|") + `)[ \t]+)` +
+		`(?:"[^"\n]*"|'[^'\n]*'|[^\s"'-][^\s"']*)`)
+}
+
+// redactAssignments applies assignmentRe, skipping matches that are not a real
+// NAME=value: a quoted "value" that is really the end of the string the name
+// sits in (["VAULT_TOKEN=","HOME=/root"], ?token=","next"), paths
+// (WEKA_TOKEN=/path), masks (token=<32 chars>) and durations (=30d). After a
+// skipped match the search resumes at the value, so a real assignment right
+// after it is still found.
+func redactAssignments(b []byte) []byte {
+	var out []byte
+	last, pos := 0, 0
+	for pos < len(b) {
+		m := assignmentRe.FindSubmatchIndex(b[pos:])
+		if m == nil {
+			break
+		}
+		ns, vs, ve := pos+m[0], pos+m[2], pos+m[3]
+		if skipAssignmentValue(b, ns, vs, ve) {
+			pos = vs
+			continue
+		}
+		out = append(out, b[last:vs]...)
+		out = append(out, "[REDACTED]"...)
+		last, pos = ve, ve
+	}
+	if out == nil {
+		return b
+	}
+	return append(out, b[last:]...)
+}
+
+func skipAssignmentValue(b []byte, nameStart, vs, ve int) bool {
+	v := b[vs:ve]
+	switch v[0] {
+	case '"', '\'':
+		// The name sits inside a string quoted the same way: this "value" is
+		// that string's closing quote plus whatever follows.
+		if nameStart > 0 && b[nameStart-1] == v[0] {
+			return true
+		}
+		// A real quoted value ends at a delimiter, not mid-word.
+		if ve < len(b) && !bytes.ContainsRune([]byte(" \t\r;,&)}]|"), rune(b[ve])) {
+			return true
+		}
+	case '/', '<':
+		return true
+	}
+	return durationValueRe.Match(v)
+}
+
 // redactSensitiveValues applies value-shape redaction that the key-name passes
-// miss: HTTP Authorization headers, CLI flag values, and bare Weka SRT tokens.
+// miss: HTTP Authorization headers, CLI flag values, bare Weka SRT and Vault
+// tokens, NAME=value assignments and positional weka CLI passwords.
 // Safe to run on arbitrary text — content without matches is returned unchanged.
 func redactSensitiveValues(b []byte) []byte {
 	b = authHeaderRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	b = cliFlagRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	b = srtTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
-	b = assignmentRe.ReplaceAll(b, []byte("${1}${2}[REDACTED]"))
+	b = redactAssignments(b)
 	b = vaultTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
-	b = wekaUserPasswordRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
+	b = wekaCLIPasswordRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	return b
 }
 
-// redactSensitive auto-detects JSON content (starts with `{` or `[` after
-// whitespace) and applies the JSON redactor; otherwise falls back to the
-// line-based YAML/text redactor. A final value-pattern pass then catches tokens
-// that appear without a structured key (CLI args, HTTP headers, bare SRT tokens).
-// Safe to call on arbitrary command output — content without sensitive keys is
-// returned unchanged.
+// credentialHints are lowercase substrings at least one of which appears in
+// every line any redaction pattern can match. Lines without one (most log
+// lines) skip all regular expressions.
+var credentialHints = [][]byte{
+	[]byte("pass"), []byte("pwd"), []byte("token"), []byte("secret"), []byte("key"),
+	[]byte("auth"), []byte("credential"), []byte("srt"), []byte("hvs."), []byte("hvb."), []byte("hvr."),
+}
+
+// cliPasswordHints: a line can hold a positional weka CLI password only if it
+// has "weka" and one of these subcommand words.
+var cliPasswordHints = [][]byte{
+	[]byte("login"), []byte("passwd"), []byte("add"), []byte("create"), []byte("setup"), []byte("domain"),
+}
+
+// lineMayHoldSecret is the cheap prefilter for redactLine; lower is the line
+// with ASCII letters lowercased.
+func lineMayHoldSecret(lower []byte) bool {
+	for _, h := range credentialHints {
+		if bytes.Contains(lower, h) {
+			return true
+		}
+	}
+	if bytes.Contains(lower, []byte("weka")) {
+		for _, h := range cliPasswordHints {
+			if bytes.Contains(lower, h) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// keyWordsBeforeColon and keyWordsBeforeEquals are the lowercase words that
+// sensitiveKeyRe must see right before ":" and assignmentRe right before "="
+// (spaces/tabs allowed in between). wordBefore uses them as a fast exact
+// prefilter, so the regexes only run on lines that can match.
+var (
+	keyWordsBeforeColon  = splitWords("password passwd pwd pass token secret secret_id secret-id secretid api_key api-key apikey auth authtok credential private_key private-key privatekey access_key access-key accesskey signing_key signing-key signingkey")
+	keyWordsBeforeEquals = splitWords("password passwd passphrase secret secret_id secret-id secretid token authtok api_key api-key apikey access_key access-key accesskey private_key private-key privatekey signing_key signing-key signingkey credential credentials _pass _pwd pgpass")
+)
+
+func splitWords(s string) [][]byte {
+	var out [][]byte
+	for _, w := range strings.Fields(s) {
+		out = append(out, []byte(w))
+	}
+	return out
+}
+
+// wordBefore reports whether some sep in lower is preceded (after optional
+// spaces/tabs) by one of words.
+func wordBefore(lower []byte, sep byte, words [][]byte) bool {
+	off := 0
+	for {
+		i := bytes.IndexByte(lower[off:], sep)
+		if i < 0 {
+			return false
+		}
+		j := off + i
+		for j > 0 && (lower[j-1] == ' ' || lower[j-1] == '\t') {
+			j--
+		}
+		for _, w := range words {
+			if bytes.HasSuffix(lower[:j], w) {
+				return true
+			}
+		}
+		off += i + 1
+	}
+}
+
+// asciiLower returns a copy of b with ASCII letters lowercased. Unlike
+// bytes.ToLower it never changes the length, so offsets stay aligned with b.
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		out[i] = c
+	}
+	return out
+}
+
+// redactLine applies the per-line passes: the YAML/text key pass (not for
+// JSON documents, where it would cut structure), the quoted-key passes
+// (JSON, Python dict and escaped JSON inside text) and the value passes.
+// Each pattern runs only if the line has the literal it cannot match without
+// (lower is the original line with ASCII letters lowercased); the result is
+// the same as running redactSensitiveValues and the key passes on every line.
+func redactLine(line, lower []byte, isJSONDoc bool) []byte {
+	has := func(s string) bool { return bytes.Contains(lower, []byte(s)) }
+	hasByte := func(c byte) bool { return bytes.IndexByte(lower, c) >= 0 }
+	if !isJSONDoc && wordBefore(lower, ':', keyWordsBeforeColon) {
+		line = redactSensitiveYAMLLine(line)
+	}
+	if hasByte('"') && hasByte(':') {
+		line = jsonSensitiveValueRe.ReplaceAll(line, []byte(`$1"[REDACTED]"`))
+		if has(`\"`) {
+			line = jsonEscapedValueRe.ReplaceAll(line, []byte(`${1}[REDACTED]${2}`))
+		}
+	}
+	if hasByte('\'') && hasByte(':') {
+		line = jsonSingleQuotedValueRe.ReplaceAll(line, []byte(`$1'[REDACTED]'`))
+	}
+	if has("authorization") {
+		line = authHeaderRe.ReplaceAll(line, []byte("${1}[REDACTED]"))
+	}
+	if has("--") {
+		line = cliFlagRe.ReplaceAll(line, []byte("${1}[REDACTED]"))
+	}
+	if has("srt") {
+		line = srtTokenRe.ReplaceAll(line, []byte("[REDACTED]"))
+	}
+	if wordBefore(lower, '=', keyWordsBeforeEquals) {
+		line = redactAssignments(line)
+	}
+	if has("hvs.") || has("hvb.") || has("hvr.") {
+		line = vaultTokenRe.ReplaceAll(line, []byte("[REDACTED]"))
+	}
+	if has("weka") {
+		line = wekaCLIPasswordRe.ReplaceAll(line, []byte("${1}[REDACTED]"))
+	}
+	return line
+}
+
+// redactSensitive redacts credentials in collected text. A JSON document
+// (starts with { or [ after whitespace) first gets the whole-document JSON
+// pass, which also handles multi-line arrays. Then every line that contains a
+// credential hint gets redactLine; other lines are copied unchanged, which
+// keeps this fast on large logs. Safe to call on arbitrary command output —
+// content without sensitive keys is returned unchanged.
 func redactSensitive(b []byte) []byte {
 	trimmed := bytes.TrimLeft(b, " \t\r\n")
-	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+	isJSONDoc := len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+	if isJSONDoc {
 		b = redactSensitiveJSON(b)
-	} else {
-		b = redactSensitiveYAML(b)
 	}
-	return redactSensitiveValues(b)
+	lower := asciiLower(b)
+	out := make([]byte, 0, len(b)+64)
+	start := 0
+	for {
+		end := bytes.IndexByte(b[start:], '\n')
+		last := end < 0
+		if last {
+			end = len(b)
+		} else {
+			end += start
+		}
+		line, lline := b[start:end], lower[start:end]
+		if lineMayHoldSecret(lline) {
+			line = redactLine(line, lline, isJSONDoc)
+		}
+		out = append(out, line...)
+		if last {
+			break
+		}
+		out = append(out, '\n')
+		start = end + 1
+	}
+	return out
 }
 
 // ─── anonymizer ──────────────────────────────────────────────────────────────
@@ -1119,6 +1374,15 @@ func splitCommaList(values []string) []string {
 	return out
 }
 
+// oneLine collapses whitespace (including newlines) and truncates s to max bytes.
+func oneLine(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > max {
+		s = s[:max]
+	}
+	return s
+}
+
 // remoteTimeArg formats a window bound for a remote --start-time/--end-time:
 // UTC RFC3339 with seconds, so the remote host reads the same instant
 // whatever its own time zone, without losing the seconds.
@@ -1161,6 +1425,9 @@ type CommandSpec struct {
 	NodeLocal    bool   // if true, output varies per node (weka local *); otherwise cluster-wide
 	NodeOptional bool   // if true, failure is expected on some nodes/distros — logged at verbose only, not WARN
 	LocalOnly    bool   // if true, run even when cluster auth is unavailable (weka local commands only)
+	// MinTimeout raises the per-command timeout for this command (for slow
+	// commands such as weka events with a large --num-results).
+	MinTimeout time.Duration
 }
 
 // defaultCommands are run on every node that has the weka CLI available.
@@ -1233,6 +1500,10 @@ var defaultCommands = []CommandSpec{
 // events out of the window; an explicit large number works on 4.4 and 5.1.
 const eventsMaxResults = "100000"
 
+// eventsMinTimeout: weka events pages through Weka Home 1000 events at a time
+// and prints nothing until it is done, so a timeout loses all of it.
+const eventsMinTimeout = 5 * time.Minute
+
 // buildWindowedDefaultCmds returns default commands whose --start-time must align with
 // the collection window. Uses relative offsets (e.g. -9h, -37m) rather than absolute
 // timestamps — weka events only reliably accepts relative offsets.
@@ -1250,6 +1521,9 @@ func buildWindowedDefaultCmdsAt(from, to, now time.Time) []CommandSpec {
 	// Convert absolute time to a relative offset that weka events accepts.
 	// Round up by one hour so we don't miss events right at the window boundary.
 	hours := int(now.Sub(effectiveFrom).Hours()) + 1
+	if hours < 1 {
+		hours = 1
+	}
 	window := fmt.Sprintf(" --start-time -%dh", hours)
 	// End of the window, rounded down to whole minutes (so the window only
 	// grows). Omitted when the window ends within the last minute.
@@ -1261,10 +1535,10 @@ func buildWindowedDefaultCmdsAt(from, to, now time.Time) []CommandSpec {
 	window += " --num-results " + eventsMaxResults
 	return []CommandSpec{
 		// Events at major+ severity within the collection window.
-		{Name: "weka_events_major", Cmd: "weka events --severity major" + window},
+		{Name: "weka_events_major", Cmd: "weka events --severity major" + window, MinTimeout: eventsMinTimeout},
 		// Warning+ within the window: disconnects and other early signs that
 		// are not major (a superset of weka_events_major).
-		{Name: "weka_events_warning", Cmd: "weka events --severity warning" + window},
+		{Name: "weka_events_warning", Cmd: "weka events --severity warning" + window, MinTimeout: eventsMinTimeout},
 	}
 }
 
@@ -2207,6 +2481,9 @@ func truncateCmdError(msg string) string {
 }
 
 func runCommand(spec CommandSpec, timeout time.Duration) (CommandResult, []byte) {
+	if spec.MinTimeout > timeout {
+		timeout = spec.MinTimeout
+	}
 	start := time.Now()
 	result := CommandResult{
 		Name:     spec.Name,
@@ -3398,14 +3675,54 @@ func maybeRemoteSudo(cmd string) string {
 
 // bundledTraceExtractorNames returns the trace_extractor file names to look for
 // next to the wlc binary, most specific first. The repo ships
-// trace_extractor (linux/amd64) and trace_extractor-arm64 (linux/arm64).
-// A non-Linux wlc (macOS) only orchestrates remote hosts, which are x86_64 in
-// the common case, so it keeps using the amd64 build.
+// trace_extractor-amd64 and trace_extractor-arm64 (Linux). The plain
+// trace_extractor is the older build, left untouched so that "git pull" keeps
+// working on nodes where an earlier wlc chmod'ed it in place; it is only a
+// fallback (or a user-placed copy). A non-Linux wlc (macOS) only orchestrates
+// remote hosts, which are x86_64 in the common case, so it uses the amd64 build.
 func bundledTraceExtractorNames(goos, goarch string) []string {
 	if goos == "linux" && goarch == "arm64" {
-		return []string{traceExtractorBin + "-arm64"}
+		return []string{traceExtractorBin + "-arm64", traceExtractorBin}
 	}
-	return []string{traceExtractorBin}
+	return []string{traceExtractorBin + "-amd64", traceExtractorBin}
+}
+
+// executableTraceExtractor returns path if it is executable, otherwise a 0755
+// copy in the temp dir (and a cleanup func). wlc never chmods the file in
+// place: inside a git checkout that would make the next "git pull" refuse.
+func executableTraceExtractor(path string) (string, func(), error) {
+	noop := func() {}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", noop, err
+	}
+	if fi.Mode()&0111 != 0 {
+		return path, noop, nil
+	}
+	src, err := os.Open(path)
+	if err != nil {
+		return "", noop, err
+	}
+	defer src.Close()
+	dst, err := os.CreateTemp("", "wlc-trace_extractor-*")
+	if err != nil {
+		return "", noop, err
+	}
+	cleanup := func() { os.Remove(dst.Name()) }
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		cleanup()
+		return "", noop, err
+	}
+	if err := dst.Close(); err != nil {
+		cleanup()
+		return "", noop, err
+	}
+	if err := os.Chmod(dst.Name(), 0755); err != nil {
+		cleanup()
+		return "", noop, err
+	}
+	return dst.Name(), cleanup, nil
 }
 
 // findTraceExtractor locates the trace_extractor binary. Discovery order:
@@ -3435,7 +3752,8 @@ func findTraceExtractor(override string) (string, error) {
 	if _, err := os.Stat(legacyTraceExtractorPath); err == nil {
 		return legacyTraceExtractorPath, nil
 	}
-	return "", fmt.Errorf("trace_extractor binary not found; place it alongside the wlc binary or use --trace-extractor-path")
+	return "", fmt.Errorf("trace_extractor binary not found; place %s alongside the wlc binary or use --trace-extractor-path",
+		strings.Join(bundledTraceExtractorNames(runtime.GOOS, runtime.GOARCH), " or "))
 }
 
 // addRawFileToArchive streams a file into the tar without loading it into memory.
@@ -3472,11 +3790,18 @@ var (
 	reExtractorHistograms = regexp.MustCompile(`(?m)^\s+(\d+) histogram files\s*$`)
 	reExtractorUnparsed   = regexp.MustCompile(`(?m): (\d+) skipped \(parse\)`)
 	reExtractorDirWarning = regexp.MustCompile(`(?m)^warning: cannot read trace directory .*$`)
+	reExtractorShardGlob  = regexp.MustCompile(`(?m): (\d+) files match glob \*\.shard\s*$`)
 )
 
 // parseExtractorOutput fills the shard, histogram and unparsed-file counts from
 // trace_extractor's stderr (its "Collecting:" summary and --verbose lines).
-func parseExtractorOutput(out string, r *TraceResult) {
+// It returns how many *.shard files the extractor saw in the trace directory
+// (-1 if its output does not say).
+func parseExtractorOutput(out string, r *TraceResult) int {
+	seen := -1
+	if m := reExtractorShardGlob.FindStringSubmatch(out); m != nil {
+		seen, _ = strconv.Atoi(m[1])
+	}
 	if m := reExtractorShards.FindStringSubmatch(out); m != nil {
 		r.Shards, _ = strconv.Atoi(m[1])
 	}
@@ -3490,6 +3815,7 @@ func parseExtractorOutput(out string, r *TraceResult) {
 	if m := reExtractorDirWarning.FindString(out); m != "" && r.Reason == "" {
 		r.Reason = m
 	}
+	return seen
 }
 
 // traceResultLine renders a TraceResult as one summary line.
@@ -3558,7 +3884,7 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 	start := time.Now()
 	out, runErr := cmd.CombinedOutput()
 	res.Duration = time.Since(start).Round(time.Second).String()
-	parseExtractorOutput(string(out), res)
+	shardFilesSeen := parseExtractorOutput(string(out), res)
 
 	exitDesc := "0"
 	switch {
@@ -3573,12 +3899,19 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			res.ExitCode = exitErr.ExitCode()
 		}
+		res.Reason = runErr.Error()
 		if l := lastNonEmptyLine(string(out)); l != "" {
-			res.Reason = l
-		} else {
-			res.Reason = runErr.Error()
+			res.Reason += ": " + l
 		}
 		exitDesc = runErr.Error()
+	}
+	if res.Status != "" {
+		// Nothing was added to the bundle: report no shards, and say how
+		// many the extractor had selected (explains most timeouts).
+		if res.Shards > 0 {
+			res.Reason += fmt.Sprintf(" (%d shards had been selected)", res.Shards)
+		}
+		res.Shards, res.Histograms = 0, 0
 	}
 
 	logHeader := fmt.Sprintf("command: %s %s\nstarted: %s\nduration: %s\nexit: %s\n\n",
@@ -3623,7 +3956,13 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 		warnf("[traces] trace_extractor ran but produced no output files")
 	case res.Shards == 0:
 		res.Status = "no_shards"
-		if res.Reason == "" {
+		switch {
+		case res.Reason != "": // e.g. trace directory not readable
+		case shardFilesSeen == 0:
+			res.Reason = "no shard files in the trace directory"
+		case shardFilesSeen > 0 && res.UnparsedFiles >= shardFilesSeen:
+			res.Reason = fmt.Sprintf("none of the %d shard files had a name trace_extractor could parse", shardFilesSeen)
+		default:
 			res.Reason = "no shard files matched the time window and filter"
 		}
 		warnf("[traces] 0 shards collected: %s", res.Reason)
@@ -3816,14 +4155,21 @@ func deployFailureResults(hosts []string, failed map[string]string) []HostResult
 // written in pkillSelfSafePattern form (the rm paths as shell globs), so the
 // pkill cannot match the cleanup shell's own command line and the rm runs.
 func remoteKillCommand(remoteBin string) string {
+	// "( |$)" anchors the end of the name so ...-123 does not match ...-1234.
 	files := pkillSelfSafePattern(remoteBin)
-	kill := maybeRemoteSudo("pkill -f '"+pkillSelfSafePattern(filepath.Base(remoteBin))+"'") + " 2>/dev/null"
+	kill := maybeRemoteSudo("pkill -f '"+pkillSelfSafePattern(filepath.Base(remoteBin))+"( |$)'") + " 2>/dev/null"
 	if collectTraces && resolvedTraceExtractorPath != "" {
 		te := pkillSelfSafePattern(remoteTraceExtractorPath())
 		files += " " + te
-		kill += "; " + maybeRemoteSudo("pkill -f '"+te+"'") + " 2>/dev/null"
+		kill += "; " + maybeRemoteSudo("pkill -f '"+te+"( |$)'") + " 2>/dev/null"
 	}
-	return kill + "; " + maybeRemoteSudo("rm -f "+files) + "; true"
+	// The [x]name globs must be expanded by a shell that can read wlcBaseDir,
+	// so with sudo the rm runs in a root shell.
+	rm := "rm -f " + files
+	if remoteNeedsSudo() {
+		rm = `sudo sh -c "` + rm + `"`
+	}
+	return kill + "; " + rm + "; true"
 }
 
 // tracesEnabledForHost reports whether the remote run on host should collect
@@ -3855,6 +4201,11 @@ func remoteNodeArgs(host string, from, to time.Time, containerNames []string) []
 	}
 	for _, name := range containerNames {
 		extra = append(extra, "--container-name", name)
+	}
+	if v, failed := traceDeployFailed.Load(host); failed && collectTraces && resolvedTraceExtractorPath != "" {
+		// Let the node record why its bundle has no traces (also in --upload
+		// mode, where the orchestrator never sees the node's manifest).
+		extra = append(extra, "--trace-skip-reason", oneLine("trace_extractor deploy failed: "+v.(string), 300))
 	}
 	if tracesEnabledForHost(host) {
 		extra = append(extra, "--collect-traces")
@@ -4852,7 +5203,7 @@ _weka_log_collector() {
           --start-time --end-time --profile --output --host --container-id
           --extra-commands --cmd-timeout --no-shell-history --compression --anonymize --anonymize-key --force
           --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers
-          --collect-traces --trace-filter --trace-extractor-path"
+          --collect-traces --trace-filter --trace-extractor-path --trace-timeout"
 
     case "$prev" in
         --profile)
@@ -6587,6 +6938,7 @@ func main() {
 		collectTracesFlag  = flag.Bool("collect-traces", false, "Collect traces via trace_extractor (WEKA v5.x+ only; requires --start-time; window capped at 1 hour)")
 		traceExtractorPath = flag.String("trace-extractor-path", "", "Path to trace_extractor binary (default: auto-discover alongside wlc binary or in PATH)")
 		traceTimeoutFlag   = flag.Duration("trace-timeout", defaultTraceTimeout, "Maximum run time of trace_extractor on each node (e.g. 10m, 30m)")
+		traceSkipFlag      = flag.String("trace-skip-reason", "", "Internal: why this node collects no traces (set by the orchestrator when trace_extractor could not be deployed)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -6770,6 +7122,9 @@ func main() {
 			}
 		}
 	}
+	if *traceSkipFlag != "" && !*collectTracesFlag {
+		traceSkipReason = *traceSkipFlag
+	}
 	if *collectTracesFlag {
 		collectTraces = true
 		traceFilters = []string(traceFilterFlags)
@@ -6792,11 +7147,17 @@ func main() {
 			errorf("--collect-traces: %v", err)
 			os.Exit(1)
 		}
-		// Ensure the binary is executable for local invocations. The SSH path
-		// does chmod +x on remote nodes, but the orchestrating node runs the
-		// binary directly without going through that path.
+		// The orchestrating node runs the extractor directly (remote nodes get
+		// chmod +x in the ssh command). If it is not executable, run a copy.
 		if resolvedTraceExtractorPath != "" {
-			_ = os.Chmod(resolvedTraceExtractorPath, 0755)
+			p, cleanup, err := executableTraceExtractor(resolvedTraceExtractorPath)
+			if err != nil {
+				errorf("--collect-traces: %s: %v", resolvedTraceExtractorPath, err)
+				exitCode = 1
+				return
+			}
+			defer cleanup()
+			resolvedTraceExtractorPath = p
 		}
 	}
 
@@ -6806,7 +7167,12 @@ func main() {
 	// scopes journalctl, weka stats (perf profile), and rotated log files (by mtime).
 	defaultWindow := from.IsZero()
 	if defaultWindow {
-		from = time.Now().Add(-8 * time.Hour)
+		// Anchor the default 8h window at --end-time when only that is given.
+		base := time.Now()
+		if !to.IsZero() {
+			base = to
+		}
+		from = base.Add(-8 * time.Hour)
 	}
 	// Cluster mode: fix the end of the window once, here, so every host and
 	// the cluster-wide commands use the same bounds. Without this each remote
@@ -6814,6 +7180,14 @@ func main() {
 	// trace window as too long).
 	if to.IsZero() && !*localOnly {
 		to = time.Now()
+	}
+	// A --start-time in the future leaves an empty window. Stop here instead
+	// of deploying to every host only to have each one reject it.
+	if !to.IsZero() && to.Before(from) {
+		errorf("The time window is empty: start %s is after end %s.", from.Format(time.RFC3339), to.Format(time.RFC3339))
+		errorf("Times without a zone are read in this host's local time zone (%s); use e.g. 2026-03-04T10:30:00Z for UTC.", from.Format("MST"))
+		exitCode = 1
+		return
 	}
 
 	// ── build anonymizer (must happen before output path / archive root are
@@ -6982,6 +7356,9 @@ func main() {
 		if *upload && !toStdout {
 			if err := uploadBundle(outPath, *uploadSessionID); err != nil {
 				errorf("Upload failed: %v", err)
+				// Non-zero so an orchestrating run sees the failure (and keeps
+				// the bundle) instead of counting this node as uploaded.
+				exitCode = 1
 			} else {
 				os.Remove(outPath) // uploaded; no need to keep local copy
 			}
@@ -7020,6 +7397,7 @@ func main() {
 				if *upload && !toStdout {
 					if err := uploadBundle(outPath, 0); err != nil {
 						errorf("Upload failed: %v", err)
+						exitCode = 1
 					} else {
 						os.Remove(outPath)
 					}
@@ -7690,9 +8068,13 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		}
 	}
 
+	type hostFailure struct {
+		Host   string `json:"host"`
+		Reason string `json:"reason"`
+	}
 	var succeeded, failed int
 	var failedHosts []string
-	failedReasons := map[string]string{}
+	var failedReasons []hostFailure
 	traces := map[string]*TraceResult{}
 	var traceProblems []string
 
@@ -7700,7 +8082,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		if r.Err != nil {
 			failed++
 			failedHosts = append(failedHosts, r.Host)
-			failedReasons[r.Host] = r.Err.Error()
+			failedReasons = append(failedReasons, hostFailure{r.Host, r.Err.Error()})
 			errorf("[%s] FAILED: %v", r.Host, r.Err)
 			// Write a placeholder error file so the host is visible in the archive
 			errContent := []byte(fmt.Sprintf("Collection failed for host %s\nError: %v\n", r.Host, r.Err))
@@ -7715,7 +8097,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			errorf("[%s] failed to open temp archive %s: %v", r.Host, r.TempFile, openErr)
 			failed++
 			failedHosts = append(failedHosts, r.Host)
-			failedReasons[r.Host] = "open host archive: " + openErr.Error()
+			failedReasons = append(failedReasons, hostFailure{r.Host, "open host archive: " + openErr.Error()})
 			os.Remove(r.TempFile)
 			continue
 		}
@@ -7731,7 +8113,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			errorf("[%s] failed to merge archive: %v", r.Host, mergeErr)
 			failed++
 			failedHosts = append(failedHosts, r.Host)
-			failedReasons[r.Host] = "merge host archive: " + mergeErr.Error()
+			failedReasons = append(failedReasons, hostFailure{r.Host, "merge host archive: " + mergeErr.Error()})
 			continue
 		}
 		succeeded++
@@ -7741,14 +8123,23 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
 		}
 		if tr := hostTraceResult(r.Host, hostManifest); tr != nil {
+			// Key by the host's directory name in the bundle (hosts/<name>/),
+			// which --anonymize maps to a unique placeholder; masked IPs
+			// (x.x.x.5) can collide.
 			key := r.Host
+			if hostManifest != nil && isSafePathComponent(hostManifest.Hostname) {
+				key = hostManifest.Hostname
+			}
 			if globalAnonymizer.enabled {
 				key = string(globalAnonymizer.Apply([]byte(key)))
+			}
+			for base, n := key, 2; traces[key] != nil; n++ {
+				key = fmt.Sprintf("%s#%d", base, n)
 			}
 			traces[key] = tr
 			if tr.Status != "ok" || tr.UnparsedFiles > 0 {
 				warnf("  [%s] traces: %s", r.Host, traceResultLine(tr))
-				traceProblems = append(traceProblems, r.Host)
+				traceProblems = append(traceProblems, key)
 			} else {
 				logf("  [%s] traces: %s", r.Host, traceResultLine(tr))
 			}
@@ -7765,7 +8156,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		Succeeded   int                     `json:"succeeded"`
 		Failed      int                     `json:"failed"`
 		FailedHosts []string                `json:"failed_hosts,omitempty"`
-		FailReasons map[string]string       `json:"failed_reasons,omitempty"`
+		FailReasons []hostFailure           `json:"failed_reasons,omitempty"`
 		Traces      map[string]*TraceResult `json:"traces,omitempty"`
 		TraceSkip   string                  `json:"traces_skipped,omitempty"`
 	}
@@ -7780,9 +8171,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	if len(traces) > 0 {
 		summary.Traces = traces
 	}
-	if len(failedReasons) > 0 {
-		summary.FailReasons = failedReasons
-	}
+	summary.FailReasons = failedReasons
 	summary.TraceSkip = traceSkipReason
 	if !from.IsZero() {
 		summary.From = from.Format(time.RFC3339)
@@ -7812,6 +8201,8 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		if len(traceProblems) > 0 {
 			logf("            check: %s (details in cluster_summary.json and hosts/<host>/traces/extractor.log)", strings.Join(traceProblems, ", "))
 		}
+	} else if traceSkipReason != "" {
+		logf("  Traces:   skipped: %s", traceSkipReason)
 	}
 	if !toStdout {
 		if info, err := os.Stat(outPath); err == nil {
@@ -7895,8 +8286,9 @@ TRACES  (requires WEKA v5.x+ on each node; window is capped at 1 hour)
                                e.g. --trace-filter "container=drives0 and slot=7"
                                Default when omitted: collect all traces (--all).
   --trace-extractor-path PATH  Override the trace_extractor binary path.
-                               Default: alongside the wlc binary (trace_extractor-arm64 on
-                               aarch64), then PATH, then /opt/weka/weka-log-collector/.
+                               Default: alongside the wlc binary (trace_extractor-amd64, or
+                               -arm64 on aarch64, then trace_extractor), then PATH, then
+                               /opt/weka/weka-log-collector/trace_extractor.
   --trace-timeout DURATION     Maximum trace_extractor run time per node (default: 15m).
                                The outcome per node (status, shard count, skipped files)
                                is in collection_manifest.json, cluster_summary.json and

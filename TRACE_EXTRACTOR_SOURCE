@@ -6,6 +6,9 @@
 #   silently skipped shards such as *_0031_18401_*.shard).
 # Build: go1.27.4, CGO_ENABLED=0 GOOS=linux GOARCH=<arch> go build -trimpath
 #
+# The plain "trace_extractor" file is the older build, left unchanged on
+# purpose (see README, Trace collection); it is not listed here.
+#
 # sha256                                                            file
-4cfd5dc98a62b15f8c00fa02198dbbeee811bbf7c0b5173add115396b43f057b  trace_extractor
+4cfd5dc98a62b15f8c00fa02198dbbeee811bbf7c0b5173add115396b43f057b  trace_extractor-amd64
 5c7fb01324b45bfaa4bd51c9bccd93cdb3958320641e95f4eb203033b7c03b19  trace_extractor-arm64
