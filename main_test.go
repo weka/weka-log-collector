@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -454,36 +455,124 @@ func TestRemoteNodeArgs_TraceDeployFailed(t *testing.T) {
 		t.Errorf("hostTraceResult for failed deploy: %+v", tr)
 	}
 	cmd := remoteShellCommand("good-host", "/opt/weka/weka-log-collector/wlc", "true", time.Minute)
-	if !strings.Contains(cmd, remoteTraceExtractorPath) {
+	if !strings.Contains(cmd, remoteTraceExtractorPath()) {
 		t.Errorf("remote cleanup should remove trace_extractor: %s", cmd)
 	}
 }
 
-func TestMergeArchive_ReturnsHostManifest(t *testing.T) {
-	m := HostManifest{Hostname: "h1", Traces: &TraceResult{Status: "no_shards"}}
+// hostArchive builds a gzip'd tar shaped like a --node-only host archive:
+// <root>/collection_manifest.json at the top, data under hosts/<host>/.
+func hostArchive(t *testing.T, host string, m HostManifest) *bytes.Buffer {
+	t.Helper()
 	mj, _ := json.Marshal(m)
 	var src bytes.Buffer
 	gw := gzip.NewWriter(&src)
 	tw := tar.NewWriter(gw)
-	for name, data := range map[string][]byte{
-		"old/hosts/h1/collection_manifest.json": mj,
-		"old/hosts/h1/system/uptime.txt":        []byte("up"),
+	for _, e := range []struct {
+		name string
+		data []byte
+	}{
+		{"old-root/hosts/" + host + "/system/uptime.txt", []byte("up")},
+		{"old-root/collection_manifest.json", mj},
 	} {
-		_ = tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(data))})
-		_, _ = tw.Write(data)
+		_ = tw.WriteHeader(&tar.Header{Name: e.name, Mode: 0644, Size: int64(len(e.data))})
+		_, _ = tw.Write(e.data)
 	}
 	tw.Close()
 	gw.Close()
+	return &src
+}
 
+func TestMergeArchive_ReturnsHostManifest(t *testing.T) {
 	var out bytes.Buffer
 	otw := tar.NewWriter(&out)
-	got, err := mergeArchive(otw, &src, "new")
+	for _, h := range []string{"h1", "h2"} {
+		got, err := mergeArchive(otw, hostArchive(t, h, HostManifest{Hostname: h, Traces: &TraceResult{Status: "no_shards"}}), "new")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Hostname != h || got.Traces == nil || got.Traces.Status != "no_shards" {
+			t.Errorf("%s: manifest not returned: %+v", h, got)
+		}
+	}
 	otw.Close()
-	if err != nil {
+
+	names := map[string]bool{}
+	tr := tar.NewReader(&out)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if names[hdr.Name] {
+			t.Errorf("duplicate entry %s in merged archive", hdr.Name)
+		}
+		names[hdr.Name] = true
+	}
+	for _, want := range []string{"new/hosts/h1/collection_manifest.json", "new/hosts/h2/collection_manifest.json"} {
+		if !names[want] {
+			t.Errorf("missing %s; entries: %v", want, names)
+		}
+	}
+	if names["new/collection_manifest.json"] {
+		t.Errorf("host manifest left at the bundle root")
+	}
+}
+
+func TestMergeArchive_UnsafeManifestHostnameStaysAtRoot(t *testing.T) {
+	var out bytes.Buffer
+	otw := tar.NewWriter(&out)
+	if _, err := mergeArchive(otw, hostArchive(t, "h1", HostManifest{Hostname: "../evil"}), "new"); err != nil {
 		t.Fatal(err)
 	}
-	if got == nil || got.Traces == nil || got.Traces.Status != "no_shards" {
-		t.Errorf("manifest not returned: %+v", got)
+	otw.Close()
+	tr := tar.NewReader(&out)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if strings.Contains(hdr.Name, "..") {
+			t.Errorf("unsafe path written: %s", hdr.Name)
+		}
+	}
+}
+
+func TestRemoteKillCommand(t *testing.T) {
+	oldCT, oldPath := collectTraces, resolvedTraceExtractorPath
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	defer func() { collectTraces, resolvedTraceExtractorPath = oldCT, oldPath }()
+
+	cmd := remoteKillCommand("/opt/weka/weka-log-collector/weka-log-collector-123")
+	for _, want := range []string{
+		"pkill -f '[w]eka-log-collector-123'",
+		"pkill -f '" + filepath.Dir(remoteTraceExtractorPath()) + "/[t]race_extractor-",
+		"rm -f /opt/weka/weka-log-collector/[w]eka-log-collector-123 " + pkillSelfSafePattern(remoteTraceExtractorPath()),
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("kill command %q missing %q", cmd, want)
+		}
+	}
+	// The pkill patterns must not match their own command line, but must
+	// match the real process and file names.
+	for _, c := range []struct{ pat, real string }{
+		{"[w]eka-log-collector-123", "/opt/weka/weka-log-collector/weka-log-collector-123 --local"},
+		{pkillSelfSafePattern(remoteTraceExtractorPath()), remoteTraceExtractorPath() + " --verbose"},
+	} {
+		re := regexp.MustCompile(c.pat)
+		if re.MatchString(cmd) {
+			t.Errorf("pattern %q matches the cleanup command itself", c.pat)
+		}
+		if !re.MatchString(c.real) {
+			t.Errorf("pattern %q does not match the process %q", c.pat, c.real)
+		}
+	}
+}
+
+func TestRemoteTraceExtractorPathIsPerRun(t *testing.T) {
+	p := remoteTraceExtractorPath()
+	if p == legacyTraceExtractorPath || !strings.HasPrefix(p, wlcBaseDir+"/trace_extractor-") {
+		t.Errorf("remote extractor path should be per-run: %s", p)
 	}
 }
 
@@ -650,5 +739,50 @@ func TestBuildWindowedDefaultCmds_Events(t *testing.T) {
 		if strings.Contains(c.Cmd, "--end-time") {
 			t.Errorf("window ending now should not pass --end-time: %q", c.Cmd)
 		}
+	}
+}
+
+func TestRedactSensitiveValues_NoNewlineCrossing(t *testing.T) {
+	for _, in := range []string{
+		"weka user passwd\nweka status -v",
+		"weka user login\nweka status -v",
+		"weka user add bob clusteradmin\nweka cluster drive",
+		"VAULT_TOKEN=\nHOME=/root",
+		"password =\n[server]",
+		"--password\nnext-line",
+		"Authorization: Bearer\nnext-line",
+	} {
+		if got := string(redactSensitiveValues([]byte(in))); got != in {
+			t.Errorf("match crossed a line break:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_WekaUserPasswordForms(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"weka user login admin 'P@ss w0rd'", "weka user login admin [REDACTED]"},
+		{`weka user login admin "P@ss w0rd" --org acme`, "weka user login admin [REDACTED] --org acme"},
+		{"weka user login --org acme admin " + fakePW, "weka user login --org acme admin [REDACTED]"},
+		{"weka user login admin " + fakePW + ",x;y", "weka user login admin [REDACTED]"},
+		{"weka -H node1 user login admin " + fakePW, "weka -H node1 user login admin [REDACTED]"},
+		{"weka user passwd --username bob " + fakePW, "weka user passwd --username bob [REDACTED]"},
+		{"weka user add bob clusteradmin --posix-uid 1001 " + fakePW, "weka user add bob clusteradmin --posix-uid 1001 [REDACTED]"},
+		{`{"cmd":"weka user login admin ` + fakePW + `","x":1}`, `{"cmd":"weka user login admin [REDACTED]","x":1}`},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitive_SecretID(t *testing.T) {
+	in := "Nov 25 10:00:01 host app: secret_id=" + fakePW + " role auth: approle"
+	got := string(redactSensitive([]byte(in)))
+	if strings.Contains(got, fakePW) {
+		t.Errorf("secret_id value survived: %q", got)
+	}
+	if !strings.HasPrefix(got, "Nov 25 10:00:01 host app: ") {
+		t.Errorf("line context lost: %q", got)
 	}
 }

@@ -119,6 +119,9 @@ Flags:
                        Override path to the trace_extractor binary. By default the tool
                        looks alongside itself (trace_extractor-arm64 on aarch64), then in
                        PATH, then at /opt/weka/weka-log-collector/trace_extractor.
+                       The window is passed as RFC3339 (2026-03-20T14:00:00+02:00), so
+                       an override must be a trace_extractor that accepts zoned times
+                       (the bundled build does).
   --trace-timeout DURATION
                        Maximum trace_extractor run time per node (default: 15m). Each
                        node's outcome (status, shard count, unparsed files skipped) is
