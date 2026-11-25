@@ -1068,6 +1068,20 @@ func parseInputTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse time %q: use YYYY-MM-DDTHH:MM[:SS] (local), RFC3339 with a zone (2026-03-04T10:30:00Z, +02:00) or relative like -2h, -30m, -1d", s)
 }
 
+// splitCommaList flattens values that may each hold a comma-separated list
+// ("drives0,compute0") into individual trimmed, non-empty items.
+func splitCommaList(values []string) []string {
+	var out []string
+	for _, v := range values {
+		for _, item := range strings.Split(v, ",") {
+			if item = strings.TrimSpace(item); item != "" {
+				out = append(out, item)
+			}
+		}
+	}
+	return out
+}
+
 // remoteTimeArg formats a window bound for a remote --start-time/--end-time:
 // UTC RFC3339 with seconds, so the remote host reads the same instant
 // whatever its own time zone, without losing the seconds.
@@ -3610,12 +3624,16 @@ const deployWorkers = 20
 // If all hosts reject the current SSH user with a "Please login as user X"
 // message (common on OCI/EC2 where root SSH is blocked), deployAll
 // automatically retries once with the suggested user.
-func deployAll(hosts []string, displayNames map[string]string, selfPath string) []string {
+//
+// It returns the hosts that were deployed and, for every other host, the
+// deploy error text.
+func deployAll(hosts []string, displayNames map[string]string, selfPath string) ([]string, map[string]string) {
 	return deployAllInner(hosts, displayNames, selfPath, false)
 }
 
-func deployAllInner(hosts []string, displayNames map[string]string, selfPath string, isRetry bool) []string {
+func deployAllInner(hosts []string, displayNames map[string]string, selfPath string, isRetry bool) ([]string, map[string]string) {
 	type deployErr struct {
+		host    string
 		display string
 		msg     string
 	}
@@ -3638,7 +3656,7 @@ func deployAllInner(hosts []string, displayNames map[string]string, selfPath str
 			}
 			if err := deployToHost(host, selfPath); err != nil {
 				mu.Lock()
-				failures = append(failures, deployErr{display, err.Error()})
+				failures = append(failures, deployErr{host, display, err.Error()})
 				mu.Unlock()
 				return
 			}
@@ -3649,8 +3667,12 @@ func deployAllInner(hosts []string, displayNames map[string]string, selfPath str
 	}
 	wg.Wait()
 
+	failedMsgs := make(map[string]string, len(failures))
+	for _, f := range failures {
+		failedMsgs[f.host] = f.msg
+	}
 	if len(failures) == 0 {
-		return succeeded
+		return succeeded, failedMsgs
 	}
 
 	// Check whether all failures are SSH user rejections pointing to the same user.
@@ -3695,7 +3717,20 @@ func deployAllInner(hosts []string, displayNames map[string]string, selfPath str
 		sort.Strings(users)
 		warnf("SSH user rejected — re-run with: --ssh-user %s", strings.Join(users, " or "))
 	}
-	return succeeded
+	return succeeded, failedMsgs
+}
+
+// deployFailureResults turns deploy failures into HostResults so that hosts
+// which never ran a collection still appear in the bundle (COLLECTION_FAILED.txt),
+// in the host counts and in the failed-host list.
+func deployFailureResults(hosts []string, failed map[string]string) []HostResult {
+	var out []HostResult
+	for _, h := range hosts {
+		if msg, ok := failed[h]; ok {
+			out = append(out, HostResult{Host: h, Err: fmt.Errorf("deploy failed: %s", msg)})
+		}
+	}
+	return out
 }
 
 // tracesEnabledForHost reports whether the remote run on host should collect
@@ -3725,8 +3760,8 @@ func remoteNodeArgs(host string, from, to time.Time, containerNames []string) []
 	if noShellHistory {
 		extra = append(extra, "--no-shell-history")
 	}
-	if len(containerNames) > 0 {
-		extra = append(extra, "--container-name", strings.Join(containerNames, ","))
+	for _, name := range containerNames {
+		extra = append(extra, "--container-name", name)
 	}
 	if tracesEnabledForHost(host) {
 		extra = append(extra, "--collect-traces")
@@ -6790,7 +6825,7 @@ func main() {
 	// so remote nodes only collect /opt/weka/logs/<name>/ for those containers.
 	// --container-name is an internal flag set by the orchestrator; honour it
 	// directly when running as a remote node (--local --node-only).
-	containerNames := []string(containerNamesFlag)
+	containerNames := splitCommaList([]string(containerNamesFlag))
 	if len(containerNames) == 0 && len(containerIDs) > 0 {
 		nameMap := resolveContainerNames([]int(containerIDs))
 		for _, id := range containerIDs {
@@ -7118,6 +7153,10 @@ func main() {
 			logf("  Failed:   %s", strings.Join(failedDisplays, ", "))
 			logf("  Tip: check SSH access and 'weka cloud status' on failed nodes.")
 		}
+		if succeeded == 0 {
+			releaseRunLock()
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -7125,7 +7164,10 @@ func main() {
 	phase("Collecting from cluster hosts")
 	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames)
 	phase("Writing archive")
-	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, *statsTimeout, *noStats, collectionStart, extraCmds, *compression)
+	if writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, *statsTimeout, *noStats, collectionStart, extraCmds, *compression) == 0 {
+		releaseRunLock()
+		os.Exit(1)
+	}
 }
 
 // collectCluster deploys the binary to all hosts first, then fans out collection
@@ -7134,10 +7176,11 @@ func main() {
 func collectCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
 	// ── phase 1: deploy binary to all hosts ───────────────────────────────
 	phase("Deploying binary to cluster hosts")
-	deployed := deployAll(hosts, displayNames, selfPath)
+	deployed, deployFailed := deployAll(hosts, displayNames, selfPath)
+	failures := deployFailureResults(hosts, deployFailed)
 	if len(deployed) == 0 {
 		errorf("Deploy failed on all hosts — nothing to collect.")
-		return nil
+		return failures
 	}
 	if len(deployed) < len(hosts) {
 		logf("  Deploy: %d/%d succeeded — collecting from reachable nodes only", len(deployed), len(hosts))
@@ -7177,7 +7220,7 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, pr
 		}()
 	}
 	wg.Wait()
-	return results
+	return append(results, failures...)
 }
 
 // uploadFromHost runs collection + upload on a remote host (binary already deployed
@@ -7235,10 +7278,11 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 func uploadCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64, compression string) []HostResult {
 	// ── phase 1: deploy binary to all remote hosts ────────────────────────
 	phase("Deploying binary to remote hosts")
-	deployed := deployAll(hosts, displayNames, selfPath)
+	deployed, deployFailed := deployAll(hosts, displayNames, selfPath)
+	failures := deployFailureResults(hosts, deployFailed)
 	if len(deployed) == 0 {
 		errorf("Deploy failed on all remote hosts — nothing to upload.")
-		return nil
+		return failures
 	}
 	if len(deployed) < len(hosts) {
 		logf("  Deploy: %d/%d succeeded — uploading from reachable nodes only", len(deployed), len(hosts))
@@ -7278,7 +7322,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 		}()
 	}
 	wg.Wait()
-	return results
+	return append(results, failures...)
 }
 
 // writeArchive performs a local collection and writes to outPath (or stdout).
@@ -7472,7 +7516,9 @@ func addClusterWideCmdsToArchive(tw *tar.Writer, archiveRoot, profile string, fr
 }
 
 // writeMergedArchive merges results from all cluster hosts into a single archive.
-func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout, statsTimeout time.Duration, noStats bool, collectionStart time.Time, extraCmds []CommandSpec, compression string) {
+//
+// It returns the number of hosts whose data made it into the bundle.
+func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout, statsTimeout time.Duration, noStats bool, collectionStart time.Time, extraCmds []CommandSpec, compression string) int {
 	clusterName := getClusterName()
 	if globalAnonymizer.enabled {
 		clusterName = "weka-cluster"
@@ -7530,6 +7576,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 
 	var succeeded, failed int
 	var failedHosts []string
+	failedReasons := map[string]string{}
 	traces := map[string]*TraceResult{}
 	var traceProblems []string
 
@@ -7537,6 +7584,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		if r.Err != nil {
 			failed++
 			failedHosts = append(failedHosts, r.Host)
+			failedReasons[r.Host] = r.Err.Error()
 			errorf("[%s] FAILED: %v", r.Host, r.Err)
 			// Write a placeholder error file so the host is visible in the archive
 			errContent := []byte(fmt.Sprintf("Collection failed for host %s\nError: %v\n", r.Host, r.Err))
@@ -7599,6 +7647,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		Succeeded   int                     `json:"succeeded"`
 		Failed      int                     `json:"failed"`
 		FailedHosts []string                `json:"failed_hosts,omitempty"`
+		FailReasons map[string]string       `json:"failed_reasons,omitempty"`
 		Traces      map[string]*TraceResult `json:"traces,omitempty"`
 		TraceSkip   string                  `json:"traces_skipped,omitempty"`
 	}
@@ -7612,6 +7661,9 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 	}
 	if len(traces) > 0 {
 		summary.Traces = traces
+	}
+	if len(failedReasons) > 0 {
+		summary.FailReasons = failedReasons
 	}
 	summary.TraceSkip = traceSkipReason
 	if !from.IsZero() {
@@ -7649,6 +7701,10 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		}
 	}
 	logf("  Duration: %s", elapsed)
+	if succeeded == 0 {
+		errorf("No host data was collected (%d host(s) failed). The bundle holds only cluster-wide output and the failure list.", failed)
+	}
+	return succeeded
 }
 
 // hostTraceResult returns the trace outcome for one merged host: from its

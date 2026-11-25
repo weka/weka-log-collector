@@ -231,6 +231,8 @@ Use `--container-id` to scope to specific nodes, `--clients` to include client n
 
 > **Note:** `--clients` and `--clients-only` can significantly increase collection size — each client host adds roughly the same log volume as a backend. Only use it when investigating a client-side issue (e.g. Kubernetes/CSI clients, NFS/SMB clients). For most support cases, leave it off.
 
+> **Failed hosts:** every discovered host is listed in the bundle. A host that could not be deployed to or collected from gets `hosts/<host>/COLLECTION_FAILED.txt` and an entry in `failed_hosts` / `failed_reasons` in `cluster_summary.json`. The run exits non-zero (1) when no host could be collected; a partial run still exits 0, so check the summary.
+
 > **Signal handling:** If you press Ctrl+C during cluster collection, the tool will SSH to all active remote nodes, kill any running collection processes, and clean up the temporary binary before exiting.
 
 ### Large clusters (50+ nodes)

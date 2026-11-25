@@ -523,3 +523,40 @@ func TestRemoteNodeArgs_UTCWindow(t *testing.T) {
 		t.Errorf("round trip: got %v (%v), want %v", got, err, from)
 	}
 }
+
+func TestSplitCommaList(t *testing.T) {
+	got := splitCommaList([]string{"drives0,compute0", " frontend0 ", ",", "s3"})
+	want := []string{"drives0", "compute0", "frontend0", "s3"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestRemoteNodeArgs_ContainerNamesRepeated(t *testing.T) {
+	args := remoteNodeArgs("h", time.Time{}, time.Time{}, []string{"drives0", "compute0"})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--container-name drives0") || !strings.Contains(joined, "--container-name compute0") {
+		t.Errorf("each container name must be its own flag: %v", args)
+	}
+	if strings.Contains(joined, "drives0,compute0") {
+		t.Errorf("names must not be comma-joined: %v", args)
+	}
+	// What the remote receives parses back to the same list.
+	var f multiStringFlag
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--container-name" {
+			_ = f.Set(args[i+1])
+		}
+	}
+	if got := splitCommaList([]string(f)); strings.Join(got, ",") != "drives0,compute0" {
+		t.Errorf("round trip: %v", got)
+	}
+}
+
+func TestDeployFailureResults(t *testing.T) {
+	hosts := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	res := deployFailureResults(hosts, map[string]string{"10.0.0.2": "Permission denied (publickey)"})
+	if len(res) != 1 || res[0].Host != "10.0.0.2" || res[0].Err == nil || !strings.Contains(res[0].Err.Error(), "Permission denied") {
+		t.Errorf("got %+v", res)
+	}
+}
