@@ -103,15 +103,15 @@ var jsonSensitiveArrayRe = regexp.MustCompile(
 // redactSensitiveYAML replaces the value of any YAML/text line whose key matches
 // sensitiveKeyRe with [REDACTED]. Only single-line scalar values are redacted;
 // multiline blocks are left as-is (they do not contain credentials in practice).
+//
+// Everything after the matched key's own colon is replaced, not everything
+// after the line's first colon: in syslog/journal/output.log lines the first
+// colon is inside the timestamp, which used to leave only the timestamp.
 func redactSensitiveYAML(b []byte) []byte {
 	lines := bytes.Split(b, []byte("\n"))
 	for i, line := range lines {
-		if sensitiveKeyRe.Match(line) {
-			// Find the colon and replace everything after it.
-			idx := bytes.Index(line, []byte(":"))
-			if idx >= 0 && idx < len(line)-1 {
-				lines[i] = append(line[:idx+1], []byte(" [REDACTED]")...)
-			}
+		if loc := sensitiveKeyRe.FindIndex(line); loc != nil && loc[1] < len(line) {
+			lines[i] = append(line[:loc[1]:loc[1]], []byte(" [REDACTED]")...)
 		}
 	}
 	return bytes.Join(lines, []byte("\n"))
@@ -136,6 +136,9 @@ func redactSensitiveJSON(b []byte) []byte {
 //	[2] CLI flag whose name contains a credential substring (aligned with sensitiveKeyRe):
 //	    --token, --access-token, --refresh-token, --join-secret, --private-key, etc.
 //	[3] Weka SRT token: a bare SRT… string of ≥20 chars (download/activation tokens)
+//	[4] KEY=value assignments whose name ends in a credential word
+//	[5] HashiCorp Vault tokens (hvs./hvb./hvr.)
+//	[6] positional passwords in weka user login/passwd/add
 //
 // Values are bounded by [^\s"',;]+ rather than \S+ so that structural
 // delimiters (quotes, commas, semicolons) in JSON/YAML context are never
@@ -147,6 +150,21 @@ var (
 		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|\s+))[^\s"',;]+`)
 	srtTokenRe = regexp.MustCompile(
 		`\bSRT[A-Za-z0-9+/._=-]{20,}`)
+	// [4] KEY=value assignment (shell env, ini, URL query) whose name ends in
+	//     a credential word: VAULT_TOKEN=..., DB_PASS=..., password = ...
+	//     The name must END in the word, so max_token_count=5 or
+	//     spec_store_bypass_disable=on are left alone. Group 1 is the
+	//     boundary before the name (Go regexp has no lookbehind).
+	assignmentRe = regexp.MustCompile(
+		`(?i)(^|[^A-Za-z0-9_.-])([A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|signing[-_]?key|credentials?|_pass|pgpass)\s*=\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s"',;&]+)`)
+	// [5] HashiCorp Vault tokens (service, batch, recovery) by shape.
+	vaultTokenRe = regexp.MustCompile(
+		`\bhv[sbr]\.[A-Za-z0-9_-]{20,}`)
+	// [6] Positional passwords on the weka CLI:
+	//     weka user login <user> <password>, weka user passwd <password>,
+	//     weka user add <user> <role> <password>. Flags (-x/--x) are not values.
+	wekaUserPasswordRe = regexp.MustCompile(
+		`(?i)(\bweka\s+user\s+(?:login\s+\S+|passwd|add\s+\S+\s+\S+)\s+)[^\s"',;-][^\s"',;]*`)
 )
 
 // redactSensitiveValues applies value-shape redaction that the key-name passes
@@ -156,6 +174,9 @@ func redactSensitiveValues(b []byte) []byte {
 	b = authHeaderRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	b = cliFlagRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	b = srtTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
+	b = assignmentRe.ReplaceAll(b, []byte("${1}${2}[REDACTED]"))
+	b = vaultTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
+	b = wekaUserPasswordRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	return b
 }
 

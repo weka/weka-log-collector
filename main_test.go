@@ -560,3 +560,69 @@ func TestDeployFailureResults(t *testing.T) {
 		t.Errorf("got %+v", res)
 	}
 }
+
+const fakeVault = "hvs.FAKE-TEST-VAULT-TOKEN-XXXXXXXXXXXX"
+
+func TestRedactSensitiveYAML_KeepsTimestampAndContext(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{
+			"Nov 25 10:00:01 node-1 kernel: Speculative Store Bypass: Mitigation: SSB disabled",
+			"Nov 25 10:00:01 node-1 kernel: Speculative Store Bypass: [REDACTED]",
+		},
+		{
+			"2026-11-25 10:00:01.123 app[42]: password: " + fakePW,
+			"2026-11-25 10:00:01.123 app[42]: password: [REDACTED]",
+		},
+		{"join_secret: abc123", "join_secret: [REDACTED]"},
+		{"password:", "password:"}, // no value: unchanged
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveYAML([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_Assignments(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"export VAULT_TOKEN=" + fakeVault, "export VAULT_TOKEN=[REDACTED]"},
+		{"DB_PASS=\"" + fakePW + " x\" next", "DB_PASS=[REDACTED] next"},
+		{"password = " + fakePW, "password = [REDACTED]"},
+		{"GET /api?user=bob&token=" + fakeBearer + "&x=1", "GET /api?user=bob&token=[REDACTED]&x=1"},
+		{"A_SECRET=" + fakePW + " B_TOKEN=" + fakeBearer, "A_SECRET=[REDACTED] B_TOKEN=[REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_VaultAndWekaCLI(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"vault login " + fakeVault, "vault login [REDACTED]"},
+		{"weka user login admin " + fakePW, "weka user login admin [REDACTED]"},
+		{"weka user passwd " + fakePW + " --username bob", "weka user passwd [REDACTED] --username bob"},
+		{"weka user add bob clusteradmin " + fakePW, "weka user add bob clusteradmin [REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_AssignmentNoFalsePositives(t *testing.T) {
+	for _, in := range []string{
+		"PWD=/root",
+		"BOOT_IMAGE=/vmlinuz root=/dev/sda1 spec_store_bypass_disable=on",
+		"max_token_count=5 token_bucket_size=10",
+		"weka user login admin --org default",
+		"weka user add bob clusteradmin --posix-uid 1001",
+		"tokens: 5",
+	} {
+		if got := string(redactSensitiveValues([]byte(in))); got != in {
+			t.Errorf("false positive:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+}
