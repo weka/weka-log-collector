@@ -486,3 +486,40 @@ func TestMergeArchive_ReturnsHostManifest(t *testing.T) {
 		t.Errorf("manifest not returned: %+v", got)
 	}
 }
+
+func TestParseInputTime_Zones(t *testing.T) {
+	want := time.Date(2026, 3, 4, 10, 30, 0, 0, time.UTC)
+	for _, in := range []string{"2026-03-04T10:30:00Z", "2026-03-04T12:30:00+02:00", "2026-03-04T05:30:00-05:00"} {
+		got, err := parseInputTime(in)
+		if err != nil {
+			t.Fatalf("%s: %v", in, err)
+		}
+		if !got.Equal(want) {
+			t.Errorf("%s: got %s, want %s", in, got, want)
+		}
+		if got.Location() != time.Local {
+			t.Errorf("%s: want local time, got zone %s", in, got.Location())
+		}
+	}
+	local, err := parseInputTime("2026-03-04T10:30")
+	if err != nil || !local.Equal(time.Date(2026, 3, 4, 10, 30, 0, 0, time.Local)) {
+		t.Errorf("zone-less input should be local: %v %v", local, err)
+	}
+	if _, err := parseInputTime("yesterday"); err == nil {
+		t.Errorf("expected error for unparseable input")
+	}
+}
+
+func TestRemoteNodeArgs_UTCWindow(t *testing.T) {
+	from := time.Date(2026, 3, 4, 12, 30, 15, 0, time.FixedZone("X", 2*3600))
+	to := from.Add(45 * time.Minute)
+	args := strings.Join(remoteNodeArgs("h", from, to, nil), " ")
+	if !strings.Contains(args, "--start-time 2026-03-04T10:30:15Z") || !strings.Contains(args, "--end-time 2026-03-04T11:15:15Z") {
+		t.Errorf("remote window not sent as UTC RFC3339 with seconds: %s", args)
+	}
+	// Round trip: what the remote parses is the same instant.
+	got, err := parseInputTime(remoteTimeArg(from))
+	if err != nil || !got.Equal(from) {
+		t.Errorf("round trip: got %v (%v), want %v", got, err, from)
+	}
+}

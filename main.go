@@ -1051,13 +1051,28 @@ func parseInputTime(s string) (time.Time, error) {
 		}
 		return time.Now().Add(-dur), nil
 	}
-	// Try absolute formats: YYYY-MM-DDTHH:MM:SS then YYYY-MM-DDTHH:MM
+	// Absolute with an explicit zone (2026-03-04T10:30:00Z, ...+02:00). The
+	// result is converted to local time so that every consumer (journalctl,
+	// weka CLI, file mtimes) keeps working in the host's own zone.
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Local(), nil
+		}
+	}
+	// Absolute without a zone, in local time: YYYY-MM-DDTHH:MM:SS then YYYY-MM-DDTHH:MM
 	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04"} {
 		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("cannot parse time %q: use YYYY-MM-DDTHH:MM[:SS] or relative like -2h, -30m, -1d", s)
+	return time.Time{}, fmt.Errorf("cannot parse time %q: use YYYY-MM-DDTHH:MM[:SS] (local), RFC3339 with a zone (2026-03-04T10:30:00Z, +02:00) or relative like -2h, -30m, -1d", s)
+}
+
+// remoteTimeArg formats a window bound for a remote --start-time/--end-time:
+// UTC RFC3339 with seconds, so the remote host reads the same instant
+// whatever its own time zone, without losing the seconds.
+func remoteTimeArg(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
 }
 
 // ── collection profiles ───────────────────────────────────────────────────────
@@ -3418,11 +3433,13 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 			args = append(args, "--filter", f)
 		}
 	}
+	// RFC3339 with seconds and zone: trace_extractor honours the zone, and
+	// minute precision would cut up to 59 s off the end of the window.
 	if !from.IsZero() {
-		args = append(args, "--from", from.Format("2006-01-02T15:04"))
+		args = append(args, "--from", from.Format(time.RFC3339))
 	}
 	if !to.IsZero() {
-		args = append(args, "--to", to.Format("2006-01-02T15:04"))
+		args = append(args, "--to", to.Format(time.RFC3339))
 	}
 
 	tmpDir, err := os.MkdirTemp("", "wlc-traces-*")
@@ -3697,10 +3714,10 @@ func tracesEnabledForHost(host string) bool {
 func remoteNodeArgs(host string, from, to time.Time, containerNames []string) []string {
 	var extra []string
 	if !from.IsZero() {
-		extra = append(extra, "--start-time", from.Format("2006-01-02T15:04"))
+		extra = append(extra, "--start-time", remoteTimeArg(from))
 	}
 	if !to.IsZero() {
-		extra = append(extra, "--end-time", to.Format("2006-01-02T15:04"))
+		extra = append(extra, "--end-time", remoteTimeArg(to))
 	}
 	if verbose {
 		extra = append(extra, "--verbose")
@@ -6385,7 +6402,7 @@ func main() {
 	}
 
 	var (
-		startTimeStr       = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
+		startTimeStr       = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30, 2026-03-04T10:30:00Z)")
 		endTimeStr         = flag.String("end-time", "", "End of time window (default: now)")
 		profileStr         = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
 		outputPath         = flag.String("output", "", "Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<name>-weka-logs-<ts>.tar.gz). Use - for stdout.")
@@ -6584,7 +6601,12 @@ func main() {
 			if effectiveTo.IsZero() {
 				effectiveTo = time.Now()
 			}
-			if effectiveTo.Sub(from) > traceMaxWindow {
+			limit := traceMaxWindow
+			if *nodeOnly {
+				// The orchestrator already enforced the cap; allow for rounding.
+				limit += 2 * time.Minute
+			}
+			if effectiveTo.Sub(from) > limit {
 				traceSkipReason = fmt.Sprintf("time window is %.0f minutes (max: 60 minutes)", effectiveTo.Sub(from).Minutes())
 				warnf("--collect-traces skipped: time window is %.0f minutes (max: 60 minutes).",
 					effectiveTo.Sub(from).Minutes())
@@ -6630,6 +6652,13 @@ func main() {
 	defaultWindow := from.IsZero()
 	if defaultWindow {
 		from = time.Now().Add(-8 * time.Hour)
+	}
+	// Cluster mode: fix the end of the window once, here, so every host and
+	// the cluster-wide commands use the same bounds. Without this each remote
+	// node resolved "now" itself, minutes apart (and could then reject the
+	// trace window as too long).
+	if to.IsZero() && !*localOnly {
+		to = time.Now()
 	}
 
 	// ── build anonymizer (must happen before output path / archive root are
@@ -7652,8 +7681,9 @@ USAGE
   weka-log-collector k8s [options]      Weka-on-Kubernetes (run --help after k8s for flags)
 
 TIME
-  --start-time TIME  Relative: -2h, -30m, -1d  |  Absolute: 2026-03-04T10:30[:00]
-  --end-time   TIME  Default: now
+  --start-time TIME  Relative: -2h, -30m, -1d  |  Absolute local: 2026-03-04T10:30[:00]
+                     |  With zone: 2026-03-04T10:30:00Z, 2026-03-04T12:30:00+02:00
+  --end-time   TIME  Default: now (in cluster mode fixed once at start, for all hosts)
   Default window: last 8h. Pass --start-time -24h, -7d, etc. for longer windows.
 
 PROFILES  (--profile NAME)

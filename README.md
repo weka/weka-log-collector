@@ -95,8 +95,11 @@ Usage: weka-log-collector [flags]
 Flags:
   --local              Collect from local host only (no SSH, no cluster discovery)
   --profile            Collection profile: default|perf|nfs|s3|smbw|all  (default: default)
-  --start-time         Start of time window (e.g. -2h, -30m, -1d, 2026-03-20T14:00)
-  --end-time           End of time window (default: now)
+  --start-time         Start of time window (e.g. -2h, -30m, -1d, 2026-03-20T14:00 in local
+                       time, or with a zone: 2026-03-20T14:00:00Z, 2026-03-20T16:00:00+02:00)
+  --end-time           End of time window (default: now). In cluster mode the end is fixed
+                       once at start and sent to every node as UTC, so all hosts use the
+                       same window.
   --output             Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz). Use - for stdout.
   --host               Collect from this host by IP (repeatable; default: all cluster backends)
   --ssh-user           SSH username for connections to cluster nodes (default: current OS user)
