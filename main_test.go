@@ -399,6 +399,9 @@ func TestRunTraceExtractor_OK(t *testing.T) {
 	if !strings.Contains(log, "--verbose") || !strings.Contains(log, "42 shards") {
 		t.Errorf("extractor.log missing args or output:\n%s", log)
 	}
+	if !regexp.MustCompile(`(?m)^sha256: [0-9a-f]{64}$`).MatchString(log) {
+		t.Errorf("extractor.log missing the extractor's sha256:\n%s", log)
+	}
 }
 
 func TestRunTraceExtractor_NoShards(t *testing.T) {

@@ -13,6 +13,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -3604,6 +3606,9 @@ var (
 	traceFilters               []string // values from --trace-filter; empty → pass --all to trace_extractor
 	resolvedTraceExtractorPath string   // validated binary path, set after findTraceExtractor succeeds
 	traceTimeout               = defaultTraceTimeout
+	// traceExtractorSource is the extractor that was found; it differs from
+	// resolvedTraceExtractorPath when a non-executable file is run from a copy.
+	traceExtractorSource string
 	// traceSkipReason explains why --collect-traces was requested but will not
 	// run on this node; recorded in the host manifest so the skip is visible.
 	traceSkipReason string
@@ -3907,6 +3912,21 @@ func traceResultLine(r *TraceResult) string {
 	return line
 }
 
+// fileSHA256 returns the hex SHA-256 of a file, or "" if it cannot be read.
+// Recorded in extractor.log so a bundle shows exactly which build ran.
+func fileSHA256(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // lastNonEmptyLine returns the last non-blank line of s, for short error text.
 func lastNonEmptyLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
@@ -3991,8 +4011,14 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 		res.Shards, res.Histograms = 0, 0
 	}
 
-	logHeader := fmt.Sprintf("command: %s %s\nstarted: %s\nduration: %s\nexit: %s\n\n",
-		resolvedTraceExtractorPath, strings.Join(args, " "),
+	logHeader := fmt.Sprintf("command: %s %s\n", resolvedTraceExtractorPath, strings.Join(args, " "))
+	if traceExtractorSource != "" && traceExtractorSource != resolvedTraceExtractorPath {
+		logHeader += fmt.Sprintf("source: %s (run from a copy: not executable)\n", traceExtractorSource)
+	}
+	if sum := fileSHA256(resolvedTraceExtractorPath); sum != "" {
+		logHeader += "sha256: " + sum + "\n"
+	}
+	logHeader += fmt.Sprintf("started: %s\nduration: %s\nexit: %s\n\n",
 		start.UTC().Format(time.RFC3339), res.Duration, exitDesc)
 	logDest := filepath.Join(archiveRoot, "hosts", pathHostname, "traces", "extractor.log")
 	if err := addBytesToArchive(tw, logDest, append([]byte(logHeader), out...)); err != nil {
@@ -7241,6 +7267,10 @@ func main() {
 			}
 			defer cleanup()
 			interruptCleanup = append(interruptCleanup, cleanup)
+			traceExtractorSource = resolvedTraceExtractorPath
+			if p != resolvedTraceExtractorPath {
+				logf("Traces:   %s is not executable; running a copy (%s)", resolvedTraceExtractorPath, p)
+			}
 			resolvedTraceExtractorPath = p
 		}
 	}
