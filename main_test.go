@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1176,5 +1177,58 @@ func TestCopyExecutable_FailureLeavesNothing(t *testing.T) {
 	}
 	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0755 || filepath.Dir(p) != dir {
 		t.Errorf("copy %s mode %v", p, fi.Mode())
+	}
+}
+
+// fakeKubectl puts a kubectl script on PATH that sleeps, then prints "ok".
+func fakeKubectl(t *testing.T, sleepSecs int) {
+	t.Helper()
+	dir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\nsleep %d\necho ok\n", sleepSecs)
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestKubectlRunner_TimeoutIsDistinct(t *testing.T) {
+	fakeKubectl(t, 1)
+	kc := &kubectlRunner{timeout: 300 * time.Millisecond}
+	start := time.Now()
+	_, err := kc.execInPod("ns", "pod", "", "weka", "events")
+	if !errors.Is(err, errKubectlTimeout) {
+		t.Fatalf("want errKubectlTimeout, got %v", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("timeout not enforced: %s", d)
+	}
+	// A longer per-call timeout lets the same command finish.
+	out, err := kc.execInPodTimeout(10*time.Second, "ns", "pod", "", "weka", "events")
+	if err != nil || !strings.Contains(string(out), "ok") {
+		t.Errorf("execInPodTimeout: %q %v", out, err)
+	}
+}
+
+func TestK8sEventsCommandHasMinTimeout(t *testing.T) {
+	found := false
+	for _, spec := range clusterWideCLICommands {
+		if strings.Join(spec.cmd[:2], " ") == "weka events" {
+			found = true
+			if k8sCommandMinTimeout[spec.name] < eventsMinTimeout {
+				t.Errorf("%s: min timeout %s, want at least %s", spec.name, k8sCommandMinTimeout[spec.name], eventsMinTimeout)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no weka events command in clusterWideCLICommands")
+	}
+	for name := range k8sCommandMinTimeout {
+		ok := false
+		for _, spec := range clusterWideCLICommands {
+			ok = ok || spec.name == name
+		}
+		if !ok {
+			t.Errorf("k8sCommandMinTimeout names unknown command %s", name)
+		}
 	}
 }

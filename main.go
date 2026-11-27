@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -5603,7 +5604,16 @@ func sanitizeErrStr(s string) string {
 // run invokes kubectl (locally or via SSH jump host) with a timeout and returns
 // combined stdout+stderr. Non-zero exit returns an error containing the output.
 func (k *kubectlRunner) run(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	return k.runTimeout(k.timeout, args...)
+}
+
+// errKubectlTimeout is wrapped into the error of a kubectl call that hit its
+// deadline, so callers can tell a timeout from a command failure.
+var errKubectlTimeout = errors.New("kubectl timed out")
+
+// runTimeout is run with an explicit timeout instead of the runner default.
+func (k *kubectlRunner) runTimeout(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	kcArgs := k.buildKubectlArgs(args)
@@ -5622,8 +5632,14 @@ func (k *kubectlRunner) run(args ...string) ([]byte, error) {
 		cmd = exec.CommandContext(ctx, "kubectl", kcArgs...)
 	}
 
+	// A killed kubectl (or ssh to the jump host) can leave a child holding
+	// the output pipe; do not wait for it past the deadline.
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return out, fmt.Errorf("kubectl %s: %w after %s", args[0], errKubectlTimeout, timeout)
+		}
 		return out, fmt.Errorf("kubectl %s: %w: %s", args[0], err, sanitizeErrStr(string(out)))
 	}
 	return out, nil
@@ -5665,13 +5681,18 @@ func (k *kubectlRunner) runExternal(binary string, args ...string) ([]byte, erro
 // execInPod runs a command inside a pod via kubectl exec.
 // container may be "" to use the pod's default container.
 func (k *kubectlRunner) execInPod(ns, pod, container string, cmd ...string) ([]byte, error) {
+	return k.execInPodTimeout(k.timeout, ns, pod, container, cmd...)
+}
+
+// execInPodTimeout is execInPod with an explicit timeout.
+func (k *kubectlRunner) execInPodTimeout(timeout time.Duration, ns, pod, container string, cmd ...string) ([]byte, error) {
 	args := []string{"exec", pod, "-n", ns}
 	if container != "" {
 		args = append(args, "-c", container)
 	}
 	args = append(args, "--")
 	args = append(args, cmd...)
-	return k.run(args...)
+	return k.runTimeout(timeout, args...)
 }
 
 // podLogs fetches logs for a pod. When container is "", collects all containers
@@ -6134,6 +6155,15 @@ func collectK8sTroubledPods(tw *tar.Writer, kc *kubectlRunner, root, ns string, 
 	}
 }
 
+// k8sCommandMinTimeout raises the per-command timeout (--cmd-timeout, default
+// 60s) for slow cluster-wide commands. weka events with a large --num-results
+// pages through all results and prints nothing until done, so a timeout loses
+// every event. A command listed here is also not retried on other pods after a
+// timeout: the query is cluster-wide, so another pod is not faster.
+var k8sCommandMinTimeout = map[string]time.Duration{
+	"weka_events_major.txt": eventsMinTimeout,
+}
+
 // clusterWideCLICommands are run once per cluster from the first responsive
 // compute pod. Output is identical on every pod so there is no value running
 // them per-pod — doing so only inflates the failure count on non-compute pods.
@@ -6306,18 +6336,27 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 	// Cluster-wide CLI: run once from the first responsive compute pod.
 	// weka status / weka alerts return the same output on every pod.
 	for _, spec := range clusterWideCLICommands {
+		timeout := kc.timeout
+		minTimeout, slow := k8sCommandMinTimeout[spec.name]
+		if minTimeout > timeout {
+			timeout = minTimeout
+		}
 		for _, pod := range pods {
 			if !isWekaContainerPod(pod) {
 				continue
 			}
 			m.TotalCommands++
-			out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
+			out, err := kc.execInPodTimeout(timeout, clusterNS, pod, "", spec.cmd...)
 			if err != nil {
 				m.FailedCommands++
 				errStr := err.Error()
 				if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot get resource") || strings.Contains(errStr, "cannot list resource") {
 					warnf("k8s: %s: RBAC permission denied — skipping (grant exec access in a ClusterRole/RoleBinding)", spec.name)
 					break // RBAC denial is cluster-wide; retrying other pods will not help
+				}
+				if slow && errors.Is(err, errKubectlTimeout) {
+					warnf("k8s: %s timed out after %s on %s; not retrying on other pods (cluster-wide query)", spec.name, timeout, pod)
+					break
 				}
 				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
 				continue
