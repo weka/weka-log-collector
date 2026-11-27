@@ -1106,3 +1106,75 @@ func TestParseExtractorOutput_ShardVsHistogramParseFailures(t *testing.T) {
 		t.Errorf("seen=%d unparsed=%d total=%d", seen, unparsed, r.UnparsedFiles)
 	}
 }
+
+func TestRedactAssignments_FinalCheckCases(t *testing.T) {
+	// Separator-only "values" in compact JSON / argv arrays stay structure.
+	for _, in := range []string{
+		`["foo token=","-v"]`,
+		`["sh","-c","export TOKEN=","--x"]`,
+		`["export TOKEN=",""]`,
+		`{"Env":["A=1 SECRET_TOKEN=","/opt/bin"]}`,
+		`{"a":"x?token=","/b":1}`,
+		`{\"args\":[\"export TOKEN=\",\"-v\"]}`,
+		`{"a":"x?token=", "next": 1}`,
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("structure changed:\ninput: %s\ngot:   %s", in, got)
+		}
+	}
+	// Escaped quotes inside a double-quoted value are part of the value.
+	for in, want := range map[string]string{
+		`export PGPASSWORD="pa\"ss1" && psql`: `export PGPASSWORD=[REDACTED] && psql`,
+		`PASSWORD="ab\"cd"`:                   `PASSWORD=[REDACTED]`,
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %s\nwant %s", got, want)
+		}
+	}
+}
+
+func TestRedactSensitive_CLIShortValuelessFlags(t *testing.T) {
+	for in, want := range map[string]string{
+		"weka smb domain leave -f Administrator '" + fakePW + "'": "weka smb domain leave -f Administrator [REDACTED]",
+		"weka smb domain leave Administrator -f '" + fakePW + "'": "weka smb domain leave Administrator -f [REDACTED]",
+		"weka user login -U admin " + fakePW:                      "weka user login -U admin [REDACTED]",
+		"weka user add -R bob clusteradmin " + fakePW:             "weka user add -R bob clusteradmin [REDACTED]",
+		"weka user login --without-agent admin " + fakePW:         "weka user login --without-agent admin [REDACTED]",
+		"weka user login --UTC admin " + fakePW:                   "weka user login --UTC admin [REDACTED]",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %q\nwant %q", got, want)
+		}
+	}
+}
+
+func TestRemoteErrorSummary(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"plan\n[ERROR] Not enough free space on /opt/weka: only 150 MB available\n[ERROR] Tip: use --output /path\n[ERROR]      Or free up space on /opt/weka first.\n",
+			"Not enough free space on /opt/weka: only 150 MB available"},
+		{"[ERROR] Tip: use --output to write to a different location\n", "Tip: use --output to write to a different location"},
+		{"log\npanic: runtime error: index out of range\n\ngoroutine 1 [running]:\nmain.main()\n\t/build/main.go:7011 +0x1c4\n", "panic: runtime error: index out of range"},
+		{"a\nlast\n", "last"},
+	}
+	for _, c := range cases {
+		if got := remoteErrorSummary(c.in); got != c.want {
+			t.Errorf("got %q, want %q", got, c.want)
+		}
+	}
+}
+
+func TestCopyExecutable_FailureLeavesNothing(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "te")
+	_ = os.WriteFile(src, []byte("#!/bin/sh\n"), 0644)
+	if _, err := copyExecutable(src, filepath.Join(t.TempDir(), "missing-dir")); err == nil {
+		t.Errorf("expected an error for a missing directory")
+	}
+	dir := t.TempDir()
+	p, err := copyExecutable(src, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0755 || filepath.Dir(p) != dir {
+		t.Errorf("copy %s mode %v", p, fi.Mode())
+	}
+}

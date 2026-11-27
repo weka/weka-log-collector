@@ -183,7 +183,7 @@ var (
 	//     drops matches that would cross a string boundary.
 	assignmentRe = regexp.MustCompile(
 		`(?i)[A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|secret[-_]?id|token|authtok|api[-_]?key|access[-_]?key|private[-_]?key|signing[-_]?key|credentials?|_pass|_pwd|pgpass)(?:=|[ \t]+=[ \t]*)` +
-			`(\\"[^"\\\n]+\\"|"[^"\n]+"|'[^'\n]+'|` + bareValue + `)`)
+			`(\\"[^"\\\n]+\\"|"(?:[^"\\\n]|\\.)+"|'[^'\n]+'|` + bareValue + `)`)
 	// [5] HashiCorp Vault tokens (service, batch, recovery) by shape.
 	vaultTokenRe = regexp.MustCompile(
 		`\bhv[sbr]\.[A-Za-z0-9_-]{20,}`)
@@ -192,10 +192,11 @@ var (
 )
 
 // Building blocks for wekaCLIPasswordRe: zero or more options (the weka CLI's
-// valueless flags first, then options that take a value) and one positional
+// valueless flags first, as defined in the CLI's common parameters plus
+// --debug/--no-restart, then options that take a value) and one positional
 // (non-option) argument. Same-line only.
 const (
-	cliOpts       = `(?:[ \t]+(?:--(?:debug|force|json|no-restart|help|verbose|raw-units|no-header)|-[Jv])\b|[ \t]+--?[A-Za-z][\w-]*(?:=\S*|[ \t]+[^\s-]\S*))*`
+	cliOpts       = `(?:[ \t]+(?:--(?:debug|force|json|no-restart|help|verbose|raw-units|utc|no-header|confirmation|without-agent)|-[hJRUfv])\b|[ \t]+--?[A-Za-z][\w-]*(?:=\S*|[ \t]+[^\s-]\S*))*`
 	cliPositional = `[ \t]+[^\s-]\S*`
 )
 
@@ -296,20 +297,16 @@ func skipAssignmentValue(b []byte, nameStart, vs, ve int) bool {
 	default:
 		return false
 	}
-	// The name sits inside a string quoted the same way, so this "value"
-	// starts with that string's closing quote.
+	// The name sits right after a quote of the same kind, so this "value"
+	// starts with the closing quote of the string the name is in.
 	if nameStart >= len(quote) && bytes.Equal(b[nameStart-len(quote):nameStart], quote) {
 		return true
 	}
-	// A real quoted value is not followed directly by a word character; the
-	// tail of an enclosing string ("," then the next key) is.
-	if ve < len(b) {
-		c := b[ve]
-		if c == '_' || ('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') {
-			return true
-		}
-	}
-	return false
+	// A "value" that is only punctuation (",", ", ", "]," ...) is the end of
+	// one string and the start of the next (["export TOKEN=","-v"]), never a
+	// secret. Anything else in quotes is redacted.
+	inner := v[len(quote) : len(v)-len(quote)]
+	return len(bytes.Trim(inner, " \t,:;[]{}()")) == 0
 }
 
 // redactSensitiveValues applies value-shape redaction that the key-name passes
@@ -3580,15 +3577,37 @@ func remoteFailure(exitCode int, stderr string) error {
 	if exitCode == 255 {
 		return fmt.Errorf("SSH failed (exit 255): %s", lastNonEmptyLine(stderr))
 	}
-	msg := lastNonEmptyLine(stderr)
-	lines := strings.Split(stderr, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if l := strings.TrimSpace(lines[i]); strings.HasPrefix(l, "[ERROR]") {
-			msg = strings.TrimSpace(strings.TrimPrefix(l, "[ERROR]"))
-			break
+	return fmt.Errorf("remote run failed (exit %d): %s", exitCode, remoteErrorSummary(stderr))
+}
+
+// remoteErrorSummary picks the line that names the cause in a node's stderr:
+// the first [ERROR] line that is not a "Tip:" or an indented continuation,
+// else a Go panic line, else the last line.
+func remoteErrorSummary(stderr string) string {
+	var firstErr string
+	for _, raw := range strings.Split(stderr, "\n") {
+		if !strings.HasPrefix(raw, "[ERROR]") {
+			continue
+		}
+		rest := strings.TrimPrefix(raw, "[ERROR]")
+		msg := strings.TrimSpace(rest)
+		if firstErr == "" {
+			firstErr = msg
+		}
+		// errorf writes "[ERROR] msg"; continuation lines are indented further.
+		if msg != "" && !strings.HasPrefix(msg, "Tip:") && !strings.HasPrefix(rest, "  ") {
+			return msg
 		}
 	}
-	return fmt.Errorf("remote run failed (exit %d): %s", exitCode, msg)
+	if firstErr != "" {
+		return firstErr
+	}
+	for _, raw := range strings.Split(stderr, "\n") {
+		if l := strings.TrimSpace(raw); strings.HasPrefix(l, "panic:") {
+			return l
+		}
+	}
+	return lastNonEmptyLine(stderr)
 }
 
 // activeRemoteHosts tracks hosts currently being collected/uploaded via SSH.
@@ -3764,40 +3783,50 @@ func executableTraceExtractor(path string) (string, func(), error) {
 	if fi.Mode()&0111 != 0 {
 		return path, noop, nil
 	}
-	src, err := os.Open(path)
-	if err != nil {
-		return "", noop, err
-	}
-	defer src.Close()
 	// Prefer wlcBaseDir (outside any git checkout, on /opt, which is not
-	// mounted noexec the way a hardened /tmp can be), then the temp dir.
-	dir := ""
+	// mounted noexec the way a hardened /tmp can be), then the temp dir, so
+	// a full /opt still works.
+	var dirs []string
 	if fi, err := os.Stat(wlcBaseDir); err == nil && fi.IsDir() {
-		dir = wlcBaseDir
+		dirs = append(dirs, wlcBaseDir)
 	}
-	dst, err := os.CreateTemp(dir, "wlc-trace_extractor-*")
-	if err != nil && dir != "" {
-		dst, err = os.CreateTemp("", "wlc-trace_extractor-*")
+	dirs = append(dirs, "")
+	var lastErr error
+	for _, dir := range dirs {
+		p, err := copyExecutable(path, dir)
+		if err == nil {
+			return p, func() { os.Remove(p) }, nil
+		}
+		lastErr = err
 	}
+	return "", noop, lastErr
+}
+
+// copyExecutable copies src into a new 0755 file in dir ("" = temp dir) and
+// returns its path; on any error nothing is left behind.
+func copyExecutable(src, dir string) (string, error) {
+	in, err := os.Open(src)
 	if err != nil {
-		return "", noop, err
+		return "", err
+	}
+	defer in.Close()
+	dst, err := os.CreateTemp(dir, "wlc-trace_extractor-*")
+	if err != nil {
+		return "", err
 	}
 	name := dst.Name()
-	cleanup := func() { os.Remove(name) }
-	if _, err := io.Copy(dst, src); err != nil {
-		dst.Close()
-		cleanup()
-		return "", noop, err
+	_, err = io.Copy(dst, in)
+	if cerr := dst.Close(); err == nil {
+		err = cerr
 	}
-	if err := dst.Close(); err != nil {
-		cleanup()
-		return "", noop, err
+	if err == nil {
+		err = os.Chmod(name, 0755)
 	}
-	if err := os.Chmod(dst.Name(), 0755); err != nil {
-		cleanup()
-		return "", noop, err
+	if err != nil {
+		os.Remove(name)
+		return "", err
 	}
-	return dst.Name(), cleanup, nil
+	return name, nil
 }
 
 // findTraceExtractor locates the trace_extractor binary. Discovery order:
@@ -4407,7 +4436,7 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 			if exitCode == 124 {
 				result.Err = fmt.Errorf("timed out after %s — collection took too long", sshTimeout)
 			} else if exitCode == 137 {
-				result.Err = fmt.Errorf("process killed (OOM) on remote host — try --start-time to reduce collection size: %s", errMsg)
+				result.Err = fmt.Errorf("process killed (OOM) on remote host — try --start-time to reduce collection size: %s", remoteErrorSummary(errMsg))
 			} else {
 				result.Err = remoteFailure(exitCode, errMsg)
 			}
@@ -7270,6 +7299,18 @@ func main() {
 			traceExtractorSource = resolvedTraceExtractorPath
 			if p != resolvedTraceExtractorPath {
 				logf("Traces:   %s is not executable; running a copy (%s)", resolvedTraceExtractorPath, p)
+				if *localOnly {
+					// Cluster mode has its own Ctrl-C handler that runs
+					// interruptCleanup; a --local run has none.
+					localSig := make(chan os.Signal, 1)
+					signal.Notify(localSig, os.Interrupt, syscall.SIGTERM)
+					go func() {
+						<-localSig
+						cleanup()
+						releaseRunLock()
+						os.Exit(1)
+					}()
+				}
 			}
 			resolvedTraceExtractorPath = p
 		}
@@ -7871,8 +7912,12 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 				return fmt.Errorf("timed out after %s — collection/upload took too long", sshTimeout)
 			}
 			if exitCode == 137 {
-				return fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", errMsg)
+				vlogf("[%s] remote output:\n%s", host, errMsg)
+				return fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", remoteErrorSummary(errMsg))
 			}
+			// The full node output goes to the debug log (and --verbose); the
+			// returned error keeps only the cause.
+			vlogf("[%s] remote output:\n%s", host, errMsg)
 			return remoteFailure(exitCode, errMsg)
 		}
 		return fmt.Errorf("SSH error: %v", err)
