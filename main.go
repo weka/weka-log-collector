@@ -476,7 +476,7 @@ func redactSensitive(b []byte) []byte {
 		b = redactSensitiveJSON(b)
 	}
 	lower := asciiLower(b)
-	out := make([]byte, 0, len(b)+64)
+	out := make([]byte, 0, len(b)) // grows by append when a line gets longer
 	start := 0
 	for {
 		end := bytes.IndexByte(b[start:], '\n')
