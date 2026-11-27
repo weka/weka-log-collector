@@ -1293,9 +1293,16 @@ func runClusterWideWithFakeKubectl(t *testing.T, script string, pods []string) (
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	old := k8sCommandMinTimeout["weka_events_major.txt"]
-	k8sCommandMinTimeout["weka_events_major.txt"] = time.Second
-	defer func() { k8sCommandMinTimeout["weka_events_major.txt"] = old }()
+	saved := map[string]time.Duration{}
+	for name, d := range k8sCommandMinTimeout {
+		saved[name] = d
+		k8sCommandMinTimeout[name] = time.Second
+	}
+	defer func() {
+		for name, d := range saved {
+			k8sCommandMinTimeout[name] = d
+		}
+	}()
 
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -1318,7 +1325,7 @@ func TestK8sClusterWide_HungFirstPodStillGetsEvents(t *testing.T) {
 	// c-compute-0 never answers; c-compute-1 answers everything.
 	script := "case \"$2\" in c-compute-0) exec sleep 30;; esac\necho ok\n"
 	files, _ := runClusterWideWithFakeKubectl(t, script, []string{"c-compute-0", "c-compute-1"})
-	for _, f := range []string{"root/weka-commands/weka_status.txt", "root/weka-commands/weka_events_major.txt"} {
+	for _, f := range []string{"root/weka-commands/weka_status.txt", "root/weka-commands/weka_events_major.txt", "root/weka-commands/weka_events_warning.txt"} {
 		if !files[f] {
 			t.Errorf("%s missing; got %v", f, files)
 		}
@@ -1333,10 +1340,42 @@ func TestK8sClusterWide_SlowEventsNotRetriedOnOtherPods(t *testing.T) {
 	if files["root/weka-commands/weka_events_major.txt"] {
 		t.Errorf("events should have timed out")
 	}
-	if n := strings.Count(calls, "events"); n != 1 {
-		t.Errorf("slow events query ran %d times, want 1 (no per-pod retry):\n%s", n, calls)
+	// One call per events command (major, warning), never repeated on other pods.
+	if n, want := strings.Count(calls, "events"), len(k8sCommandMinTimeout); n != want {
+		t.Errorf("slow events queries ran %d times, want %d (no per-pod retry):\n%s", n, want, calls)
 	}
 	if d := time.Since(start); d > 20*time.Second {
 		t.Errorf("took %s", d)
+	}
+}
+
+func TestWindowIsEmpty(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		from, to time.Time
+		want     bool
+	}{
+		{now.Add(time.Hour), time.Time{}, true},              // --local, future start, no end
+		{now.Add(time.Hour), now, true},                      // cluster mode, end fixed at now
+		{now.Add(-time.Hour), time.Time{}, false},            // normal --local
+		{now.Add(-time.Hour), now.Add(-2 * time.Hour), true}, // end before start
+		{time.Time{}, time.Time{}, false},
+	}
+	for i, c := range cases {
+		if got := windowIsEmpty(c.from, c.to, now); got != c.want {
+			t.Errorf("case %d: got %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+func TestK8sHasBothEventsFiles(t *testing.T) {
+	names := map[string]bool{}
+	for _, spec := range clusterWideCLICommands {
+		names[spec.name] = true
+	}
+	for _, n := range []string{"weka_events_major.txt", "weka_events_warning.txt"} {
+		if !names[n] {
+			t.Errorf("k8s clusterWideCLICommands lacks %s", n)
+		}
 	}
 }

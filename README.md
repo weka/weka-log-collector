@@ -444,7 +444,7 @@ The tool automatically discovers Weka namespaces by querying the `wekacluster` C
   identity & status (`weka status`, `weka status rebuild`, `weka alerts`, `weka version`, `weka version current`, `weka user`),
   cluster topology (`weka cluster servers list`, `weka cluster container -v`, `weka cluster container net`, `weka cluster process -v`, `weka cluster drive -v`, `weka cluster bucket -v`, `weka cluster failure-domain`, `weka cluster task`),
   filesystems (`weka fs -v`, `weka fs group`, `weka fs snapshot -v`, `weka fs tier s3 -v`),
-  events (`weka events --severity major --start-time -8h --num-results 100000`, with at least a 5 minute timeout),
+  events (`weka events --severity major|warning --start-time -8h --num-results 100000`, with at least a 5 minute timeout),
   security (`weka security kms`),
   debug (`weka debug traces status`, `weka debug override list`, `weka debug net links`, `weka debug blacklist list`, `weka debug buckets dist`)
 - **Per-pod weka local commands** (stored under each pod's `weka-local-commands/`):

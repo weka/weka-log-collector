@@ -1500,6 +1500,18 @@ func oneLine(s string, max int) string {
 	return s
 }
 
+// windowIsEmpty reports whether the collection window [from, to] ends before
+// it starts; a zero to means now.
+func windowIsEmpty(from, to, now time.Time) bool {
+	if from.IsZero() {
+		return false
+	}
+	if to.IsZero() {
+		to = now
+	}
+	return to.Before(from)
+}
+
 // remoteTimeArg formats a window bound for a remote --start-time/--end-time:
 // UTC RFC3339 with seconds, so the remote host reads the same instant
 // whatever its own time zone, without losing the seconds.
@@ -6300,7 +6312,8 @@ func podsPreferring(pods []string, first string) []string {
 // every event. A command listed here is also not retried on other pods after a
 // timeout: the query is cluster-wide, so another pod is not faster.
 var k8sCommandMinTimeout = map[string]time.Duration{
-	"weka_events_major.txt": eventsMinTimeout,
+	"weka_events_major.txt":   eventsMinTimeout,
+	"weka_events_warning.txt": eventsMinTimeout,
 }
 
 // clusterWideCLICommands are run once per cluster from the first responsive
@@ -6333,6 +6346,7 @@ var clusterWideCLICommands = []struct {
 	{"weka_fs_tier_s3.txt", []string{"weka", "fs", "tier", "s3", "-v"}},
 	// events (last 8 hours)
 	{"weka_events_major.txt", []string{"weka", "events", "--severity", "major", "--start-time", "-8h", "--num-results", eventsMaxResults}},
+	{"weka_events_warning.txt", []string{"weka", "events", "--severity", "warning", "--start-time", "-8h", "--num-results", eventsMaxResults}},
 	// security
 	{"weka_security_kms.txt", []string{"weka", "security", "kms"}},
 	// debug
@@ -7485,10 +7499,15 @@ func main() {
 	if to.IsZero() && !*localOnly {
 		to = time.Now()
 	}
-	// A --start-time in the future leaves an empty window. Stop here instead
-	// of deploying to every host only to have each one reject it.
-	if !to.IsZero() && to.Before(from) {
-		errorf("The time window is empty: start %s is after end %s.", from.Format(time.RFC3339), to.Format(time.RFC3339))
+	// A --start-time in the future leaves an empty window, in every mode (a
+	// --local run has no end set yet; its end is "now"). Stop here instead of
+	// collecting nothing or deploying to every host only to have each reject it.
+	if windowIsEmpty(from, to, time.Now()) {
+		end := to
+		if end.IsZero() {
+			end = time.Now()
+		}
+		errorf("The time window is empty: start %s is after end %s.", from.Format(time.RFC3339), end.Format(time.RFC3339))
 		errorf("Times without a zone are read in this host's local time zone (%s); use e.g. 2026-03-04T10:30:00Z for UTC.", from.Format("MST"))
 		exitCode = 1
 		return
