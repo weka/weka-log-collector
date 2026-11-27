@@ -1042,8 +1042,7 @@ func TestRedactSensitive_CLIValuelessFlagsAndCase(t *testing.T) {
 // refRedactAll is redactSensitive without any prefilter: every pass on every
 // line. The fast path must give byte-identical output.
 func refRedactAll(b []byte) []byte {
-	trimmed := bytes.TrimLeft(b, " \t\r\n")
-	isJSON := len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+	isJSON := isJSONDocument(b)
 	if isJSON {
 		b = redactSensitiveJSON(b)
 	}
@@ -1051,7 +1050,7 @@ func refRedactAll(b []byte) []byte {
 	for i, line := range lines {
 		lines[i] = redactLine(line, nil, isJSON, false)
 	}
-	return bytes.Join(lines, []byte("\n"))
+	return redactSplitFlagValues(bytes.Join(lines, []byte("\n")))
 }
 
 func TestRedactSensitive_PrefilterEquivalence(t *testing.T) {
@@ -1230,5 +1229,114 @@ func TestK8sEventsCommandHasMinTimeout(t *testing.T) {
 		if !ok {
 			t.Errorf("k8sCommandMinTimeout names unknown command %s", name)
 		}
+	}
+}
+
+func TestRedactSplitFlagValues_DescribeArgs(t *testing.T) {
+	in := "    Args:\n      --log-level\n      debug\n      --api-token\n      " + fakeBearer + "\n      --join-secret\n      --next-flag\n    Ready: True\n"
+	want := "    Args:\n      --log-level\n      debug\n      --api-token\n      [REDACTED]\n      --join-secret\n      --next-flag\n    Ready: True\n"
+	if got := string(redactSensitive([]byte(in))); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+	if got := string(redactSensitive([]byte("--password\n"))); got != "--password\n" {
+		t.Errorf("flag with nothing after it changed: %q", got)
+	}
+}
+
+func TestRedactSensitive_PrefixedPodLogsGetKeyPass(t *testing.T) {
+	in := "[pod/cl-compute-1/weka-container] 2026-11-27 10:00:01 setup password: " + fakePW + "\n[pod/cl-compute-1/weka-container] ok\n"
+	got := string(redactSensitive([]byte(in)))
+	if strings.Contains(got, fakePW) {
+		t.Errorf("prefixed pod log line not redacted:\n%s", got)
+	}
+	if isJSONDocument([]byte(in)) || isJSONDocument([]byte("[    0.000000] Linux version")) {
+		t.Errorf("log text classified as a JSON document")
+	}
+	if !isJSONDocument([]byte(` {"a": 1, "join_secret": ["x"]}`)) || !isJSONDocument([]byte("[\n {\"a\": 1}\n]\n")) {
+		t.Errorf("real JSON not classified as a JSON document")
+	}
+}
+
+func TestRedactSensitive_NoDoubleRedaction(t *testing.T) {
+	for in, want := range map[string]string{
+		"weka agent --token=" + fakeSRT:      "weka agent --token=[REDACTED]",
+		"proc --join-secret=" + fakeBearer:   "proc --join-secret=[REDACTED]",
+		"x --password=" + fakePW + " --next": "x --password=[REDACTED] --next",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+}
+
+func TestPodsPreferring(t *testing.T) {
+	pods := []string{"a", "b", "c"}
+	if got := strings.Join(podsPreferring(pods, "b"), ","); got != "b,a,c" {
+		t.Errorf("got %s", got)
+	}
+	if got := strings.Join(podsPreferring(pods, ""), ","); got != "a,b,c" {
+		t.Errorf("got %s", got)
+	}
+	if got := strings.Join(podsPreferring(pods, "zz"), ","); got != "a,b,c" {
+		t.Errorf("got %s", got)
+	}
+}
+
+// runClusterWideWithFakeKubectl runs runK8sClusterWideCommands against a fake
+// kubectl script and returns the archived command files and the call log.
+func runClusterWideWithFakeKubectl(t *testing.T, script string, pods []string) (map[string]bool, string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	full := "#!/bin/sh\necho \"$*\" >> " + logPath + "\n" + script
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(full), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	old := k8sCommandMinTimeout["weka_events_major.txt"]
+	k8sCommandMinTimeout["weka_events_major.txt"] = time.Second
+	defer func() { k8sCommandMinTimeout["weka_events_major.txt"] = old }()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	runK8sClusterWideCommands(tw, &kubectlRunner{timeout: 300 * time.Millisecond}, "root", "ns", pods, &k8sManifest{})
+	tw.Close()
+	files := map[string]bool{}
+	tr := tar.NewReader(&buf)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		files[hdr.Name] = true
+	}
+	calls, _ := os.ReadFile(logPath)
+	return files, string(calls)
+}
+
+func TestK8sClusterWide_HungFirstPodStillGetsEvents(t *testing.T) {
+	// c-compute-0 never answers; c-compute-1 answers everything.
+	script := "case \"$2\" in c-compute-0) exec sleep 30;; esac\necho ok\n"
+	files, _ := runClusterWideWithFakeKubectl(t, script, []string{"c-compute-0", "c-compute-1"})
+	for _, f := range []string{"root/weka-commands/weka_status.txt", "root/weka-commands/weka_events_major.txt"} {
+		if !files[f] {
+			t.Errorf("%s missing; got %v", f, files)
+		}
+	}
+}
+
+func TestK8sClusterWide_SlowEventsNotRetriedOnOtherPods(t *testing.T) {
+	// Every pod answers quickly, but weka events itself is slow.
+	script := "case \"$*\" in *events*) exec sleep 30;; esac\necho ok\n"
+	start := time.Now()
+	files, calls := runClusterWideWithFakeKubectl(t, script, []string{"c-compute-0", "c-compute-1", "c-compute-2"})
+	if files["root/weka-commands/weka_events_major.txt"] {
+		t.Errorf("events should have timed out")
+	}
+	if n := strings.Count(calls, "events"); n != 1 {
+		t.Errorf("slow events query ran %d times, want 1 (no per-pod retry):\n%s", n, calls)
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Errorf("took %s", d)
 	}
 }

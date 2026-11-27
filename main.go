@@ -289,6 +289,10 @@ func skipAssignmentValue(b []byte, nameStart, vs, ve int) bool {
 		return true
 	}
 	v := b[vs:ve]
+	// Already redacted by an earlier pass (--token=[REDACTED]).
+	if bytes.HasPrefix(v, []byte("[REDACTED")) {
+		return true
+	}
 	var quote []byte
 	switch {
 	case v[0] == '"' || v[0] == '\'':
@@ -464,6 +468,14 @@ func redactLine(line, lower []byte, isJSONDoc, filtered bool) []byte {
 	return line
 }
 
+// isJSONDocument reports whether b is one JSON document. Starting with { or [
+// is not enough: kubectl logs --prefix lines start with "[pod/...]" and dmesg
+// lines with "[   12.3]", and those must get the line-based key pass.
+func isJSONDocument(b []byte) bool {
+	trimmed := bytes.TrimLeft(b, " \t\r\n")
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') && json.Valid(trimmed)
+}
+
 // redactSensitive redacts credentials in collected text. A JSON document
 // (starts with { or [ after whitespace) first gets the whole-document JSON
 // pass, which also handles multi-line arrays. Then every line that contains a
@@ -471,8 +483,7 @@ func redactLine(line, lower []byte, isJSONDoc, filtered bool) []byte {
 // keeps this fast on large logs. Safe to call on arbitrary command output —
 // content without sensitive keys is returned unchanged.
 func redactSensitive(b []byte) []byte {
-	trimmed := bytes.TrimLeft(b, " \t\r\n")
-	isJSONDoc := len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+	isJSONDoc := isJSONDocument(b)
 	if isJSONDoc {
 		b = redactSensitiveJSON(b)
 	}
@@ -500,7 +511,77 @@ func redactSensitive(b []byte) []byte {
 		out = append(out, '\n')
 		start = end + 1
 	}
-	return out
+	return redactSplitFlagValues(out)
+}
+
+// bareCredentialFlagRe is a credential-named flag token with no value.
+var bareCredentialFlagRe = regexp.MustCompile(
+	`(?i)^--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*$`)
+
+// redactSplitFlagValues handles argv printed one element per line, as in
+// kubectl describe Args/Command: a line whose last token is a credential flag
+// without a value ("--api-token") has the first token of the next line
+// redacted, unless that token is another option. All other patterns stay on
+// one line.
+func redactSplitFlagValues(b []byte) []byte {
+	if !bytes.Contains(b, []byte("--")) {
+		return b
+	}
+	var out []byte
+	last, start := 0, 0 // b[last:] not yet copied to out
+	prevFlag := false
+	for {
+		end := bytes.IndexByte(b[start:], '\n')
+		if end < 0 {
+			end = len(b)
+		} else {
+			end += start
+		}
+		line := b[start:end]
+		if prevFlag {
+			if red, ok := redactFirstToken(line); ok {
+				out = append(out, b[last:start]...)
+				out = append(out, red...)
+				last = end
+			}
+		}
+		prevFlag = endsWithBareCredentialFlag(line)
+		if end == len(b) {
+			break
+		}
+		start = end + 1
+	}
+	if out == nil {
+		return b
+	}
+	return append(out, b[last:]...)
+}
+
+func endsWithBareCredentialFlag(line []byte) bool {
+	t := bytes.TrimRight(line, " \t\r")
+	tok := t[bytes.LastIndexAny(t, " \t")+1:]
+	return len(tok) > 2 && tok[0] == '-' && tok[1] == '-' && bareCredentialFlagRe.Match(tok)
+}
+
+// redactFirstToken replaces the first word of line with [REDACTED] unless it
+// is empty, an option (-x/--x) or already redacted.
+func redactFirstToken(line []byte) ([]byte, bool) {
+	i := 0
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	if i == len(line) || line[i] == '-' || line[i] == '\r' || bytes.HasPrefix(line[i:], []byte("[REDACTED]")) {
+		return line, false
+	}
+	j := i
+	for j < len(line) && !bytes.ContainsRune([]byte(" \t\r\"',;"), rune(line[j])) {
+		j++
+	}
+	if j == i {
+		return line, false
+	}
+	out := append(append(append([]byte{}, line[:i]...), "[REDACTED]"...), line[j:]...)
+	return out, true
 }
 
 // ─── anonymizer ──────────────────────────────────────────────────────────────
@@ -6155,6 +6236,64 @@ func collectK8sTroubledPods(tw *tar.Writer, kc *kubectlRunner, root, ns string, 
 	}
 }
 
+// runK8sClusterWideCommands runs clusterWideCLICommands once each, on the
+// first weka container pod that answers, and adds the output under
+// weka-commands/.
+func runK8sClusterWideCommands(tw *tar.Writer, kc *kubectlRunner, root, clusterNS string, pods []string, m *k8sManifest) {
+	// lastGood is the pod that last answered a cluster-wide command. Each
+	// command tries it first, so one hung pod costs a timeout once, not per
+	// command; a slow command is only given up after a timeout on a pod that
+	// has already answered (then the query itself is slow, not the pod).
+	lastGood := ""
+	for _, spec := range clusterWideCLICommands {
+		timeout := kc.timeout
+		minTimeout, slow := k8sCommandMinTimeout[spec.name]
+		if minTimeout > timeout {
+			timeout = minTimeout
+		}
+		for _, pod := range podsPreferring(pods, lastGood) {
+			if !isWekaContainerPod(pod) {
+				continue
+			}
+			m.TotalCommands++
+			out, err := kc.execInPodTimeout(timeout, clusterNS, pod, "", spec.cmd...)
+			if err != nil {
+				m.FailedCommands++
+				errStr := err.Error()
+				if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot get resource") || strings.Contains(errStr, "cannot list resource") {
+					warnf("k8s: %s: RBAC permission denied — skipping (grant exec access in a ClusterRole/RoleBinding)", spec.name)
+					break // RBAC denial is cluster-wide; retrying other pods will not help
+				}
+				if slow && pod == lastGood && errors.Is(err, errKubectlTimeout) {
+					warnf("k8s: %s timed out after %s on %s, which answered earlier commands; not retrying on other pods (cluster-wide query)", spec.name, timeout, pod)
+					break
+				}
+				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
+				continue
+			}
+			_ = addBytesToArchive(tw, root+"/weka-commands/"+spec.name, out)
+			lastGood = pod
+			break // success — no need to try other pods
+		}
+	}
+}
+
+// podsPreferring returns pods with first moved to the front (if present).
+func podsPreferring(pods []string, first string) []string {
+	if first == "" {
+		return pods
+	}
+	out := make([]string, 0, len(pods))
+	for _, p := range pods {
+		if p == first {
+			out = append([]string{p}, out...)
+		} else {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // k8sCommandMinTimeout raises the per-command timeout (--cmd-timeout, default
 // 60s) for slow cluster-wide commands. weka events with a large --num-results
 // pages through all results and prints nothing until done, so a timeout loses
@@ -6335,36 +6474,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 
 	// Cluster-wide CLI: run once from the first responsive compute pod.
 	// weka status / weka alerts return the same output on every pod.
-	for _, spec := range clusterWideCLICommands {
-		timeout := kc.timeout
-		minTimeout, slow := k8sCommandMinTimeout[spec.name]
-		if minTimeout > timeout {
-			timeout = minTimeout
-		}
-		for _, pod := range pods {
-			if !isWekaContainerPod(pod) {
-				continue
-			}
-			m.TotalCommands++
-			out, err := kc.execInPodTimeout(timeout, clusterNS, pod, "", spec.cmd...)
-			if err != nil {
-				m.FailedCommands++
-				errStr := err.Error()
-				if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot get resource") || strings.Contains(errStr, "cannot list resource") {
-					warnf("k8s: %s: RBAC permission denied — skipping (grant exec access in a ClusterRole/RoleBinding)", spec.name)
-					break // RBAC denial is cluster-wide; retrying other pods will not help
-				}
-				if slow && errors.Is(err, errKubectlTimeout) {
-					warnf("k8s: %s timed out after %s on %s; not retrying on other pods (cluster-wide query)", spec.name, timeout, pod)
-					break
-				}
-				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
-				continue
-			}
-			_ = addBytesToArchive(tw, root+"/weka-commands/"+spec.name, out)
-			break // success — no need to try other pods
-		}
-	}
+	runK8sClusterWideCommands(tw, kc, root, clusterNS, pods, m)
 
 	// Per-pod collection
 	for _, pod := range pods {
@@ -6460,7 +6570,7 @@ OPTIONS
                        or alongside the bundle when --output is specified).
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
-  --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
+  --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s; weka events gets at least 5m)
   --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name) with placeholders.
                        Anonymization mapping JSON is written next to the bundle (kept at your site; not in the archive).
   --anonymize-key PATH Override path for the anonymization mapping JSON (default: alongside the bundle)
@@ -6504,7 +6614,7 @@ func runK8sMode(args []string) {
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
 	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz when /opt/weka exists, otherwise ./weka-log-collector/bundles/)", wlcBundlesDir))
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
-	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
+	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout (weka events gets at least 5m)")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
 	ver := fs.Bool("version", false, "Print version and exit")
 	compression := fs.String("compression", "gzip", "Compression format: gzip|xz")
