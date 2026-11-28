@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -3731,9 +3732,10 @@ var (
 )
 
 // traceUploadAllowance is extra remote time in --upload mode when traces are
-// collected: the uploader expects about 30 MB/min, so a 1 GB trace archive
-// needs about 33 minutes on top of collection and extraction.
-const traceUploadAllowance = 30 * time.Minute
+// collected. It matches what the node's own uploadBundle waits for a ~1 GB
+// archive (4 s per MB, about 68 minutes, plus 2), so the outer timeout does
+// not cut off an upload the node would still have waited for.
+const traceUploadAllowance = 75 * time.Minute
 
 // traceWindowTolerance is the slack allowed on top of traceMaxWindow.
 const traceWindowTolerance = time.Minute
@@ -3741,16 +3743,68 @@ const traceWindowTolerance = time.Minute
 // exitCleanups holds local cleanups (temp files) that must also run when the
 // process ends through os.Exit, which skips deferred calls: exitProcess and
 // the Ctrl-C handlers run them.
-var exitCleanups []func()
+var (
+	exitCleanupsMu sync.Mutex
+	exitCleanups   []func()
+)
+
+// addExitCleanup registers f to run on exitProcess and in the Ctrl-C handlers.
+func addExitCleanup(f func()) {
+	exitCleanupsMu.Lock()
+	exitCleanups = append(exitCleanups, f)
+	exitCleanupsMu.Unlock()
+}
+
+// runExitCleanups runs every registered cleanup (a snapshot, so a cleanup
+// registered concurrently cannot race the iteration).
+func runExitCleanups() {
+	exitCleanupsMu.Lock()
+	fs := append([]func(){}, exitCleanups...)
+	exitCleanupsMu.Unlock()
+	for _, f := range fs {
+		f()
+	}
+}
 
 // exitProcess runs exitCleanups and exits. Used instead of os.Exit on paths
 // that can run after a cleanup was registered (the trace_extractor copy).
 func exitProcess(code int) {
-	for _, f := range exitCleanups {
-		f()
-	}
+	runExitCleanups()
 	os.Exit(code)
 }
+
+// uploadSignalSetup arranges Ctrl-C cleanup of an upload's staged files and
+// returns a function that undoes it. Under the cluster handler (cluster
+// --upload, where the orchestrator uploads its own bundle while remote nodes
+// still run) it only registers the cleanup, which that handler runs after
+// killing the remote collectors; a second handler would exit first and leave
+// them running. Otherwise it installs its own handler.
+func uploadSignalSetup(linkCleanup func()) func() {
+	if clusterSignalHandler.Load() {
+		addExitCleanup(linkCleanup)
+		return func() {}
+	}
+	stopEarlySignalHandler()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-sigCh; ok {
+			linkCleanup()
+			warnf("Upload interrupted — cleaned up staging files")
+			exitProcess(1)
+		}
+	}()
+	return func() {
+		signal.Stop(sigCh)
+		close(sigCh)
+	}
+}
+
+// clusterSignalHandler is set once the cluster-mode Ctrl-C handler is
+// installed. That handler must kill the remote collectors before the process
+// exits, so no other handler may be installed next to it; code that needs
+// cleanup on Ctrl-C registers it with addExitCleanup instead.
+var clusterSignalHandler atomic.Bool
 
 // earlySig is the Ctrl-C handler installed once a cleanup is registered and
 // before a more specific handler exists; stopEarlySignalHandler hands over.
@@ -3774,9 +3828,7 @@ func startEarlySignalHandler(holdsRunLock bool) {
 		if _, ok := <-ch; !ok {
 			return
 		}
-		for _, f := range exitCleanups {
-			f()
-		}
+		runExitCleanups()
 		if holdsRunLock {
 			releaseRunLock()
 		}
@@ -5217,23 +5269,15 @@ func uploadBundle(archivePath string, sessionID int64) error {
 	setActive := func(p string) { mu.Lock(); activeLinkPath = p; mu.Unlock() }
 	getActive := func() string { mu.Lock(); defer mu.Unlock(); return activeLinkPath }
 
-	stopEarlySignalHandler()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		if _, ok := <-sigCh; ok {
-			if lp := getActive(); lp != "" {
-				os.Remove(lp)
-			}
-			if staged {
-				os.Remove(stagedPath)
-			}
-			warnf("Upload interrupted — cleaned up staging files")
-			exitProcess(1)
+	linkCleanup := func() {
+		if lp := getActive(); lp != "" {
+			os.Remove(lp)
 		}
-	}()
-	defer signal.Stop(sigCh)
-	defer close(sigCh)
+		if staged {
+			os.Remove(stagedPath)
+		}
+	}
+	defer uploadSignalSetup(linkCleanup)()
 
 	// A healthy uploader picks up inotify events nearly immediately and moves
 	// the symlink to .uploaded/ when done. Allow at least 5 min per container
@@ -7544,7 +7588,7 @@ func main() {
 				return
 			}
 			defer cleanup()
-			exitCleanups = append(exitCleanups, cleanup)
+			addExitCleanup(cleanup)
 			traceExtractorSource = resolvedTraceExtractorPath
 			if p != resolvedTraceExtractorPath {
 				logf("Traces:   %s is not executable; running a copy (%s)", resolvedTraceExtractorPath, p)
@@ -7854,6 +7898,7 @@ func main() {
 	stopEarlySignalHandler()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	clusterSignalHandler.Store(true)
 	go func() {
 		<-sigCh
 		logf("\nInterrupted — killing remote processes and cleaning up...")
@@ -7871,9 +7916,7 @@ func main() {
 			return true
 		})
 		cleanupWg.Wait()
-		for _, f := range exitCleanups {
-			f()
-		}
+		runExitCleanups()
 		releaseRunLock()
 		logf("Cleanup complete.")
 		os.Exit(1)
@@ -8046,6 +8089,9 @@ func main() {
 		elapsed := time.Since(collectionStart).Round(time.Second)
 		logf("\nCluster upload complete  —  Duration: %s", elapsed)
 		logf("  Nodes:    %d total, %d uploaded, %d failed", len(allResults), succeeded, failed)
+		if traceSkipReason != "" {
+			logf("  Traces:   skipped: %s", traceSkipReason)
+		}
 		if len(failedDisplays) > 0 {
 			logf("  Failed:   %s", strings.Join(failedDisplays, ", "))
 			logf("  Tip: check SSH access and 'weka cloud status' on failed nodes.")
@@ -8237,7 +8283,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 			} else {
 				logf("  [%s] upload complete  [%d/%d]", display, n, total)
 			}
-			if traceLine != "" {
+			if traceLine != "" && (collectTraces || traceSkipReason == "") {
 				if strings.HasPrefix(traceLine, "ok") && !strings.Contains(traceLine, "unparsed") {
 					logf("  [%s] traces: %s", display, traceLine)
 				} else {

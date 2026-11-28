@@ -539,7 +539,7 @@ weka-log-collector --start-time -2h --upload
 weka-log-collector --local --upload
 ```
 
-A failed upload exits non-zero (1) for `--local --upload` and `k8s --upload`, and for cluster `--upload` when no node uploaded; the local bundle is kept. With `--collect-traces`, each node gets extra time (`--trace-timeout` plus 30 minutes) for the trace step and for uploading the larger archive, and its trace outcome is printed as it finishes.
+A failed upload exits non-zero (1) for `--local --upload` and `k8s --upload`, and for cluster `--upload` when no node uploaded; the local bundle is kept. With `--collect-traces`, each node gets extra time (`--trace-timeout` plus 75 minutes) for the trace step and for uploading the larger archive (about 1 GB at the uploader's own pace), and its trace outcome is printed as it finishes.
 
 You can also upload a previously collected file:
 

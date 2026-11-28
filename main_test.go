@@ -1417,7 +1417,7 @@ func TestRunTraceExtractor_LocalWindowEndFixed(t *testing.T) {
 func TestExitProcessRunsCleanups(t *testing.T) {
 	if path := os.Getenv("WLC_TEST_EXIT_CLEANUP"); path != "" {
 		// Child: register a cleanup that removes the file, then exit.
-		exitCleanups = append(exitCleanups, func() { os.Remove(path) })
+		addExitCleanup(func() { os.Remove(path) })
 		exitProcess(3)
 		return
 	}
@@ -1464,7 +1464,7 @@ func TestEarlySignalHandler(t *testing.T) {
 	switch os.Getenv("WLC_TEST_EARLY_SIG") {
 	case "handle", "handover":
 		path := os.Getenv("WLC_TEST_EARLY_FILE")
-		exitCleanups = append(exitCleanups, func() { os.Remove(path) })
+		addExitCleanup(func() { os.Remove(path) })
 		startEarlySignalHandler(false)
 		if os.Getenv("WLC_TEST_EARLY_SIG") == "handover" {
 			stopEarlySignalHandler()
@@ -1527,5 +1527,63 @@ func TestRunK8sMode_UploadFailureExitCode(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "Upload failed") {
 		t.Errorf("exit 1 did not come from the upload step:\n%s", out)
+	}
+}
+
+func TestUploadSignalSetup_UnderClusterHandler(t *testing.T) {
+	// Under the cluster handler the upload must not install its own handler
+	// (it would exit before the remote collectors are killed); it registers
+	// its cleanup for the cluster handler to run instead.
+	clusterSignalHandler.Store(true)
+	defer clusterSignalHandler.Store(false)
+	exitCleanupsMu.Lock()
+	before := len(exitCleanups)
+	exitCleanupsMu.Unlock()
+	ran := false
+	undo := uploadSignalSetup(func() { ran = true })
+	undo()
+	exitCleanupsMu.Lock()
+	added := exitCleanups[before:]
+	exitCleanups = exitCleanups[:before]
+	exitCleanupsMu.Unlock()
+	if len(added) != 1 {
+		t.Fatalf("want the cleanup registered once, got %d", len(added))
+	}
+	added[0]()
+	if !ran {
+		t.Errorf("registered cleanup is not the upload's")
+	}
+}
+
+func TestUploadSignalSetup_OwnHandler(t *testing.T) {
+	if path := os.Getenv("WLC_TEST_UPLOAD_SIG"); path != "" {
+		undo := uploadSignalSetup(func() { os.Remove(path) })
+		defer undo()
+		_ = os.WriteFile(path+".ready", nil, 0644)
+		time.Sleep(10 * time.Second)
+		os.Exit(7)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "staged")
+	_ = os.WriteFile(path, []byte("x"), 0644)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestUploadSignalSetup_OwnHandler$")
+	cmd.Env = append(os.Environ(), "WLC_TEST_UPLOAD_SIG="+path)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(path + ".ready"); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = cmd.Process.Signal(os.Interrupt)
+	err := cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Errorf("want exit 1 from the upload handler, got %v", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("staged file not cleaned up")
 	}
 }
