@@ -95,8 +95,11 @@ Usage: weka-log-collector [flags]
 Flags:
   --local              Collect from local host only (no SSH, no cluster discovery)
   --profile            Collection profile: default|perf|nfs|s3|smbw|all  (default: default)
-  --start-time         Start of time window (e.g. -2h, -30m, -1d, 2026-03-20T14:00)
-  --end-time           End of time window (default: now)
+  --start-time         Start of time window (e.g. -2h, -30m, -1d, 2026-03-20T14:00 in local
+                       time, or with a zone: 2026-03-20T14:00:00Z, 2026-03-20T16:00:00+02:00)
+  --end-time           End of time window (default: now). In cluster mode the end is fixed
+                       once at start and sent to every node as UTC, so all hosts use the
+                       same window.
   --output             Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<cluster>-weka-logs-<ts>.tar.gz). Use - for stdout.
   --host               Collect from this host by IP (repeatable; default: all cluster backends)
   --ssh-user           SSH username for connections to cluster nodes (default: current OS user)
@@ -114,8 +117,23 @@ Flags:
                        Multiple --trace-filter flags are OR'd together by trace_extractor.
   --trace-extractor-path PATH
                        Override path to the trace_extractor binary. By default the tool
-                       looks alongside itself, in PATH, and at
+                       looks alongside itself (trace_extractor-amd64, or trace_extractor-arm64
+                       on aarch64, then trace_extractor), then in PATH, then at
                        /opt/weka/weka-log-collector/trace_extractor.
+                       The window is passed as RFC3339 (2026-03-20T14:00:00+02:00), so
+                       an override must be a trace_extractor that accepts zoned times
+                       (the bundled build does).
+  --trace-timeout DURATION
+                       Maximum trace_extractor run time per node (default: 15m). Each
+                       node's outcome (status, shard count, unparsed files skipped) is
+                       recorded in collection_manifest.json ("traces"), summarised in
+                       cluster_summary.json and printed at the end of the run (with
+                       --upload: one line per node as it finishes, no summary file); the
+                       extractor's full output is in hosts/<host>/traces/extractor.log.
+                       In cluster mode without --upload each node's time limit grows by
+                       --trace-timeout, plus as long again (at least 10m) for streaming
+                       the traces back; a node still running at the limit is killed and
+                       reported as failed. Maximum 24h.
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands
@@ -195,7 +213,9 @@ weka-log-collector --upload-file weka-logs-2026-04-20.tar.gz
 
 **Clock sync** — timedatectl, timedatectl show-timesync, systemd-timesyncd status, chronyc tracking/sources, chronyd status, ntpd status, ptp4l/phc2sys status — whichever sync daemon is present on each node
 
-**Weka CLI commands** — weka status, alerts, cluster topology, filesystems, snapshots, debug traces, local container resources, and profile-specific commands (events, cfgdump, perf stats, NFS/S3/SMB-W commands)
+**Weka CLI commands** — weka status, alerts, cluster topology (`weka cluster container|process|drive|bucket -v`, so fencing/join-reject reasons, drive serial/firmware and bucket fill level are included), filesystems, snapshots, debug traces, local container resources, and profile-specific commands (events, cfgdump, perf stats, NFS/S3/SMB-W commands)
+
+**Weka events** — `weka_events_major.txt` (major and above) and `weka_events_warning.txt` (warning and above), both scoped to the collection window (`--start-time`/`--end-time` as relative offsets) and asking for up to 100000 events instead of the CLI default of the 50 newest
 
 **System log files** — `/var/log/messages*`, `secure*`, `cron*`, `syslog*`, `kern.log*`, `audit/audit.log*`, `cloud-init*`, `dnf/yum.log*` — active files always; rotated variants kept only when their mtime falls inside the time window
 
@@ -222,6 +242,8 @@ Use `--container-id` to scope to specific nodes, `--clients` to include client n
 
 > **Note:** `--clients` and `--clients-only` can significantly increase collection size — each client host adds roughly the same log volume as a backend. Only use it when investigating a client-side issue (e.g. Kubernetes/CSI clients, NFS/SMB clients). For most support cases, leave it off.
 
+> **Failed hosts:** every discovered host is listed in the bundle. A host that could not be deployed to or collected from gets `hosts/<host>/COLLECTION_FAILED.txt` and an entry in `failed_hosts` / `failed_reasons` in `cluster_summary.json`. The run exits non-zero (1) when no host could be collected; a partial run still exits 0, so check the summary.
+
 > **Signal handling:** If you press Ctrl+C during cluster collection, the tool will SSH to all active remote nodes, kill any running collection processes, and clean up the temporary binary before exiting.
 
 ### Large clusters (50+ nodes)
@@ -246,10 +268,18 @@ weka-log-collector \
 
 `--collect-traces` bundles Weka traces alongside the standard log collection. The tool uses the `trace_extractor` binary, which is **shipped in this repo** — a `git pull` on any Weka node picks it up automatically alongside `weka-log-collector`.
 
+| Binary | Architecture |
+|---|---|
+| `trace_extractor-amd64` | Linux amd64 (x86_64) |
+| `trace_extractor-arm64` | Linux arm64 (aarch64) |
+| `trace_extractor` | older amd64 build, kept unchanged only as a fallback (see below) |
+
+Both current binaries are built from the WEKA source tree (`scripts/tracing/trace_extractor`); the exact source commit and SHA-256 of each are recorded in `TRACE_EXTRACTOR_SOURCE`. Rebuild them when the upstream tool changes. The older `trace_extractor` skips shard files with 5-digit serials; it is not used when the arch-specific binaries are present. It stays untouched because older wlc versions ran `chmod +x` on it inside the checkout, and changing a file that is modified locally would make `git pull` refuse on those nodes. wlc no longer modifies files in the checkout; if the extractor is not executable it runs a temporary copy.
+
 ### Requirements
 
 - `--start-time` is **required** — traces have no safe default window.
-- Time window (`--end-time` minus `--start-time`) must be **≤ 1 hour**. If the window is larger, or if `--start-time` is omitted, trace collection is silently skipped with an explanatory message; the rest of log collection continues normally.
+- Time window (`--end-time` minus `--start-time`) must be **≤ 1 hour** (one minute of slack, so `--start-time -1h` works). If the window is larger, or if `--start-time` is omitted, trace collection is skipped with a `[WARN]`, recorded as `"status": "skipped"` in the manifest and summary; the rest of log collection continues normally.
 
 ### Filter expressions
 
@@ -417,9 +447,9 @@ The tool automatically discovers Weka namespaces by querying the `wekacluster` C
 - Pod describe + events per pod
 - **Cluster-wide weka commands** (run once from first responsive compute pod, stored under `weka-commands/`):
   identity & status (`weka status`, `weka status rebuild`, `weka alerts`, `weka version`, `weka version current`, `weka user`),
-  cluster topology (`weka cluster servers list`, `weka cluster container`, `weka cluster container net`, `weka cluster process`, `weka cluster drive`, `weka cluster bucket`, `weka cluster failure-domain`, `weka cluster task`),
+  cluster topology (`weka cluster servers list`, `weka cluster container -v`, `weka cluster container net`, `weka cluster process -v`, `weka cluster drive -v`, `weka cluster bucket -v`, `weka cluster failure-domain`, `weka cluster task`),
   filesystems (`weka fs -v`, `weka fs group`, `weka fs snapshot -v`, `weka fs tier s3 -v`),
-  events (`weka events --severity major --start-time -8h`),
+  events (`weka events --severity major|warning --start-time -8h --num-results 100000`, with at least a 5 minute timeout),
   security (`weka security kms`),
   debug (`weka debug traces status`, `weka debug override list`, `weka debug net links`, `weka debug blacklist list`, `weka debug buckets dist`)
 - **Per-pod weka local commands** (stored under each pod's `weka-local-commands/`):
@@ -512,6 +542,8 @@ Add `--upload` to any collection command to send the archive directly to Weka Ho
 weka-log-collector --start-time -2h --upload
 weka-log-collector --local --upload
 ```
+
+A failed upload exits non-zero (1) for `--local --upload` and `k8s --upload`, and for cluster `--upload` when no node uploaded; the local bundle is kept. With `--collect-traces`, each node gets extra time (`--trace-timeout` plus 75 minutes) for the trace step and for uploading the larger archive (about 1 GB at the uploader's own pace), and its trace outcome is printed as it finishes.
 
 You can also upload a previously collected file:
 

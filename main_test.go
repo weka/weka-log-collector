@@ -1,8 +1,20 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRedactSensitiveJSON_StringValue(t *testing.T) {
@@ -287,5 +299,1610 @@ func TestMaskIPv6_RealIPv6Redacted(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("IPv6 masking:\ninput: %q\ngot:   %q\nwant:  %q", tc.input, got, tc.want)
 		}
+	}
+}
+
+func TestBundledTraceExtractorNames(t *testing.T) {
+	cases := []struct {
+		goos, goarch string
+		want         string
+	}{
+		{"linux", "amd64", "trace_extractor-amd64"},
+		{"linux", "arm64", "trace_extractor-arm64"},
+		{"darwin", "arm64", "trace_extractor-amd64"},
+		{"darwin", "amd64", "trace_extractor-amd64"},
+	}
+	for _, c := range cases {
+		got := bundledTraceExtractorNames(c.goos, c.goarch)
+		if len(got) != 2 || got[0] != c.want || got[1] != "trace_extractor" {
+			t.Errorf("%s/%s: got %v, want [%s trace_extractor]", c.goos, c.goarch, got, c.want)
+		}
+	}
+}
+
+const sampleExtractorOutput = `verbose: /opt/weka/traces: 120 files match glob *.shard
+verbose:   skip (filename parse failed): weird_name.shard
+verbose: /opt/weka/traces: 1 skipped (parse), 30 skipped (filter), 89 remaining
+verbose: /opt/weka/traces/histograms: 4 skipped (parse), 0 skipped (filter), 10 remaining
+Collecting:
+  42 shards
+  7 histogram files
+  3 cache files
+  weka local ps -J: OK
+Writing host-traces.tar.gz ...
+Done: host-traces.tar.gz
+`
+
+func TestParseExtractorOutput(t *testing.T) {
+	var r TraceResult
+	parseExtractorOutput(sampleExtractorOutput, &r)
+	if r.Shards != 42 || r.Histograms != 7 || r.UnparsedFiles != 5 {
+		t.Errorf("got shards=%d histograms=%d unparsed=%d, want 42/7/5", r.Shards, r.Histograms, r.UnparsedFiles)
+	}
+	if r.Reason != "" {
+		t.Errorf("unexpected reason %q", r.Reason)
+	}
+}
+
+func TestParseExtractorOutput_DirWarning(t *testing.T) {
+	var r TraceResult
+	parseExtractorOutput("warning: cannot read trace directory /opt/weka/traces: permission denied\nCollecting:\n  0 shards\n  0 histogram files\n", &r)
+	if r.Shards != 0 || !strings.Contains(r.Reason, "cannot read trace directory") {
+		t.Errorf("got shards=%d reason=%q", r.Shards, r.Reason)
+	}
+}
+
+// writeFakeExtractor creates a shell script that mimics trace_extractor:
+// prints body to stderr, optionally sleeps, and writes an archive into cwd.
+func writeFakeExtractor(t *testing.T, body string, sleepSecs int, exitCode int) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake_extractor")
+	script := fmt.Sprintf("#!/bin/sh\ncat >&2 <<'OUT'\n%sOUT\n[ %d -gt 0 ] && exec sleep %d\necho data > host-traces-x.tar.gz\nexit %d\n", body, sleepSecs, sleepSecs, exitCode)
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func runFakeExtractor(t *testing.T, path string, timeout time.Duration) (*TraceResult, map[string]string) {
+	t.Helper()
+	oldPath, oldTimeout := resolvedTraceExtractorPath, traceTimeout
+	resolvedTraceExtractorPath, traceTimeout = path, timeout
+	defer func() { resolvedTraceExtractorPath, traceTimeout = oldPath, oldTimeout }()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	res := runTraceExtractor(tw, "root", "h1", time.Now().Add(-30*time.Minute), time.Now())
+	tw.Close()
+
+	files := map[string]string{}
+	tr := tar.NewReader(&buf)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		data, _ := io.ReadAll(tr)
+		files[hdr.Name] = string(data)
+	}
+	return res, files
+}
+
+func TestRunTraceExtractor_OK(t *testing.T) {
+	res, files := runFakeExtractor(t, writeFakeExtractor(t, sampleExtractorOutput, 0, 0), time.Minute)
+	if res.Status != "ok" || res.Shards != 42 || len(res.Archives) != 1 {
+		t.Fatalf("got %+v", res)
+	}
+	if _, ok := files["root/hosts/h1/traces/host-traces-x.tar.gz"]; !ok {
+		t.Errorf("archive not added; files=%v", files)
+	}
+	log := files["root/hosts/h1/traces/extractor.log"]
+	if !strings.Contains(log, "--verbose") || !strings.Contains(log, "42 shards") {
+		t.Errorf("extractor.log missing args or output:\n%s", log)
+	}
+	if !regexp.MustCompile(`(?m)^sha256: [0-9a-f]{64}$`).MatchString(log) {
+		t.Errorf("extractor.log missing the extractor's sha256:\n%s", log)
+	}
+}
+
+func TestRunTraceExtractor_NoShards(t *testing.T) {
+	res, _ := runFakeExtractor(t, writeFakeExtractor(t, "Collecting:\n  0 shards\n  0 histogram files\n", 0, 0), time.Minute)
+	if res.Status != "no_shards" {
+		t.Errorf("got %+v", res)
+	}
+}
+
+func TestRunTraceExtractor_Failed(t *testing.T) {
+	res, files := runFakeExtractor(t, writeFakeExtractor(t, "error: --from: bad time\n", 0, 1), time.Minute)
+	if res.Status != "failed" || res.ExitCode != 1 || !strings.Contains(res.Reason, "bad time") {
+		t.Errorf("got %+v", res)
+	}
+	if _, ok := files["root/hosts/h1/traces/extractor.log"]; !ok {
+		t.Errorf("extractor.log not written on failure")
+	}
+}
+
+func TestRunTraceExtractor_Timeout(t *testing.T) {
+	start := time.Now()
+	res, _ := runFakeExtractor(t, writeFakeExtractor(t, "Collecting:\n", 30, 0), time.Second)
+	if res.Status != "timeout" {
+		t.Errorf("got %+v", res)
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Errorf("timeout not enforced: took %s", d)
+	}
+}
+
+func TestRemoteNodeArgs_TraceDeployFailed(t *testing.T) {
+	oldCT, oldPath := collectTraces, resolvedTraceExtractorPath
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	defer func() { collectTraces, resolvedTraceExtractorPath = oldCT, oldPath }()
+
+	traceDeployFailed.Store("bad-host", "scp failed")
+	defer traceDeployFailed.Delete("bad-host")
+
+	has := func(args []string, s string) bool {
+		for _, a := range args {
+			if a == s {
+				return true
+			}
+		}
+		return false
+	}
+	if args := remoteNodeArgs("good-host", time.Time{}, time.Time{}, nil); !has(args, "--collect-traces") {
+		t.Errorf("good host should collect traces: %v", args)
+	}
+	if args := remoteNodeArgs("bad-host", time.Time{}, time.Time{}, nil); has(args, "--collect-traces") {
+		t.Errorf("host with failed extractor deploy should not collect traces: %v", args)
+	}
+	if tr := hostTraceResult("bad-host", nil); tr == nil || tr.Status != "skipped" {
+		t.Errorf("hostTraceResult for failed deploy: %+v", tr)
+	}
+	cmd := remoteShellCommand("good-host", "/opt/weka/weka-log-collector/wlc", "true", time.Minute)
+	if !strings.Contains(cmd, remoteTraceExtractorPath()) {
+		t.Errorf("remote cleanup should remove trace_extractor: %s", cmd)
+	}
+}
+
+// hostArchive builds a gzip'd tar shaped like a --node-only host archive:
+// <root>/collection_manifest.json at the top, data under hosts/<host>/.
+func hostArchive(t *testing.T, host string, m HostManifest) *bytes.Buffer {
+	t.Helper()
+	mj, _ := json.Marshal(m)
+	var src bytes.Buffer
+	gw := gzip.NewWriter(&src)
+	tw := tar.NewWriter(gw)
+	for _, e := range []struct {
+		name string
+		data []byte
+	}{
+		{"old-root/hosts/" + host + "/system/uptime.txt", []byte("up")},
+		{"old-root/collection_manifest.json", mj},
+	} {
+		_ = tw.WriteHeader(&tar.Header{Name: e.name, Mode: 0644, Size: int64(len(e.data))})
+		_, _ = tw.Write(e.data)
+	}
+	tw.Close()
+	gw.Close()
+	return &src
+}
+
+func TestMergeArchive_ReturnsHostManifest(t *testing.T) {
+	var out bytes.Buffer
+	otw := tar.NewWriter(&out)
+	for _, h := range []string{"h1", "h2"} {
+		got, err := mergeArchive(otw, hostArchive(t, h, HostManifest{Hostname: h, Traces: &TraceResult{Status: "no_shards"}}), "new")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Hostname != h || got.Traces == nil || got.Traces.Status != "no_shards" {
+			t.Errorf("%s: manifest not returned: %+v", h, got)
+		}
+	}
+	otw.Close()
+
+	names := map[string]bool{}
+	tr := tar.NewReader(&out)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if names[hdr.Name] {
+			t.Errorf("duplicate entry %s in merged archive", hdr.Name)
+		}
+		names[hdr.Name] = true
+	}
+	for _, want := range []string{"new/hosts/h1/collection_manifest.json", "new/hosts/h2/collection_manifest.json"} {
+		if !names[want] {
+			t.Errorf("missing %s; entries: %v", want, names)
+		}
+	}
+	if names["new/collection_manifest.json"] {
+		t.Errorf("host manifest left at the bundle root")
+	}
+}
+
+func TestMergeArchive_UnsafeManifestHostnameStaysAtRoot(t *testing.T) {
+	var out bytes.Buffer
+	otw := tar.NewWriter(&out)
+	if _, err := mergeArchive(otw, hostArchive(t, "h1", HostManifest{Hostname: "../evil"}), "new"); err != nil {
+		t.Fatal(err)
+	}
+	otw.Close()
+	tr := tar.NewReader(&out)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if strings.Contains(hdr.Name, "..") {
+			t.Errorf("unsafe path written: %s", hdr.Name)
+		}
+	}
+}
+
+func TestRemoteKillCommand(t *testing.T) {
+	oldCT, oldPath := collectTraces, resolvedTraceExtractorPath
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	defer func() { collectTraces, resolvedTraceExtractorPath = oldCT, oldPath }()
+
+	cmd := remoteKillCommand("/opt/weka/weka-log-collector/weka-log-collector-123")
+	tePat := pkillSelfSafePattern(remoteTraceExtractorPath()) + "( |$)"
+	for _, want := range []string{
+		"pkill -f '[w]eka-log-collector-123( |$)'",
+		"pkill -f '" + tePat + "'",
+		"rm -f /opt/weka/weka-log-collector/[w]eka-log-collector-123 " + pkillSelfSafePattern(remoteTraceExtractorPath()),
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("kill command %q missing %q", cmd, want)
+		}
+	}
+	if remoteNeedsSudo() && !strings.Contains(cmd, `sudo sh -c "rm -f `) {
+		t.Errorf("non-root cleanup must run the glob rm in a root shell: %q", cmd)
+	}
+	// The pkill patterns must not match their own command line, must match
+	// the real process, and must not match a longer PID.
+	for _, c := range []struct{ pat, real, other string }{
+		{"[w]eka-log-collector-123( |$)", "/opt/weka/weka-log-collector/weka-log-collector-123 --local", "/opt/weka/weka-log-collector/weka-log-collector-1234 --local"},
+		{tePat, remoteTraceExtractorPath() + " --verbose", remoteTraceExtractorPath() + "9 --verbose"},
+	} {
+		re := regexp.MustCompile(c.pat)
+		if re.MatchString(cmd) {
+			t.Errorf("pattern %q matches the cleanup command itself", c.pat)
+		}
+		if !re.MatchString(c.real) || !re.MatchString(strings.Fields(c.real)[0]) {
+			t.Errorf("pattern %q does not match the process %q", c.pat, c.real)
+		}
+		if re.MatchString(c.other) {
+			t.Errorf("pattern %q also matches another run %q", c.pat, c.other)
+		}
+	}
+}
+
+func TestRemoteTraceExtractorPathIsPerRun(t *testing.T) {
+	p := remoteTraceExtractorPath()
+	if p == legacyTraceExtractorPath || !strings.HasPrefix(p, wlcBaseDir+"/trace_extractor-") {
+		t.Errorf("remote extractor path should be per-run: %s", p)
+	}
+}
+
+func TestParseInputTime_Zones(t *testing.T) {
+	want := time.Date(2026, 3, 4, 10, 30, 0, 0, time.UTC)
+	for _, in := range []string{"2026-03-04T10:30:00Z", "2026-03-04T12:30:00+02:00", "2026-03-04T05:30:00-05:00"} {
+		got, err := parseInputTime(in)
+		if err != nil {
+			t.Fatalf("%s: %v", in, err)
+		}
+		if !got.Equal(want) {
+			t.Errorf("%s: got %s, want %s", in, got, want)
+		}
+		if got.Location() != time.Local {
+			t.Errorf("%s: want local time, got zone %s", in, got.Location())
+		}
+	}
+	local, err := parseInputTime("2026-03-04T10:30")
+	if err != nil || !local.Equal(time.Date(2026, 3, 4, 10, 30, 0, 0, time.Local)) {
+		t.Errorf("zone-less input should be local: %v %v", local, err)
+	}
+	if _, err := parseInputTime("yesterday"); err == nil {
+		t.Errorf("expected error for unparseable input")
+	}
+}
+
+func TestRemoteNodeArgs_UTCWindow(t *testing.T) {
+	from := time.Date(2026, 3, 4, 12, 30, 15, 0, time.FixedZone("X", 2*3600))
+	to := from.Add(45 * time.Minute)
+	args := strings.Join(remoteNodeArgs("h", from, to, nil), " ")
+	if !strings.Contains(args, "--start-time 2026-03-04T10:30:15Z") || !strings.Contains(args, "--end-time 2026-03-04T11:15:15Z") {
+		t.Errorf("remote window not sent as UTC RFC3339 with seconds: %s", args)
+	}
+	// Round trip: what the remote parses is the same instant.
+	got, err := parseInputTime(remoteTimeArg(from))
+	if err != nil || !got.Equal(from) {
+		t.Errorf("round trip: got %v (%v), want %v", got, err, from)
+	}
+}
+
+func TestSplitCommaList(t *testing.T) {
+	got := splitCommaList([]string{"drives0,compute0", " frontend0 ", ",", "s3"})
+	want := []string{"drives0", "compute0", "frontend0", "s3"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestRemoteNodeArgs_ContainerNamesRepeated(t *testing.T) {
+	args := remoteNodeArgs("h", time.Time{}, time.Time{}, []string{"drives0", "compute0"})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--container-name drives0") || !strings.Contains(joined, "--container-name compute0") {
+		t.Errorf("each container name must be its own flag: %v", args)
+	}
+	if strings.Contains(joined, "drives0,compute0") {
+		t.Errorf("names must not be comma-joined: %v", args)
+	}
+	// What the remote receives parses back to the same list.
+	var f multiStringFlag
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--container-name" {
+			_ = f.Set(args[i+1])
+		}
+	}
+	if got := splitCommaList([]string(f)); strings.Join(got, ",") != "drives0,compute0" {
+		t.Errorf("round trip: %v", got)
+	}
+}
+
+func TestDeployFailureResults(t *testing.T) {
+	hosts := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	res := deployFailureResults(hosts, map[string]string{"10.0.0.2": "Permission denied (publickey)"})
+	if len(res) != 1 || res[0].Host != "10.0.0.2" || res[0].Err == nil || !strings.Contains(res[0].Err.Error(), "Permission denied") {
+		t.Errorf("got %+v", res)
+	}
+}
+
+const fakeVault = "hvs.FAKE-TEST-VAULT-TOKEN-XXXXXXXXXXXX"
+
+func TestRedactSensitiveYAML_KeepsTimestampAndContext(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{
+			"Nov 25 10:00:01 node-1 kernel: Speculative Store Bypass: Mitigation: SSB disabled",
+			"Nov 25 10:00:01 node-1 kernel: Speculative Store Bypass: [REDACTED]",
+		},
+		{
+			"2026-11-25 10:00:01.123 app[42]: password: " + fakePW,
+			"2026-11-25 10:00:01.123 app[42]: password: [REDACTED]",
+		},
+		{"join_secret: abc123", "join_secret: [REDACTED]"},
+		{"password:", "password:"}, // no value: unchanged
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveYAML([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_Assignments(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"export VAULT_TOKEN=" + fakeVault, "export VAULT_TOKEN=[REDACTED]"},
+		{"DB_PASS=\"" + fakePW + " x\" next", "DB_PASS=[REDACTED] next"},
+		{"password = " + fakePW, "password = [REDACTED]"},
+		{"GET /api?user=bob&token=" + fakeBearer + "&x=1", "GET /api?user=bob&token=[REDACTED]&x=1"},
+		{"A_SECRET=" + fakePW + " B_TOKEN=" + fakeBearer, "A_SECRET=[REDACTED] B_TOKEN=[REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_VaultAndWekaCLI(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"vault login " + fakeVault, "vault login [REDACTED]"},
+		{"weka user login admin " + fakePW, "weka user login admin [REDACTED]"},
+		{"weka user passwd " + fakePW + " --username bob", "weka user passwd [REDACTED] --username bob"},
+		{"weka user add bob clusteradmin " + fakePW, "weka user add bob clusteradmin [REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_AssignmentNoFalsePositives(t *testing.T) {
+	for _, in := range []string{
+		"PWD=/root",
+		"BOOT_IMAGE=/vmlinuz root=/dev/sda1 spec_store_bypass_disable=on",
+		"max_token_count=5 token_bucket_size=10",
+		"weka user login admin --org default",
+		"weka user add bob clusteradmin --posix-uid 1001",
+		"tokens: 5",
+	} {
+		if got := string(redactSensitiveValues([]byte(in))); got != in {
+			t.Errorf("false positive:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+}
+
+func TestBuildWindowedDefaultCmds_Events(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	cmds := buildWindowedDefaultCmdsAt(now.Add(-90*time.Minute), now.Add(-37*time.Minute-30*time.Second), now)
+	byName := map[string]string{}
+	for _, c := range cmds {
+		byName[c.Name] = c.Cmd
+	}
+	major, warning := byName["weka_events_major"], byName["weka_events_warning"]
+	for name, cmd := range map[string]string{"major": major, "warning": warning} {
+		for _, want := range []string{"--start-time -2h", "--end-time -37m", "--num-results " + eventsMaxResults} {
+			if !strings.Contains(cmd, want) {
+				t.Errorf("%s events command %q missing %q", name, cmd, want)
+			}
+		}
+	}
+	if !strings.Contains(major, "--severity major") || !strings.Contains(warning, "--severity warning") {
+		t.Errorf("severity: major=%q warning=%q", major, warning)
+	}
+	// Window ending now: no --end-time.
+	for _, c := range buildWindowedDefaultCmdsAt(now.Add(-30*time.Minute), now.Add(-20*time.Second), now) {
+		if strings.Contains(c.Cmd, "--end-time") {
+			t.Errorf("window ending now should not pass --end-time: %q", c.Cmd)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_NoNewlineCrossing(t *testing.T) {
+	for _, in := range []string{
+		"weka user passwd\nweka status -v",
+		"weka user login\nweka status -v",
+		"weka user add bob clusteradmin\nweka cluster drive",
+		"VAULT_TOKEN=\nHOME=/root",
+		"password =\n[server]",
+		"--password\nnext-line",
+		"Authorization: Bearer\nnext-line",
+	} {
+		if got := string(redactSensitiveValues([]byte(in))); got != in {
+			t.Errorf("match crossed a line break:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+}
+
+func TestRedactSensitiveValues_WekaUserPasswordForms(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"weka user login admin 'P@ss w0rd'", "weka user login admin [REDACTED]"},
+		{`weka user login admin "P@ss w0rd" --org acme`, "weka user login admin [REDACTED] --org acme"},
+		{"weka user login --org acme admin " + fakePW, "weka user login --org acme admin [REDACTED]"},
+		{"weka user login admin " + fakePW + ",x;y", "weka user login admin [REDACTED]"},
+		{"weka -H node1 user login admin " + fakePW, "weka -H node1 user login admin [REDACTED]"},
+		{"weka user passwd --username bob " + fakePW, "weka user passwd --username bob [REDACTED]"},
+		{"weka user add bob clusteradmin --posix-uid 1001 " + fakePW, "weka user add bob clusteradmin --posix-uid 1001 [REDACTED]"},
+		{`{"cmd":"weka user login admin ` + fakePW + `","x":1}`, `{"cmd":"weka user login admin [REDACTED]","x":1}`},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitive_SecretID(t *testing.T) {
+	in := "Nov 25 10:00:01 host app: secret_id=" + fakePW + " role auth: approle"
+	got := string(redactSensitive([]byte(in)))
+	if strings.Contains(got, fakePW) {
+		t.Errorf("secret_id value survived: %q", got)
+	}
+	if !strings.HasPrefix(got, "Nov 25 10:00:01 host app: ") {
+		t.Errorf("line context lost: %q", got)
+	}
+}
+
+func TestRedactAssignments_StringBoundaries(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{`{"url":"https://h/api?token=","next":"value"}`, `{"url":"https://h/api?token=","next":"value"}`},
+		{`["PATH=/usr/bin","VAULT_TOKEN=","HOME=/root"]`, `["PATH=/usr/bin","VAULT_TOKEN=","HOME=/root"]`},
+		{`["A_TOKEN=","B_TOKEN=` + fakePW + `"]`, `["A_TOKEN=","B_TOKEN=[REDACTED]"]`},
+		{`export DB_PASSWORD=\"` + fakePW + `\" && run`, `export DB_PASSWORD=[REDACTED] && run`},
+		{`"cmd":"export DB_PASSWORD=\"` + fakePW + `\" && run"`, `"cmd":"export DB_PASSWORD=[REDACTED] && run"`},
+		{"GITHUB_TOKEN= HOME=/root", "GITHUB_TOKEN= HOME=/root"},
+		{"API_KEY= --y", "API_KEY= --y"},
+		{"(hostId=1, secret=" + fakePW + ")", "(hostId=1, secret=[REDACTED])"},
+		{"Config{user=bob, password=" + fakePW + "}", "Config{user=bob, password=[REDACTED]}"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitiveValues([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %s\nwant %s", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitive_QuotedKeysInText(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{
+			"# command: journalctl\nNov 25 10:00:01 h weka-agent[1]:     \"access_token\": \"" + fakeBearer + "\",",
+			"# command: journalctl\nNov 25 10:00:01 h weka-agent[1]:     \"access_token\": \"[REDACTED]\",",
+		},
+		{"log: {'password': '" + fakePW + "', 'user': 'bob'}", "log: {'password': '[REDACTED]', 'user': 'bob'}"},
+		{`msg="{\"refresh_token\": \"` + fakeBearer + `\", \"x\": 1}"`, `msg="{\"refresh_token\": \"[REDACTED]\", \"x\": 1}"`},
+		{`{"Authorization": "Bearer ` + fakeBearer + `"}`, `{"Authorization": "[REDACTED]"}`},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitive([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+}
+
+func TestRedactSensitive_MoreCLIPasswords(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"weka smb domain join Administrator " + fakePW, "weka smb domain join Administrator [REDACTED]"},
+		{"weka smb domain leave Administrator " + fakePW, "weka smb domain leave Administrator [REDACTED]"},
+		{"weka tenant create acme admin " + fakePW + " --ssd-quota 1TB", "weka tenant create acme admin [REDACTED] --ssd-quota 1TB"},
+		{"weka org create acme admin " + fakePW, "weka org create acme admin [REDACTED]"},
+		{"weka user ldap setup-ad ldap://dc1 corp.local reader " + fakePW, "weka user ldap setup-ad ldap://dc1 corp.local reader [REDACTED]"},
+		{"weka user ldap setup ldap://h dc=x,dc=y person uid group member gid reader " + fakePW, "weka user ldap setup ldap://h dc=x,dc=y person uid group member gid reader [REDACTED]"},
+		{"weka nfs ldap setup-ad-nokrb dc1 corp.local nfs01 Administrator " + fakePW, "weka nfs ldap setup-ad-nokrb dc1 corp.local nfs01 Administrator [REDACTED]"},
+		{"weka nfs ldap setup-openldap ldap1 example.com cn=reader,dc=example,dc=com " + fakePW, "weka nfs ldap setup-openldap ldap1 example.com cn=reader,dc=example,dc=com [REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitive([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+	// Without the password the CLI prompts; nothing to redact.
+	for _, in := range []string{"weka smb domain join Administrator", "weka user ldap setup-ad ldap://dc1 corp.local reader", "weka tenant create acme admin"} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("false positive: %q -> %q", in, got)
+		}
+	}
+}
+
+func TestRedactSensitive_ConfigCredentialNames(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"ldap_default_authtok = " + fakePW, "ldap_default_authtok = [REDACTED]"},
+		{"MYSQL_PWD=" + fakePW, "MYSQL_PWD=[REDACTED]"},
+	}
+	for _, tc := range cases {
+		if got := string(redactSensitive([]byte(tc.input))); got != tc.want {
+			t.Errorf("got  %q\nwant %q", got, tc.want)
+		}
+	}
+	for _, in := range []string{
+		"Token timeouts used for authentication were updated: access=1d, refresh=30d, max_mount_token=30d",
+		"PWD=/root OLDPWD=/home",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("non-secret value redacted:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+}
+
+func TestRedactSensitive_PreservesLayout(t *testing.T) {
+	for _, in := range []string{"", "\n", "a\nb", "a\nb\n", "\n\nx\n\n", "no secrets here\nweka status\n"} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("layout changed: %q -> %q", in, got)
+		}
+	}
+	in := "l1\npassword: " + fakePW + "\nl3\n"
+	if got := string(redactSensitive([]byte(in))); got != "l1\npassword: [REDACTED]\nl3\n" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestExecutableTraceExtractor(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "te-0644")
+	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	p, cleanup, err := executableTraceExtractor(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(p)
+	orig, _ := os.Stat(plain)
+	if p == plain || fi.Mode()&0111 == 0 || orig.Mode().Perm() != 0644 {
+		t.Errorf("want an executable copy and the original untouched: path=%s mode=%v orig=%v", p, fi.Mode(), orig.Mode())
+	}
+	cleanup()
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("cleanup did not remove %s", p)
+	}
+
+	exe := filepath.Join(dir, "te-0755")
+	_ = os.WriteFile(exe, []byte("#!/bin/sh\n"), 0755)
+	if p, _, err := executableTraceExtractor(exe); err != nil || p != exe {
+		t.Errorf("executable file should be used as is: %s %v", p, err)
+	}
+}
+
+func TestRemoteNodeArgs_TraceSkipReason(t *testing.T) {
+	oldCT, oldPath := collectTraces, resolvedTraceExtractorPath
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	defer func() { collectTraces, resolvedTraceExtractorPath = oldCT, oldPath }()
+	traceDeployFailed.Store("bad-host", "scp: write failed\nno space left")
+	defer traceDeployFailed.Delete("bad-host")
+
+	args := remoteNodeArgs("bad-host", time.Time{}, time.Time{}, nil)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--trace-skip-reason trace_extractor deploy failed: scp: write failed no space left") {
+		t.Errorf("deploy-failed host should get a one-line --trace-skip-reason: %q", args)
+	}
+	if strings.Contains(joined, "--collect-traces") {
+		t.Errorf("deploy-failed host must not get --collect-traces: %q", args)
+	}
+}
+
+func TestRunTraceExtractor_Reasons(t *testing.T) {
+	res, _ := runFakeExtractor(t, writeFakeExtractor(t, "verbose: /opt/weka/traces: 0 files match glob *.shard\nCollecting:\n  0 shards\n  0 histogram files\n", 0, 0), time.Minute)
+	if res.Status != "no_shards" || res.Reason != "no shard files in the trace directory" {
+		t.Errorf("empty dir: %+v", res)
+	}
+	res, _ = runFakeExtractor(t, writeFakeExtractor(t, "verbose: /opt/weka/traces: 3 files match glob *.shard\nverbose: /opt/weka/traces: 3 skipped (parse), 0 skipped (filter), 0 remaining\nCollecting:\n  0 shards\n", 0, 0), time.Minute)
+	if res.Status != "no_shards" || !strings.Contains(res.Reason, "none of the 3 shard files") {
+		t.Errorf("all unparsed: %+v", res)
+	}
+	res, _ = runFakeExtractor(t, writeFakeExtractor(t, sampleExtractorOutput, 30, 0), time.Second)
+	if res.Status != "timeout" || res.Shards != 0 || !strings.Contains(res.Reason, "42 shards had been selected") {
+		t.Errorf("timeout: %+v", res)
+	}
+	res, _ = runFakeExtractor(t, writeFakeExtractor(t, "Writing x ...\n", 0, 3), time.Minute)
+	if res.Status != "failed" || !strings.HasPrefix(res.Reason, "exit status 3: Writing x") {
+		t.Errorf("exit 3: %+v", res)
+	}
+}
+
+func TestRunCommand_MinTimeout(t *testing.T) {
+	r, out := runCommand(CommandSpec{Name: "slow", Cmd: "sleep 1; echo done", MinTimeout: 10 * time.Second}, 200*time.Millisecond)
+	if r.Error != "" || !strings.Contains(string(out), "done") {
+		t.Errorf("MinTimeout not applied: %+v %q", r, out)
+	}
+}
+
+func TestBuildWindowedDefaultCmds_FutureStartAndTimeout(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	for _, c := range buildWindowedDefaultCmdsAt(now.Add(3*time.Hour), time.Time{}, now) {
+		if strings.Contains(c.Cmd, "--start-time --") || strings.Contains(c.Cmd, "--start-time -0h") {
+			t.Errorf("bad start offset: %q", c.Cmd)
+		}
+		if c.MinTimeout < eventsMinTimeout {
+			t.Errorf("%s: MinTimeout %s", c.Name, c.MinTimeout)
+		}
+	}
+}
+
+func TestOneLine(t *testing.T) {
+	if got := oneLine("a\n  b\tc ", 100); got != "a b c" {
+		t.Errorf("got %q", got)
+	}
+	if got := oneLine("abcdef", 3); got != "abc" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestRedactAssignments_NoLeaks(t *testing.T) {
+	// Each of these must lose the secret (round-3 review: an earlier
+	// structure-preserving heuristic let them through).
+	for _, in := range []string{
+		`bash -c "export PGPASSWORD='` + fakePW + `'"`,
+		`"cmd": "export VAULT_TOKEN='` + fakePW + `'"`,
+		`sh -c 'export DB_PASSWORD="` + fakePW + `"'`,
+		`<user name="bob" password="` + fakePW + `"/>`,
+		`login failed, password="` + fakePW + `".`,
+		`login failed: password="` + fakePW + `": bad`,
+		`Environment="DB_PASSWORD='` + fakePW + `'"`,
+		`[{"env":"VAULT_TOKEN='` + fakePW + `'"}]`,
+		"DB_PASSWORD=Xy)9k}Lm]" + fakePW,
+		"export API_TOKEN=ab]" + fakePW,
+		"client_secret=ab}" + fakePW,
+		"password=)" + fakePW,
+		"AWS_SECRET_ACCESS_KEY=/3kRtYbE9xQ+" + fakePW,
+		"aws_secret_access_key = /3kRtYbE9xQ+" + fakePW,
+		"WEKA_TOKEN=/opt/weka/" + fakePW,
+	} {
+		got := string(redactSensitive([]byte(in)))
+		if strings.Contains(got, fakePW) {
+			t.Errorf("secret leaked:\ninput: %q\ngot:   %q", in, got)
+		}
+	}
+	// A duration-shaped value ("2024y") under a password name is still a
+	// password. Built from parts so secret scanners do not flag the test.
+	durationShaped := "DB_" + "PASSWORD=" + "2024" + "y"
+	if got := string(redactSensitive([]byte(durationShaped))); got != "DB_PASSWORD=[REDACTED]" {
+		t.Errorf("duration-shaped password kept: %q", got)
+	}
+	// Structure that must survive.
+	for in, want := range map[string]string{
+		`\"VAULT_TOKEN=\",\"PATH=/usr/bin\"`:        `\"VAULT_TOKEN=\",\"PATH=/usr/bin\"`,
+		"(hostId=1, secret=" + fakePW + ")":         "(hostId=1, secret=[REDACTED])",
+		"Config{user=bob, password=" + fakePW + "}": "Config{user=bob, password=[REDACTED]}",
+		"[password=" + fakePW + "]":                 "[password=[REDACTED]]",
+		`{"url":"https://h/api?token=","next":"v"}`: `{"url":"https://h/api?token=","next":"v"}`,
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %q\nwant %q", got, want)
+		}
+	}
+}
+
+func TestRedactSensitive_CLIValuelessFlagsAndCase(t *testing.T) {
+	for in, want := range map[string]string{
+		"weka smb domain join Administrator --debug " + fakePW:      "weka smb domain join Administrator --debug [REDACTED]",
+		"weka nfs ldap setup-openldap s d cn=r --force " + fakePW:   "weka nfs ldap setup-openldap s d cn=r --force [REDACTED]",
+		"Weka user login admin " + fakePW:                           "Weka user login admin [REDACTED]",
+		"weka smb domain join Administrator " + fakePW + " --debug": "weka smb domain join Administrator [REDACTED] --debug",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %q\nwant %q", got, want)
+		}
+	}
+}
+
+// refRedactAll is redactSensitive without any prefilter: every pass on every
+// line. The fast path must give byte-identical output.
+func refRedactAll(b []byte) []byte {
+	isJSON := isJSONDocument(b)
+	if looksLikeJSON(b) {
+		b = redactSensitiveJSON(b)
+	}
+	lines := bytes.Split(b, []byte("\n"))
+	for i, line := range lines {
+		lines[i] = redactLine(line, nil, isJSON, false)
+	}
+	return redactSplitFlagValues(bytes.Join(lines, []byte("\n")))
+}
+
+func TestRedactSensitive_PrefilterEquivalence(t *testing.T) {
+	src, err := os.ReadFile("main_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := strings.Join([]string{
+		"password\r: " + fakePW,
+		"secret\f: " + fakePW,
+		"to\u212aen: " + fakePW,
+		"pa\u017f\u017fword=" + fakePW,
+		"API_\u212aEY=" + fakePW,
+		"Credentials\t: " + fakePW,
+		"db PASSS: " + fakePW,
+		"tokens =" + fakePW,
+		"API-KEYS=" + fakePW,
+		"x_PWDS=" + fakePW,
+		"to\u212aens: " + fakePW,
+		"PASSPHRASE: " + fakePW,
+		"Secret-Key: " + fakePW,
+		"export S3_SECRET_KEYS=" + fakePW,
+		"weka cluster license payg plan-1 " + fakePW,
+		"weka s3 bucket migrate attach b1 https://h:9000 AK " + fakePW + " ca.pem",
+		"weka local resources join-secret --purge " + fakePW,
+		"x --admin-password \"" + fakePW + "\" --y",
+		"Proxy-Authorization: Basic " + fakePW,
+		"plain line without anything",
+	}, "\n")
+	// Content starting with { or [ takes the JSON branches of both
+	// functions: a valid document, one cut short, prefixed pod logs, dmesg.
+	jsonInputs := []string{
+		"{\n  \"join_secret\": [\n    \"" + fakePW + "\"\n  ],\n  \"api-key\": \"" + fakePW + "\",\n  \"note\": \"password: x\"\n}\n",
+		"{\n  \"name\": \"c1\",\n  \"auth.token\": \"" + fakePW + "\",\n  \"tokens\": [\n    \"" + fakePW,
+		"[pod/op/m] {\"msg\":\"x\",\"auth-token\":\"" + fakePW + "\"}\n[pod/op/m] password: " + fakePW + "\n",
+		"[    1.000000] secret_key: " + fakePW + "\n[    1.000001] ok\n",
+		"{\n  \"join-secret\": [\n    \"" + fakePW + "\"\n  ],\n  \"db.passwords\": [\n    \"" + fakePW,
+		"{\"msg\": \"{\\\"x\\\": 1}\", \"db_pwd\": \"" + fakePW + "\", \"credential\": \"" + fakePW + "\"}\n",
+		"{\n  \"toKens\": [\n    \"" + fakePW + "\"\n  ]\n}\n",
+		"{\"other\": \"ok\", \"password\": \"abc\\\"def" + fakePW,
+	}
+	inputs := [][]byte{src, []byte(strings.ToUpper(string(src))), []byte(extra)}
+	for _, s := range jsonInputs {
+		inputs = append(inputs, []byte(s))
+	}
+	for _, in := range inputs {
+		fast, ref := redactSensitive(in), refRedactAll(in)
+		if !bytes.Equal(fast, ref) {
+			fl, rl := bytes.Split(fast, []byte("\n")), bytes.Split(ref, []byte("\n"))
+			t.Errorf("fast path differs from reference (%d vs %d lines) for input starting %q", len(fl), len(rl), bytes.SplitN(in, []byte("\n"), 2)[0])
+			for i := range fl {
+				if i < len(rl) && !bytes.Equal(fl[i], rl[i]) {
+					t.Errorf("line %d differs:\nfast: %q\nref:  %q", i, fl[i], rl[i])
+				}
+			}
+		}
+	}
+	for _, s := range jsonInputs {
+		if got := string(redactSensitive([]byte(s))); strings.Contains(got, fakePW) {
+			t.Errorf("secret survived in JSON-shaped input:\n%s", got)
+		}
+	}
+	got := string(redactSensitive([]byte(extra)))
+	if strings.Count(got, fakePW) != 0 {
+		t.Errorf("secret survived in folded/whitespace cases:\n%s", got)
+	}
+}
+
+func TestRemoteFailure(t *testing.T) {
+	log := "weka-log-collector 0.1.0\nProfile: default\n[WARN]  x\n[ERROR] Upload failed: no uploader\nCleanup done\n"
+	if err := remoteFailure(1, log); err.Error() != "remote run failed (exit 1): Upload failed: no uploader" {
+		t.Errorf("got %v", err)
+	}
+	if err := remoteFailure(255, "ssh: connect to host x port 22: Connection refused\n"); !strings.HasPrefix(err.Error(), "SSH failed (exit 255): ssh: connect") {
+		t.Errorf("got %v", err)
+	}
+	if err := remoteFailure(2, "a\nlast line\n"); err.Error() != "remote run failed (exit 2): last line" {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestParseExtractorOutput_ShardVsHistogramParseFailures(t *testing.T) {
+	out := "verbose: /opt/weka/traces: 5 files match glob *.shard\n" +
+		"verbose: /opt/weka/traces/histograms: 4 skipped (parse), 0 skipped (filter), 0 remaining\n" +
+		"verbose: /opt/weka/traces: 1 skipped (parse), 4 skipped (filter), 0 remaining\nCollecting:\n  0 shards\n"
+	var r TraceResult
+	seen, unparsed := parseExtractorOutput(out, &r)
+	if seen != 5 || unparsed != 1 || r.UnparsedFiles != 5 {
+		t.Errorf("seen=%d unparsed=%d total=%d", seen, unparsed, r.UnparsedFiles)
+	}
+}
+
+func TestRedactAssignments_FinalCheckCases(t *testing.T) {
+	// Separator-only "values" in compact JSON / argv arrays stay structure.
+	for _, in := range []string{
+		`["foo token=","-v"]`,
+		`["sh","-c","export TOKEN=","--x"]`,
+		`["export TOKEN=",""]`,
+		`{"Env":["A=1 SECRET_TOKEN=","/opt/bin"]}`,
+		`{"a":"x?token=","/b":1}`,
+		`{\"args\":[\"export TOKEN=\",\"-v\"]}`,
+		`{"a":"x?token=", "next": 1}`,
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("structure changed:\ninput: %s\ngot:   %s", in, got)
+		}
+	}
+	// Escaped quotes inside a double-quoted value are part of the value.
+	for in, want := range map[string]string{
+		`export PGPASSWORD="pa\"ss1" && psql`: `export PGPASSWORD=[REDACTED] && psql`,
+		`PASSWORD="ab\"cd"`:                   `PASSWORD=[REDACTED]`,
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %s\nwant %s", got, want)
+		}
+	}
+}
+
+func TestRedactSensitive_CLIShortValuelessFlags(t *testing.T) {
+	for in, want := range map[string]string{
+		"weka smb domain leave -f Administrator '" + fakePW + "'": "weka smb domain leave -f Administrator [REDACTED]",
+		"weka smb domain leave Administrator -f '" + fakePW + "'": "weka smb domain leave Administrator -f [REDACTED]",
+		"weka user login -U admin " + fakePW:                      "weka user login -U admin [REDACTED]",
+		"weka user add -R bob clusteradmin " + fakePW:             "weka user add -R bob clusteradmin [REDACTED]",
+		"weka user login --without-agent admin " + fakePW:         "weka user login --without-agent admin [REDACTED]",
+		"weka user login --UTC admin " + fakePW:                   "weka user login --UTC admin [REDACTED]",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got  %q\nwant %q", got, want)
+		}
+	}
+}
+
+func TestRemoteErrorSummary(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"plan\n[ERROR] Not enough free space on /opt/weka: only 150 MB available\n[ERROR] Tip: use --output /path\n[ERROR]      Or free up space on /opt/weka first.\n",
+			"Not enough free space on /opt/weka: only 150 MB available"},
+		{"[ERROR] Tip: use --output to write to a different location\n", "Tip: use --output to write to a different location"},
+		{"log\npanic: runtime error: index out of range\n\ngoroutine 1 [running]:\nmain.main()\n\t/build/main.go:7011 +0x1c4\n", "panic: runtime error: index out of range"},
+		{"a\nlast\n", "last"},
+	}
+	for _, c := range cases {
+		if got := remoteErrorSummary(c.in); got != c.want {
+			t.Errorf("got %q, want %q", got, c.want)
+		}
+	}
+}
+
+func TestCopyExecutable_FailureLeavesNothing(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "te")
+	_ = os.WriteFile(src, []byte("#!/bin/sh\n"), 0644)
+	if _, err := copyExecutable(src, filepath.Join(t.TempDir(), "missing-dir")); err == nil {
+		t.Errorf("expected an error for a missing directory")
+	}
+	dir := t.TempDir()
+	p, err := copyExecutable(src, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0755 || filepath.Dir(p) != dir {
+		t.Errorf("copy %s mode %v", p, fi.Mode())
+	}
+}
+
+// fakeKubectl puts a kubectl script on PATH that sleeps, then prints "ok".
+func fakeKubectl(t *testing.T, sleepSecs int) {
+	t.Helper()
+	dir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\nsleep %d\necho ok\n", sleepSecs)
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestKubectlRunner_TimeoutIsDistinct(t *testing.T) {
+	fakeKubectl(t, 1)
+	kc := &kubectlRunner{timeout: 300 * time.Millisecond}
+	start := time.Now()
+	_, err := kc.execInPod("ns", "pod", "", "weka", "events")
+	if !errors.Is(err, errKubectlTimeout) {
+		t.Fatalf("want errKubectlTimeout, got %v", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("timeout not enforced: %s", d)
+	}
+	// A longer per-call timeout lets the same command finish.
+	out, err := kc.execInPodTimeout(10*time.Second, "ns", "pod", "", "weka", "events")
+	if err != nil || !strings.Contains(string(out), "ok") {
+		t.Errorf("execInPodTimeout: %q %v", out, err)
+	}
+}
+
+func TestK8sEventsCommandHasMinTimeout(t *testing.T) {
+	found := false
+	for _, spec := range clusterWideCLICommands {
+		if strings.Join(spec.cmd[:2], " ") == "weka events" {
+			found = true
+			if k8sCommandMinTimeout[spec.name] < eventsMinTimeout {
+				t.Errorf("%s: min timeout %s, want at least %s", spec.name, k8sCommandMinTimeout[spec.name], eventsMinTimeout)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no weka events command in clusterWideCLICommands")
+	}
+	for name := range k8sCommandMinTimeout {
+		ok := false
+		for _, spec := range clusterWideCLICommands {
+			ok = ok || spec.name == name
+		}
+		if !ok {
+			t.Errorf("k8sCommandMinTimeout names unknown command %s", name)
+		}
+	}
+}
+
+func TestRedactSplitFlagValues_DescribeArgs(t *testing.T) {
+	in := "    Args:\n      --log-level\n      debug\n      --api-token\n      " + fakeBearer + "\n      --join-secret\n      --next-flag\n    Ready: True\n"
+	want := "    Args:\n      --log-level\n      debug\n      --api-token\n      [REDACTED]\n      --join-secret\n      --next-flag\n    Ready: True\n"
+	if got := string(redactSensitive([]byte(in))); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+	if got := string(redactSensitive([]byte("--password\n"))); got != "--password\n" {
+		t.Errorf("flag with nothing after it changed: %q", got)
+	}
+}
+
+func TestRedactSensitive_PrefixedPodLogsGetKeyPass(t *testing.T) {
+	in := "[pod/cl-compute-1/weka-container] 2026-11-27 10:00:01 setup password: " + fakePW + "\n[pod/cl-compute-1/weka-container] ok\n"
+	got := string(redactSensitive([]byte(in)))
+	if strings.Contains(got, fakePW) {
+		t.Errorf("prefixed pod log line not redacted:\n%s", got)
+	}
+	if isJSONDocument([]byte(in)) || isJSONDocument([]byte("[    0.000000] Linux version")) {
+		t.Errorf("log text classified as a JSON document")
+	}
+	if !isJSONDocument([]byte(` {"a": 1, "join_secret": ["x"]}`)) || !isJSONDocument([]byte("[\n {\"a\": 1}\n]\n")) {
+		t.Errorf("real JSON not classified as a JSON document")
+	}
+}
+
+// JSON that does not parse (cut short by a command timeout, or followed by a
+// trailer line) still gets the whole-document pass, the only one that
+// redacts a multi-line array such as join_secret.
+func TestRedactSensitive_InvalidJSONGetsArrayPass(t *testing.T) {
+	doc := "{\n  \"name\": \"c1\",\n  \"join_secret\": [\n    \"" + fakePW + "\"\n  ],\n  \"other\": \"ok\""
+	cutIn := "{\n  \"other\": \"ok\",\n  \"join_secret\": [\n    \""
+	for name, in := range map[string]string{
+		"truncated":          doc + ",\n  \"more\": [\n    \"x",
+		"trailer":            doc + "\n}\nerror: command timed out\n",
+		"array top level":    "[\n {\"other\": \"ok\", \"join_secret\": [\n   \"" + fakePW + "\"\n ]},\n {\"a\": ",
+		"cut inside array":   cutIn + fakePW + "\"\n",
+		"cut inside value":   cutIn + fakePW,
+		"bracket in value":   cutIn + "x]" + fakePW,
+		"cut on one line":    `{"other": "ok", "join_secret": ["` + fakePW + `"`,
+		"cut after an entry": cutIn + "a\", \"" + fakePW,
+		"escaped quote":      cutIn + "a\\\"]\", \"" + fakePW,
+		"cut scalar":         "{\"other\": \"ok\", \"password\": \"" + fakePW,
+		"cut scalar lines":   "{\n  \"other\": \"ok\",\n  \"join_secret\": \"" + fakePW,
+		"cut after escape":   "{\"other\": \"ok\", \"password\": \"abc\\\"def" + fakePW,
+	} {
+		if isJSONDocument([]byte(in)) {
+			t.Fatalf("%s: test input parses as JSON", name)
+		}
+		got := string(redactSensitive([]byte(in)))
+		if strings.Contains(got, fakePW) {
+			t.Errorf("%s: join_secret array not redacted:\n%s", name, got)
+		}
+		if !strings.Contains(got, `"other": "ok"`) {
+			t.Errorf("%s: unrelated key changed:\n%s", name, got)
+		}
+	}
+	// Valid JSON never ends inside an array or string, so the end-of-content
+	// passes leave it alone, also with escaped quotes and backslashes.
+	for _, in := range []string{
+		`{"tokens": ["a", "b"], "x": 1}`,
+		"{\"join_secret\": [\n  \"[REDACTED]\"\n]}\n",
+		`{"tokens": [["a"],["b"]]}`,
+		`{"tokens": ["a\"b"], "x": 1}`,
+		`{"tokens": ["a\\"], "password": "c\\", "x": "y"}`,
+		`{"password": "a\"b", "x": 1}`,
+	} {
+		if jsonUnclosedArrayRe.MatchString(in) || jsonUnclosedValueRe.MatchString(in) {
+			t.Errorf("end-of-content pattern matched valid JSON %q", in)
+		}
+		if got := string(redactSensitive([]byte(in))); !strings.HasSuffix(strings.TrimSpace(got), "}") {
+			t.Errorf("valid JSON lost its end: %q -> %q", in, got)
+		}
+	}
+	// An escaped quote inside a credential value no longer ends it.
+	if got := string(redactSensitive([]byte(`{"password": "abc\"` + fakePW + `", "x": 1}`))); strings.Contains(got, fakePW) || !strings.Contains(got, `"x": 1`) {
+		t.Errorf("escaped quote in value: %q", got)
+	}
+	if got := string(redactSensitive([]byte(`{"tokens": ["a\"` + fakePW + `"], "x": 1}`))); strings.Contains(got, fakePW) || !strings.Contains(got, `"x": 1`) {
+		t.Errorf("escaped quote in array: %q", got)
+	}
+}
+
+// Credential forms that other patterns already covered for the same name:
+// positional join secrets on the weka CLI, quoted flag values, secret_key,
+// passphrase, other Authorization schemes and hyphenated or dotted JSON keys.
+func TestRedactSensitive_SiblingForms(t *testing.T) {
+	for _, in := range []string{
+		"weka cluster container join-secret 3 " + fakePW,
+		"weka local resources join-secret " + fakePW,
+		"weka local resources join-secret --purge " + fakePW,
+		"weka local resources join-secret -C drives0 " + fakePW,
+		"weka cluster container join-token 3 " + fakePW,
+		"weka local resources join-token " + fakePW,
+		"weka cluster license payg plan-1 " + fakePW,
+		"weka s3 bucket migrate attach b1 https://10.0.0.1:9000 AKEXAMPLE " + fakePW + " /root/ca.pem",
+		"weka cluster create h1 h2 --admin-password \"" + fakePW + "\" --join-secret 'x" + fakePW + "'",
+		"weka local setup container --join-secret \"" + fakePW + "\"",
+		"weka fs tier s3 add obs --secret-key \"" + fakePW + "\"; echo done",
+		"Access-Key: AKEXAMPLE\nSecret-Key: " + fakePW + "\nSession-Token: x",
+		"secret_key: " + fakePW,
+		"    secretKey: " + fakePW,
+		"secret_key = " + fakePW,
+		"export S3_SECRET_KEY=" + fakePW,
+		"obs_add(name='obs1', secret_key='" + fakePW + "')",
+		"passphrase: " + fakePW,
+		"  ssl_key_passphrase: " + fakePW,
+		"PASSPHRASES: " + fakePW,
+		"curl -sk -H 'Authorization: Basic " + fakePW + "' https://h:14000/api/v2/cluster",
+		"Proxy-Authorization: Basic " + fakePW,
+		"Authorization: Negotiate " + fakePW,
+		"Authorization: NTLM " + fakePW,
+		"Authorization: Bearer \"" + fakePW + "\"",
+		"Authorization: ApiKey " + fakePW,
+		"Authorization: SSWS " + fakePW,
+		"Authorization: AWS AKEXAMPLE:" + fakePW,
+		"weka cluster container join-secret -H 10.0.0.1 3 " + fakePW,
+		"weka cluster license payg -H backend1 plan-1 " + fakePW,
+		"weka s3 bucket migrate attach -H backend1 b1 https://h:9000 AK " + fakePW + " ca.pem",
+		"weka user login -H 10.0.0.1 admin " + fakePW,
+		`{"cmd": "weka local setup container --join-secret '` + fakePW + `'"}`,
+		`sh -c 'weka cluster create h1 h2 --admin-password "` + fakePW + `"'`,
+		`  command: ["sh", "-c", "weka local setup container --join-secret '` + fakePW + `'"]`,
+		`{"cmd": "weka cluster create h1 --admin-password \"` + fakePW + `\""}`,
+		`run --password "ab\" ` + fakePW + `"`,
+		`weka x --admin-pass="` + fakePW + `"`,
+		`weka x --db-pwd='` + fakePW + `'`,
+		`weka x --api-auth="` + fakePW + `", next`,
+		`{"join-secret": "` + fakePW + `"}`,
+		"headers={'Host': 'h', 'x-amz-security-token': '" + fakePW + "'}",
+		`{"X-Auth-Token": "` + fakePW + `"}`,
+		`msg="{\"client-secret\": \"` + fakePW + `\"}"`,
+		`{"spring.datasource.password": "` + fakePW + `"}`,
+		`[pod/a/b] kubectl.kubernetes.io/last-applied-configuration: {"data":{"access-token":"` + fakePW + `"}}`,
+		"{\"tokens-v2\": [\n  \"" + fakePW + "\"\n], \"x\": 1}\n",
+	} {
+		if got := string(redactSensitive([]byte(in))); strings.Contains(got, fakePW) {
+			t.Errorf("not redacted: %q", got)
+		}
+	}
+	for _, in := range []string{
+		`cmd="weka local setup container --join-secret ", next="foo"`,
+		`{"cmd": "weka local setup container --join-secret ", "x": "y"}`,
+		"weka local resources join-secret --help",
+		"weka cluster container join-secret",
+		"        secretKeyRef:",
+		"  - key: node-role.kubernetes.io/control-plane",
+		"partition_key: id",
+		"weka cluster container join-secret -H 10.0.0.1 --help",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("changed: %q -> %q", in, got)
+		}
+	}
+}
+
+// redactSensitiveValues runs the same value passes as redactLine, so the
+// table tests that use it see the quoted-flag pass too.
+func TestRedactSensitiveValues_MatchesLinePass(t *testing.T) {
+	for _, in := range []string{
+		"x --admin-password \"" + fakePW + "\" --y",
+		"x --join-secret='" + fakePW + "'",
+		"Authorization: Basic " + fakePW,
+	} {
+		vals := string(redactSensitiveValues([]byte(in)))
+		line := string(redactLine([]byte(in), nil, true, false))
+		if strings.Contains(vals, fakePW) || vals != line {
+			t.Errorf("redactSensitiveValues %q, redactLine %q", vals, line)
+		}
+	}
+}
+
+// hasQuotedCredentialKey gates the quoted-key patterns, so it must be true
+// wherever one of them matches.
+func TestHasQuotedCredentialKey_CoversPatterns(t *testing.T) {
+	src, err := os.ReadFile("main_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(src)+"\n"+strings.ToUpper(string(src)), "\n")
+	lines = append(lines,
+		"{\"a-b.password\"\n  :\n  [\"x\"]}",
+		"x 'Secret-Key' :\t'v'",
+		`{"API_KEY":"v"}`,
+		`"a"b-token": "v"`,
+	)
+	matched := 0
+	for _, l := range lines {
+		b := []byte(l)
+		if foldsToASCII(b) {
+			continue
+		}
+		lower := asciiLower(b)
+		if jsonSensitiveValueRe.Match(b) || jsonSensitiveArrayRe.Match(b) || jsonUnclosedArrayRe.Match(b) || jsonUnclosedValueRe.Match(b) {
+			matched++
+			if !hasQuotedCredentialKey(lower, '"') {
+				t.Errorf("gate false but a double-quoted pattern matches: %q", l)
+			}
+		}
+		if jsonSingleQuotedValueRe.Match(b) {
+			matched++
+			if !hasQuotedCredentialKey(lower, '\'') {
+				t.Errorf("gate false but the single-quoted pattern matches: %q", l)
+			}
+		}
+	}
+	if matched < 20 {
+		t.Errorf("only %d lines matched a pattern; the check is too weak", matched)
+	}
+}
+
+// A credential key with nothing after its colon (a YAML parent key) has no
+// value on that line: the line, trailing spaces and CR included, stays.
+func TestRedactSensitive_KeyWithoutValueUnchanged(t *testing.T) {
+	for _, in := range []string{
+		"apiVersion: v1\r\nkind: ServiceAccount\r\nsecrets:\r\n- name: default-token-abcde\r\n",
+		"secrets:   \n- name: x\n",
+		"credentials:\t\n  user: x\n",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("changed: %q -> %q", in, got)
+		}
+	}
+	if got := string(redactSensitive([]byte("password: " + fakePW + "\r\n"))); strings.Contains(got, fakePW) {
+		t.Errorf("value with CRLF not redacted: %q", got)
+	}
+}
+
+// Plural key names hold credentials as often as singular ones.
+func TestRedactSensitive_PluralKeys(t *testing.T) {
+	for _, in := range []string{
+		"credentials: " + fakePW,
+		"2026-11-28T10:00:01Z host app[1]: ldap passwords : " + fakePW,
+		"  API_KEYS:" + fakePW,
+		"secrets:\t" + fakePW,
+		"DB_PASSWORDS=" + fakePW,
+		"export VAULT_TOKENS=" + fakePW,
+		"aws_access_keys = " + fakePW,
+		"https://x/cb?client_secrets=" + fakePW + "&a=1",
+	} {
+		if got := string(redactSensitive([]byte(in))); strings.Contains(got, fakePW) {
+			t.Errorf("plural key not redacted: %q", got)
+		}
+	}
+	for _, in := range []string{"max_token_count=5", "spec_store_bypass_disable=on", "tokenizer: bpe"} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("non-credential name changed: %q -> %q", in, got)
+		}
+	}
+}
+
+func TestRemoteRunTimeout(t *testing.T) {
+	oldCT, oldPath, oldTT := collectTraces, resolvedTraceExtractorPath, traceTimeout
+	defer func() { collectTraces, resolvedTraceExtractorPath, traceTimeout = oldCT, oldPath, oldTT }()
+	base := 10 * time.Minute
+
+	collectTraces, resolvedTraceExtractorPath = false, ""
+	if got := remoteRunTimeout(base, "h", false); got != base {
+		t.Errorf("no traces: got %s, want %s", got, base)
+	}
+
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	traceDeployFailed.Store("bad-host", "scp failed")
+	defer traceDeployFailed.Delete("bad-host")
+	if got := remoteRunTimeout(base, "bad-host", false); got != base {
+		t.Errorf("deploy failed: got %s, want %s", got, base)
+	}
+	for _, c := range []struct {
+		trace  time.Duration
+		upload bool
+		want   time.Duration
+	}{
+		{15 * time.Minute, false, base + 30*time.Minute},
+		{time.Second, false, base + time.Second + minTraceStreamAllowance},
+		{time.Hour, false, base + 2*time.Hour},
+		{15 * time.Minute, true, base + 15*time.Minute + traceUploadAllowance},
+	} {
+		traceTimeout = c.trace
+		if got := remoteRunTimeout(base, "h", c.upload); got != c.want {
+			t.Errorf("trace-timeout %s upload=%v: got %s, want %s", c.trace, c.upload, got, c.want)
+		}
+		// remoteRun, used by both remote paths, puts the same limit into
+		// the remote timeout(1) command.
+		limit, cmd := remoteRun("h", "/opt/x/wlc", "true", base, c.upload)
+		if want := fmt.Sprintf("timeout %d ", int(c.want.Seconds())); limit != c.want || !strings.Contains(cmd, want) {
+			t.Errorf("remoteRun upload=%v: limit %s, command %q, want %q", c.upload, limit, cmd, want)
+		}
+	}
+	// The two remote paths build their commands with the right limit.
+	traceTimeout = 15 * time.Minute
+	from, to := time.Unix(1764320400, 0), time.Unix(1764322200, 0)
+	limit, cmd := collectRemoteCommand("h", "/opt/x/wlc", "default", from, to, nil, base)
+	if want := base + 30*time.Minute; limit != want || !strings.Contains(cmd, fmt.Sprintf("timeout %d ", int(want.Seconds()))) || !strings.Contains(cmd, "'--output' '-'") {
+		t.Errorf("collectRemoteCommand: limit %s, command %q", limit, cmd)
+	}
+	limit, cmd = uploadRemoteCommand("h", "/opt/x/wlc", "default", from, to, nil, 7, "gzip", base)
+	if want := base + 15*time.Minute + traceUploadAllowance; limit != want || !strings.Contains(cmd, fmt.Sprintf("timeout %d ", int(want.Seconds()))) || !strings.Contains(cmd, "--upload") {
+		t.Errorf("uploadRemoteCommand: limit %s, command %q", limit, cmd)
+	}
+	// --trace-timeout is bounded, so the doubled limit cannot overflow.
+	for d, ok := range map[time.Duration]bool{
+		0: false, -time.Second: false, time.Second: true, maxTraceTimeout: true, maxTraceTimeout + time.Second: false,
+	} {
+		if err := validateTraceTimeout(d); (err == nil) != ok {
+			t.Errorf("validateTraceTimeout(%s): %v", d, err)
+		}
+	}
+}
+
+func TestRedactSensitive_NoDoubleRedaction(t *testing.T) {
+	for in, want := range map[string]string{
+		"weka agent --token=" + fakeSRT:      "weka agent --token=[REDACTED]",
+		"proc --join-secret=" + fakeBearer:   "proc --join-secret=[REDACTED]",
+		"x --password=" + fakePW + " --next": "x --password=[REDACTED] --next",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+}
+
+func TestPodsPreferring(t *testing.T) {
+	pods := []string{"a", "b", "c"}
+	if got := strings.Join(podsPreferring(pods, "b"), ","); got != "b,a,c" {
+		t.Errorf("got %s", got)
+	}
+	if got := strings.Join(podsPreferring(pods, ""), ","); got != "a,b,c" {
+		t.Errorf("got %s", got)
+	}
+	if got := strings.Join(podsPreferring(pods, "zz"), ","); got != "a,b,c" {
+		t.Errorf("got %s", got)
+	}
+}
+
+// runClusterWideWithFakeKubectl runs runK8sClusterWideCommands against a fake
+// kubectl script and returns the archived command files and the call log.
+func runClusterWideWithFakeKubectl(t *testing.T, script string, pods []string) (map[string]bool, string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	full := "#!/bin/sh\necho \"$*\" >> " + logPath + "\n" + script
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(full), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	saved := map[string]time.Duration{}
+	for name, d := range k8sCommandMinTimeout {
+		saved[name] = d
+		k8sCommandMinTimeout[name] = time.Second
+	}
+	defer func() {
+		for name, d := range saved {
+			k8sCommandMinTimeout[name] = d
+		}
+	}()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	runK8sClusterWideCommands(tw, &kubectlRunner{timeout: 300 * time.Millisecond}, "root", "ns", pods, &k8sManifest{})
+	tw.Close()
+	files := map[string]bool{}
+	tr := tar.NewReader(&buf)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		files[hdr.Name] = true
+	}
+	calls, _ := os.ReadFile(logPath)
+	return files, string(calls)
+}
+
+func TestK8sClusterWide_HungFirstPodStillGetsEvents(t *testing.T) {
+	// c-compute-0 never answers; c-compute-1 answers everything.
+	script := "case \"$2\" in c-compute-0) exec sleep 30;; esac\necho ok\n"
+	files, _ := runClusterWideWithFakeKubectl(t, script, []string{"c-compute-0", "c-compute-1"})
+	for _, f := range []string{"root/weka-commands/weka_status.txt", "root/weka-commands/weka_events_major.txt", "root/weka-commands/weka_events_warning.txt"} {
+		if !files[f] {
+			t.Errorf("%s missing; got %v", f, files)
+		}
+	}
+}
+
+func TestK8sClusterWide_SlowEventsNotRetriedOnOtherPods(t *testing.T) {
+	// Every pod answers quickly, but weka events itself is slow.
+	script := "case \"$*\" in *events*) exec sleep 30;; esac\necho ok\n"
+	start := time.Now()
+	files, calls := runClusterWideWithFakeKubectl(t, script, []string{"c-compute-0", "c-compute-1", "c-compute-2"})
+	if files["root/weka-commands/weka_events_major.txt"] {
+		t.Errorf("events should have timed out")
+	}
+	// One call per events command (major, warning), never repeated on other pods.
+	if n, want := strings.Count(calls, "events"), len(k8sCommandMinTimeout); n != want {
+		t.Errorf("slow events queries ran %d times, want %d (no per-pod retry):\n%s", n, want, calls)
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Errorf("took %s", d)
+	}
+}
+
+func TestWindowIsEmpty(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		from, to time.Time
+		want     bool
+	}{
+		{now.Add(time.Hour), time.Time{}, true},              // --local, future start, no end
+		{now.Add(time.Hour), now, true},                      // cluster mode, end fixed at now
+		{now.Add(-time.Hour), time.Time{}, false},            // normal --local
+		{now.Add(-time.Hour), now.Add(-2 * time.Hour), true}, // end before start
+		{time.Time{}, time.Time{}, false},
+	}
+	for i, c := range cases {
+		if got := windowIsEmpty(c.from, c.to, now); got != c.want {
+			t.Errorf("case %d: got %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+func TestK8sHasBothEventsFiles(t *testing.T) {
+	names := map[string]bool{}
+	for _, spec := range clusterWideCLICommands {
+		names[spec.name] = true
+	}
+	for _, n := range []string{"weka_events_major.txt", "weka_events_warning.txt"} {
+		if !names[n] {
+			t.Errorf("k8s clusterWideCLICommands lacks %s", n)
+		}
+	}
+}
+
+func TestRunTraceExtractor_LocalWindowEndFixed(t *testing.T) {
+	// --local leaves "to" unset; the extractor must still get --to, set to
+	// the time the 60 minute cap was checked, not "now" after log collection.
+	end := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+	old := traceWindowEnd
+	traceWindowEnd = end
+	defer func() { traceWindowEnd = old }()
+
+	oldPath, oldTimeout := resolvedTraceExtractorPath, traceTimeout
+	resolvedTraceExtractorPath, traceTimeout = writeFakeExtractor(t, sampleExtractorOutput, 0, 0), time.Minute
+	defer func() { resolvedTraceExtractorPath, traceTimeout = oldPath, oldTimeout }()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	runTraceExtractor(tw, "root", "h1", end.Add(-time.Hour), time.Time{})
+	tw.Close()
+	tr := tar.NewReader(&buf)
+	var log string
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if strings.HasSuffix(hdr.Name, "extractor.log") {
+			b, _ := io.ReadAll(tr)
+			log = string(b)
+		}
+	}
+	if !strings.Contains(log, "--to "+end.Format(time.RFC3339)) {
+		t.Errorf("extractor did not get the fixed window end:\n%s", log)
+	}
+}
+
+func TestExitProcessRunsCleanups(t *testing.T) {
+	if path := os.Getenv("WLC_TEST_EXIT_CLEANUP"); path != "" {
+		// Child: register a cleanup that removes the file, then exit.
+		addExitCleanup(func() { os.Remove(path) })
+		exitProcess(3)
+		return
+	}
+	path := filepath.Join(t.TempDir(), "copy")
+	if err := os.WriteFile(path, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestExitProcessRunsCleanups$")
+	cmd.Env = append(os.Environ(), "WLC_TEST_EXIT_CLEANUP="+path)
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("want exit code 3, got %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("cleanup did not run before exit: %s still exists", path)
+	}
+}
+
+func TestRemoteNodeArgs_RunLevelTraceSkip(t *testing.T) {
+	oldCT, oldReason := collectTraces, traceSkipReason
+	collectTraces, traceSkipReason = false, "time window is 120 minutes (max: 60 minutes)"
+	defer func() { collectTraces, traceSkipReason = oldCT, oldReason }()
+	args := strings.Join(remoteNodeArgs("h", time.Time{}, time.Time{}, nil), " ")
+	if !strings.Contains(args, "--trace-skip-reason time window is 120 minutes (max: 60 minutes)") || strings.Contains(args, "--collect-traces") {
+		t.Errorf("run-level skip not forwarded: %s", args)
+	}
+}
+
+func TestRemoteTraceLine(t *testing.T) {
+	stderr := "Traces:   /opt/weka/weka-log-collector/trace_extractor-1  (filter: --all)\n" +
+		"Traces:   ./te is not executable; running a copy (/tmp/x)\n" +
+		"[traces] 42 shards, 7 histogram files in 3s\n\nCollection complete → x\n" +
+		"  Commands: 80 total, 0 failed\n  Traces:   ok, 42 shards\n"
+	if got := remoteTraceLine(stderr); got != "ok, 42 shards" {
+		t.Errorf("got %q", got)
+	}
+	if got := remoteTraceLine("no traces here\n"); got != "" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestEarlySignalHandler(t *testing.T) {
+	switch os.Getenv("WLC_TEST_EARLY_SIG") {
+	case "handle", "handover":
+		path := os.Getenv("WLC_TEST_EARLY_FILE")
+		addExitCleanup(func() { os.Remove(path) })
+		startEarlySignalHandler(false)
+		if os.Getenv("WLC_TEST_EARLY_SIG") == "handover" {
+			stopEarlySignalHandler()
+		}
+		_ = os.WriteFile(path+".ready", nil, 0644)
+		time.Sleep(10 * time.Second)
+		os.Exit(7) // not reached when the signal is handled
+	}
+	for _, mode := range []string{"handle", "handover"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "copy")
+		_ = os.WriteFile(path, []byte("x"), 0755)
+		cmd := exec.Command(os.Args[0], "-test.run=^TestEarlySignalHandler$")
+		cmd.Env = append(os.Environ(), "WLC_TEST_EARLY_SIG="+mode, "WLC_TEST_EARLY_FILE="+path)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 100; i++ {
+			if _, err := os.Stat(path + ".ready"); err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		_ = cmd.Process.Signal(os.Interrupt)
+		err := cmd.Wait()
+		_, statErr := os.Stat(path)
+		switch mode {
+		case "handle":
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || !os.IsNotExist(statErr) {
+				t.Errorf("handle: want exit 1 and copy removed, got err=%v copyErr=%v", err, statErr)
+			}
+		case "handover":
+			// After stopEarlySignalHandler the early handler must not act:
+			// the default SIGINT action ends the process, the file stays.
+			if err == nil || statErr != nil {
+				t.Errorf("handover: want default signal exit with the file kept, got err=%v copyErr=%v", err, statErr)
+			}
+		}
+	}
+}
+
+func TestRunK8sMode_UploadFailureExitCode(t *testing.T) {
+	if os.Getenv("WLC_TEST_K8S_UPLOAD") != "" {
+		os.Exit(runK8sMode([]string{"--upload", "--cmd-timeout", "5s", "--output", os.Getenv("WLC_TEST_K8S_OUT")}))
+	}
+	dir := t.TempDir()
+	// A kubectl that only answers "version"; everything else fails.
+	script := "#!/bin/sh\ncase \"$1\" in version) echo 'Client Version: v1.29.0'; exit 0;; esac\necho 'error: not found' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunK8sMode_UploadFailureExitCode$")
+	cmd.Env = append(os.Environ(), "WLC_TEST_K8S_UPLOAD=1", "WLC_TEST_K8S_OUT="+filepath.Join(dir, "b.tar.gz"),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Errorf("want exit 1 after a failed k8s upload, got %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "Upload failed") {
+		t.Errorf("exit 1 did not come from the upload step:\n%s", out)
+	}
+}
+
+func TestUploadSignalSetup_UnderClusterHandler(t *testing.T) {
+	// Under the cluster handler the upload must not install its own handler
+	// (it would exit before the remote collectors are killed); it registers
+	// its cleanup for the cluster handler to run instead.
+	clusterSignalHandler.Store(true)
+	defer clusterSignalHandler.Store(false)
+	exitCleanupsMu.Lock()
+	before := len(exitCleanups)
+	exitCleanupsMu.Unlock()
+	ran := false
+	undo := uploadSignalSetup(func() { ran = true })
+	undo()
+	exitCleanupsMu.Lock()
+	added := exitCleanups[before:]
+	exitCleanups = exitCleanups[:before]
+	exitCleanupsMu.Unlock()
+	if len(added) != 1 {
+		t.Fatalf("want the cleanup registered once, got %d", len(added))
+	}
+	added[0]()
+	if !ran {
+		t.Errorf("registered cleanup is not the upload's")
+	}
+}
+
+func TestUploadSignalSetup_OwnHandler(t *testing.T) {
+	if path := os.Getenv("WLC_TEST_UPLOAD_SIG"); path != "" {
+		undo := uploadSignalSetup(func() { os.Remove(path) })
+		defer undo()
+		_ = os.WriteFile(path+".ready", nil, 0644)
+		time.Sleep(10 * time.Second)
+		os.Exit(7)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "staged")
+	_ = os.WriteFile(path, []byte("x"), 0644)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestUploadSignalSetup_OwnHandler$")
+	cmd.Env = append(os.Environ(), "WLC_TEST_UPLOAD_SIG="+path)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(path + ".ready"); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = cmd.Process.Signal(os.Interrupt)
+	err := cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Errorf("want exit 1 from the upload handler, got %v", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("staged file not cleaned up")
 	}
 }

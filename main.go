@@ -13,7 +13,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,10 +27,12 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -47,8 +52,10 @@ const (
 	wlcRunLock        = "/tmp/weka-log-collector.lock"
 	uploadFileMaxSize = 50 * 1024 * 1024 // 50 MB
 
-	traceExtractorBin        = "trace_extractor"
-	remoteTraceExtractorPath = wlcBaseDir + "/" + traceExtractorBin
+	traceExtractorBin = "trace_extractor"
+	// legacyTraceExtractorPath is where older wlc versions deployed the
+	// extractor; still checked by findTraceExtractor as a last resort.
+	legacyTraceExtractorPath = wlcBaseDir + "/" + traceExtractorBin
 	traceMaxWindow           = time.Hour
 )
 
@@ -81,48 +88,102 @@ func stripANSI(b []byte) []byte { return ansiEscape.ReplaceAll(b, nil) }
 // Permissive on purpose: the bare "pass" alternative catches camelCase variants
 // (pcsPass, dbPass, ldapPass) and prefixed forms (pgpass, db_password). False
 // positives like "bypass:" or "compass:" are accepted — over-redacting a
-// non-secret is far less harmful than leaking a credential.
+// non-secret is far less harmful than leaking a credential. Plurals
+// (credentials:, passwords:, api_keys:) match too.
 var sensitiveKeyRe = regexp.MustCompile(
-	`(?i)(password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\s*:`)
+	`(?i)(password|passwd|passphrase|pwd|pass|token|secret|secret[-_]?id|secret[-_]?key|api[-_]?key|auth|authtok|credential|private[-_]?key|access[-_]?key|signing[-_]?key)s?\s*:`)
 
 // jsonSensitiveValueRe matches a JSON `"key": "value"` pair where the key
 // contains a credential-like substring. Captures the prefix (key + colon +
 // opening quote) so the replacement preserves quotes and only the value text
 // is replaced with [REDACTED]. Operates on raw JSON bytes (no parse / re-marshal)
-// so Weka's grep-friendly JSON formatting is preserved exactly.
+// so Weka's grep-friendly JSON formatting is preserved exactly. The value
+// honours backslash escapes ("a\"b" is one string); a string that only ends at
+// an escaped quote is still taken as the fallback.
 var jsonSensitiveValueRe = regexp.MustCompile(
-	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)"[^"]*"`)
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)(?:"(?:[^"\\\n]|\\.)*"|"[^"\n]*")`)
+
+// jsonSingleQuotedValueRe and jsonEscapedValueRe are the same key/value pair
+// as jsonSensitiveValueRe, written as a Python-style dict ('password': 'x')
+// or as JSON embedded in a JSON/log string (\"access_token\": \"eyJ...\").
+// Both appear inside ordinary text lines (journal, output.log).
+var (
+	jsonSingleQuotedValueRe = regexp.MustCompile(
+		`(?i)('[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*'[ \t]*:[ \t]*)'[^'\n]*'`)
+	jsonEscapedValueRe = regexp.MustCompile(
+		`(?i)(\\"[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*\\"[ \t]*:[ \t]*\\")(?:[^"\\\n]|\\[^"\n])*(\\")`)
+)
 
 // jsonSensitiveArrayRe matches a JSON `"key": [...]` pair where the key contains
 // a credential-like substring and the value is a JSON array. Needed for fields
 // like join_secret that Weka stores as single-element string arrays.
 var jsonSensitiveArrayRe = regexp.MustCompile(
-	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)\[(?:"[^"]*"|[^"\]])*\]`)
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)\[(?:"(?:[^"\\]|\\(?s:.))*"|"[^"]*"|[^"\]])*\]`)
+
+// jsonUnclosedArrayRe is the same pair when the content ends inside the array
+// (output cut short there), including a value string cut in the middle, and
+// jsonUnclosedValueRe a string value cut in the middle. Their strings honour
+// backslash escapes, so neither can match valid JSON, where every array and
+// string is closed. (The closed patterns also accept a string ended by an
+// escaped quote, a fallback for text that only looks like JSON.)
+var jsonUnclosedArrayRe = regexp.MustCompile(
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)\[(?:"(?:[^"\\]|\\(?s:.))*"|[^"\]])*(?:"(?:[^"\\]|\\(?s:.))*\\?)?\z`)
+var jsonUnclosedValueRe = regexp.MustCompile(
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)"(?:[^"\\\n]|\\.)*\\?\z`)
+
+// unclosedArrayTail is how much of the end of the content jsonUnclosedArrayRe
+// looks at: an array cut at the end starts well within it, and scanning only
+// the tail keeps large inputs fast.
+const unclosedArrayTail = 64 << 10
 
 // redactSensitiveYAML replaces the value of any YAML/text line whose key matches
 // sensitiveKeyRe with [REDACTED]. Only single-line scalar values are redacted;
 // multiline blocks are left as-is (they do not contain credentials in practice).
+//
+// Everything after the matched key's own colon is replaced, not everything
+// after the line's first colon: in syslog/journal/output.log lines the first
+// colon is inside the timestamp, which used to leave only the timestamp.
 func redactSensitiveYAML(b []byte) []byte {
 	lines := bytes.Split(b, []byte("\n"))
 	for i, line := range lines {
-		if sensitiveKeyRe.Match(line) {
-			// Find the colon and replace everything after it.
-			idx := bytes.Index(line, []byte(":"))
-			if idx >= 0 && idx < len(line)-1 {
-				lines[i] = append(line[:idx+1], []byte(" [REDACTED]")...)
-			}
-		}
+		lines[i] = redactSensitiveYAMLLine(line)
 	}
 	return bytes.Join(lines, []byte("\n"))
+}
+
+// redactSensitiveYAMLLine leaves a key with nothing but whitespace after its
+// colon alone (a YAML parent key such as "secrets:" with trailing spaces or
+// a CRLF ending): there is no value on the line to redact.
+func redactSensitiveYAMLLine(line []byte) []byte {
+	if loc := sensitiveKeyRe.FindIndex(line); loc != nil && len(bytes.TrimRight(line[loc[1]:], " \t\r\f\v")) > 0 {
+		return append(line[:loc[1]:loc[1]], []byte(" [REDACTED]")...)
+	}
+	return line
 }
 
 // redactSensitiveJSON replaces the value of any JSON key whose name contains a
 // credential-like substring with [REDACTED]. Handles both string scalar values
 // ("key": "val") and array values ("key": [...]) — the latter covers fields like
-// join_secret that Weka stores as single-element arrays.
+// join_secret that Weka stores as single-element arrays — and an array the
+// content ends inside.
 func redactSensitiveJSON(b []byte) []byte {
+	// The end-of-content passes run first: a closed-pattern match on a cut
+	// value (taking an escaped quote as the end) would hide the rest of it.
+	b = redactUnclosedTail(b, jsonUnclosedArrayRe, `["[REDACTED]"`)
+	b = redactUnclosedTail(b, jsonUnclosedValueRe, `"[REDACTED]`)
 	b = jsonSensitiveValueRe.ReplaceAll(b, []byte(`$1"[REDACTED]"`))
 	b = jsonSensitiveArrayRe.ReplaceAll(b, []byte(`$1["[REDACTED]"]`))
+	return b
+}
+
+// redactUnclosedTail replaces what follows group 1 of an end-anchored match
+// of re in the last unclosedArrayTail bytes of b with repl.
+func redactUnclosedTail(b []byte, re *regexp.Regexp, repl string) []byte {
+	tail := max(len(b)-unclosedArrayTail, 0)
+	if loc := re.FindSubmatchIndex(b[tail:]); loc != nil {
+		end := tail + loc[3]
+		b = append(b[:end:end], repl...)
+	}
 	return b
 }
 
@@ -131,47 +192,517 @@ func redactSensitiveJSON(b []byte) []byte {
 // cases that fall through (e.g. CLI args in ps aux, Authorization headers in
 // shelld.log, bare Weka SRT tokens).
 //
-//	[1] HTTP Authorization header: "Authorization: Bearer <token>" or "Authorization: Token <token>"
+//	[1] HTTP Authorization header (also Proxy-Authorization and Go's
+//	    map[Authorization:[...]] form) with the Bearer, Token, Basic,
+//	    Negotiate, NTLM, ApiKey, SSWS or AWS scheme
 //	[2] CLI flag whose name contains a credential substring (aligned with sensitiveKeyRe):
 //	    --token, --access-token, --refresh-token, --join-secret, --private-key, etc.
+//	    cliFlagRe takes a bare value, cliFlagQuotedRe a quoted one
+//	    (--admin-password 'x', --db-pwd="x", JSON-escaped \"x\").
 //	[3] Weka SRT token: a bare SRT… string of ≥20 chars (download/activation tokens)
+//	[4] KEY=value assignments whose name ends in a credential word (redactAssignments)
+//	[5] HashiCorp Vault tokens (hvs./hvb./hvr.)
+//	[6] positional passwords on the weka CLI (wekaCLIPasswordRe)
 //
 // Values are bounded by [^\s"',;]+ rather than \S+ so that structural
 // delimiters (quotes, commas, semicolons) in JSON/YAML context are never
 // consumed, preventing corruption of surrounding structured output.
+// Separators use [ \t] rather than \s so a match never crosses a line break.
 var (
 	authHeaderRe = regexp.MustCompile(
-		`(?i)(Authorization\s*:\s*(?:Bearer|Token)\s+)[^\s"',;]+`)
+		`(?i)(Authorization[ \t]*[:=][ \t]*\[?[ \t]*(?:Bearer|Token|Basic|Negotiate|NTLM|ApiKey|SSWS|AWS)[ \t]+"?)[^\s"',;\]]+`)
 	cliFlagRe = regexp.MustCompile(
-		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|\s+))[^\s"',;]+`)
+		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|[ \t]+))(?:\\[^"]|[^\s"',;\\])[^\s"',;]*`)
+	// The quoted value must end the argument (space, shell separator, comma,
+	// the other quote of an enclosing string, or end of line after the
+	// closing quote), so a flag at the end of a quoted string
+	// ("cmd --join-secret ", next) is not taken as one. Double-quoted values
+	// honour backslash escapes.
+	cliFlagQuotedRe = regexp.MustCompile(
+		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|[ \t]+))(?:"(?:[^"\\\n]|\\.)+"|'[^'\n]+'|\\"(?:[^"\\\n]|\\[^"\n])*\\")([\s;|&)'",]|$)`)
 	srtTokenRe = regexp.MustCompile(
 		`\bSRT[A-Za-z0-9+/._=-]{20,}`)
+	// [4] NAME=value (shell env, ini, URL query) where NAME ends in a
+	//     credential word: VAULT_TOKEN=..., DB_PASS=..., password = ...,
+	//     ldap_default_authtok = ... The name must END in the word or its
+	//     plural (DB_PASSWORDS=, API_KEYS=), so max_token_count=5 or
+	//     spec_store_bypass_disable=on are left alone.
+	//     Spaces around "=" only in the ini form (name, space, "="), so an
+	//     empty env value (GITHUB_TOKEN= HOME=/root) never takes the next
+	//     word. Group 1 is the value: a backslash-escaped quoted string, a
+	//     quoted string, or a bare word that does not start with a quote or
+	//     backslash and stops at structural delimiters. redactAssignments
+	//     drops matches that would cross a string boundary.
+	assignmentRe = regexp.MustCompile(
+		`(?i)[A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|secret[-_]?id|secret[-_]?key|token|authtok|api[-_]?key|access[-_]?key|private[-_]?key|signing[-_]?key|credential|_pass|_pwd|pgpass)s?(?:=|[ \t]+=[ \t]*)` +
+			`(\\"[^"\\\n]+\\"|"(?:[^"\\\n]|\\.)+"|'[^'\n]+'|` + bareValue + `)`)
+	// [5] HashiCorp Vault tokens (service, batch, recovery) by shape.
+	vaultTokenRe = regexp.MustCompile(
+		`\bhv[sbr]\.[A-Za-z0-9_-]{20,}`)
+	// [6] built from cliPasswordPositions.
+	wekaCLIPasswordRe = buildWekaCLIPasswordRe()
 )
 
+// Building blocks for wekaCLIPasswordRe: zero or more options (the weka CLI's
+// valueless flags first, as defined in the CLI's common parameters plus
+// --debug/--no-restart, then options that take a value) and one positional
+// (non-option) argument. Same-line only.
+const (
+	cliOpts       = `(?:[ \t]+(?:--(?:debug|force|json|no-restart|help|verbose|raw-units|utc|no-header|confirmation|without-agent|purge)|(?-i:-[hJRUfv]))\b|[ \t]+--?[A-Za-z][\w-]*(?:=\S*|[ \t]+[^\s-]\S*))*`
+	cliPositional = `[ \t]+[^\s-]\S*`
+)
+
+// bareValue is an unquoted assignment value. It may not start with a quote or
+// backslash. Closing brackets are part of the value when more value follows
+// (a password like Xy)9k}Lm), but trailing ones are left as structure:
+// (secret=x) and Config{password=x} keep their closing bracket.
+const bareValue = `(?:[^\s"',;&\\)}\]]|[)}\]]+[^\s"',;&\\)}\]])(?:[^\s"',;&)}\]]|[)}\]]+[^\s"',;&)}\]])*`
+
+// nonSecretAssignmentNames are names that end in a credential word but whose
+// value is known not to be a secret (WEKA's token-timeout event).
+var nonSecretAssignmentNames = map[string]bool{"max_mount_token": true}
+
+// cliPasswordPositions lists weka CLI commands that take a password, join
+// secret, join token or secret key as a positional argument, with the 1-based
+// position of that argument among the positionals (from the CLI definitions
+// in 4.4 and 5.1). With a password left out the CLI prompts for it, which is
+// the safe use; these entries catch the command lines (shell history, ps,
+// logs) where it was typed inline.
+var cliPasswordPositions = []struct {
+	path string
+	pos  int
+}{
+	{"user login", 2},
+	{"user passwd", 1},
+	{"user add", 3},
+	{"user ldap setup", 9},
+	{"user ldap setup-ad", 4},
+	{"tenant create", 3},
+	{"org create", 3},
+	{"smb domain join", 2},
+	{"smb domain leave", 2},
+	{"nfs ldap setup-ad-nokrb", 5},
+	{"nfs ldap setup-openldap", 4},
+	{"cluster container join-secret", 2},
+	{"cluster container join-token", 2},
+	{"local resources join-secret", 1},
+	{"local resources join-token", 1},
+	{"cluster license payg", 2},
+	{"s3 bucket migrate attach", 4},
+}
+
+// buildWekaCLIPasswordRe builds one regexp for all cliPasswordPositions:
+// "weka", the subcommand words, the positionals before the password (options
+// with values may appear anywhere), then the password itself, quoted or bare.
+// Group 1 is everything before the password.
+func buildWekaCLIPasswordRe() *regexp.Regexp {
+	alts := make([]string, 0, len(cliPasswordPositions))
+	for _, c := range cliPasswordPositions {
+		words := strings.Fields(c.path)
+		for i, w := range words {
+			words[i] = regexp.QuoteMeta(w)
+		}
+		alt := strings.Join(words, cliOpts+`[ \t]+`) + cliOpts
+		for i := 1; i < c.pos; i++ {
+			alt += cliPositional + cliOpts
+		}
+		alts = append(alts, alt)
+	}
+	return regexp.MustCompile(`(?i)(\bweka` + cliOpts + `[ \t]+(?:` + strings.Join(alts, "|") + `)[ \t]+)` +
+		`(?:"[^"\n]*"|'[^'\n]*'|[^\s"'-][^\s"']*)`)
+}
+
+// redactAssignments applies assignmentRe, skipping only matches whose quoted
+// "value" is really the end of the string the name sits in, e.g.
+// ["VAULT_TOKEN=","HOME=/root"] or ?token=","next". Everything else is
+// redacted: over-redacting is acceptable, leaking is not. After a skipped
+// match the search resumes at the value, so a real assignment right after it
+// is still found.
+func redactAssignments(b []byte) []byte {
+	var out []byte
+	last, pos := 0, 0
+	for pos < len(b) {
+		m := assignmentRe.FindSubmatchIndex(b[pos:])
+		if m == nil {
+			break
+		}
+		ns, vs, ve := pos+m[0], pos+m[2], pos+m[3]
+		if skipAssignmentValue(b, ns, vs, ve) {
+			pos = vs
+			continue
+		}
+		out = append(out, b[last:vs]...)
+		out = append(out, "[REDACTED]"...)
+		last, pos = ve, ve
+	}
+	if out == nil {
+		return b
+	}
+	return append(out, b[last:]...)
+}
+
+func skipAssignmentValue(b []byte, nameStart, vs, ve int) bool {
+	name := bytes.ToLower(bytes.TrimRight(b[nameStart:vs], " \t="))
+	if nonSecretAssignmentNames[string(name)] {
+		return true
+	}
+	v := b[vs:ve]
+	// Already redacted by an earlier pass (--token=[REDACTED]).
+	if bytes.HasPrefix(v, []byte("[REDACTED")) {
+		return true
+	}
+	var quote []byte
+	switch {
+	case v[0] == '"' || v[0] == '\'':
+		quote = v[:1]
+	case bytes.HasPrefix(v, []byte(`\"`)):
+		quote = v[:2]
+	default:
+		return false
+	}
+	// The name sits right after a quote of the same kind, so this "value"
+	// starts with the closing quote of the string the name is in.
+	if nameStart >= len(quote) && bytes.Equal(b[nameStart-len(quote):nameStart], quote) {
+		return true
+	}
+	// A "value" that is only punctuation (",", ", ", "]," ...) is the end of
+	// one string and the start of the next (["export TOKEN=","-v"]), never a
+	// secret. Anything else in quotes is redacted.
+	inner := v[len(quote) : len(v)-len(quote)]
+	return len(bytes.Trim(inner, " \t,:;[]{}()")) == 0
+}
+
 // redactSensitiveValues applies value-shape redaction that the key-name passes
-// miss: HTTP Authorization headers, CLI flag values, and bare Weka SRT tokens.
+// miss: HTTP Authorization headers, CLI flag values, bare Weka SRT and Vault
+// tokens, NAME=value assignments and positional weka CLI passwords.
 // Safe to run on arbitrary text — content without matches is returned unchanged.
 func redactSensitiveValues(b []byte) []byte {
 	b = authHeaderRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	b = cliFlagRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
+	b = cliFlagQuotedRe.ReplaceAll(b, []byte("${1}[REDACTED]${2}"))
 	b = srtTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
+	b = redactAssignments(b)
+	b = vaultTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
+	b = wekaCLIPasswordRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	return b
 }
 
-// redactSensitive auto-detects JSON content (starts with `{` or `[` after
-// whitespace) and applies the JSON redactor; otherwise falls back to the
-// line-based YAML/text redactor. A final value-pattern pass then catches tokens
-// that appear without a structured key (CLI args, HTTP headers, bare SRT tokens).
-// Safe to call on arbitrary command output — content without sensitive keys is
-// returned unchanged.
-func redactSensitive(b []byte) []byte {
-	trimmed := bytes.TrimLeft(b, " \t\r\n")
-	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-		b = redactSensitiveJSON(b)
-	} else {
-		b = redactSensitiveYAML(b)
+// credentialHints are lowercase substrings at least one of which appears in
+// every line any redaction pattern can match. Lines without one (most log
+// lines) skip all regular expressions.
+var credentialHints = [][]byte{
+	[]byte("pass"), []byte("pwd"), []byte("token"), []byte("secret"), []byte("key"),
+	[]byte("auth"), []byte("credential"), []byte("srt"), []byte("hvs."), []byte("hvb."), []byte("hvr."),
+}
+
+// cliPasswordHints: a line can hold a positional weka CLI password only if it
+// has "weka" and one of these subcommand words.
+var cliPasswordHints = [][]byte{
+	[]byte("login"), []byte("passwd"), []byte("add"), []byte("create"), []byte("setup"), []byte("domain"), []byte("payg"), []byte("attach"),
+}
+
+// lineMayHoldSecret is the cheap prefilter for redactLine; lower is the line
+// with ASCII letters lowercased.
+func lineMayHoldSecret(lower []byte) bool {
+	for _, h := range credentialHints {
+		if bytes.Contains(lower, h) {
+			return true
+		}
 	}
-	return redactSensitiveValues(b)
+	if bytes.Contains(lower, []byte("weka")) {
+		for _, h := range cliPasswordHints {
+			if bytes.Contains(lower, h) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// keyWordsBeforeColon and keyWordsBeforeEquals are the lowercase words that
+// sensitiveKeyRe must see right before ":" and assignmentRe right before "="
+// (spaces/tabs allowed in between), each also with a trailing "s" because
+// both regexes accept the plural. wordBefore uses them as a fast exact
+// prefilter, so the regexes only run on lines that can match.
+var (
+	keyWordsBeforeColon  = splitWords("password passwd passphrase pwd pass token secret secret_id secret-id secretid secret_key secret-key secretkey api_key api-key apikey auth authtok credential private_key private-key privatekey access_key access-key accesskey signing_key signing-key signingkey")
+	keyWordsBeforeEquals = splitWords("password passwd passphrase secret secret_id secret-id secretid secret_key secret-key secretkey token authtok api_key api-key apikey access_key access-key accesskey private_key private-key privatekey signing_key signing-key signingkey credential _pass _pwd pgpass")
+)
+
+// splitWords returns the words of s, each also with a trailing "s".
+func splitWords(s string) [][]byte {
+	var out [][]byte
+	for _, w := range strings.Fields(s) {
+		out = append(out, []byte(w), []byte(w+"s"))
+	}
+	return out
+}
+
+// wordBefore reports whether some sep in lower is preceded (after optional
+// spaces/tabs) by one of words.
+func wordBefore(lower []byte, sep byte, words [][]byte) bool {
+	off := 0
+	for {
+		i := bytes.IndexByte(lower[off:], sep)
+		if i < 0 {
+			return false
+		}
+		j := off + i
+		for j > 0 && isRegexpSpace(lower[j-1]) {
+			j--
+		}
+		for _, w := range words {
+			if bytes.HasSuffix(lower[:j], w) {
+				return true
+			}
+		}
+		off += i + 1
+	}
+}
+
+// quotedKeyWords holds a lowercase literal from every credential word of the
+// quoted-key patterns ("key" covers api_key, private-key, access_key, ...).
+var quotedKeyWords = [][]byte{
+	[]byte("pass"), []byte("pwd"), []byte("token"), []byte("secret"), []byte("auth"), []byte("credential"), []byte("key"),
+}
+
+// hasQuotedCredentialKey is the exact prefilter for the quoted-key patterns:
+// jsonSensitiveValueRe, jsonUnclosedValueRe and the array patterns take the
+// double quote as quote, jsonSingleQuotedValueRe the single quote. lower
+// (ASCII-lowercased) must hold a key of [\w.-] bytes between two quote
+// characters that contains a credential word and is followed, after optional
+// whitespace, by a colon. Content with foldsToASCII letters must skip it.
+func hasQuotedCredentialKey(lower []byte, quote byte) bool {
+	off := 0
+	for {
+		i := bytes.IndexByte(lower[off:], ':')
+		if i < 0 {
+			return false
+		}
+		j := off + i
+		off = j + 1
+		for j > 0 && isRegexpSpace(lower[j-1]) {
+			j--
+		}
+		if j == 0 || lower[j-1] != quote {
+			continue
+		}
+		end := j - 1
+		s := end
+		for s > 0 && isKeyByte(lower[s-1]) {
+			s--
+		}
+		if s == 0 || lower[s-1] != quote {
+			continue
+		}
+		for _, w := range quotedKeyWords {
+			if bytes.Contains(lower[s:end], w) {
+				return true
+			}
+		}
+	}
+}
+
+// isKeyByte reports whether c is in [\w.-] (lowercase input).
+func isKeyByte(c byte) bool {
+	return 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '_' || c == '.' || c == '-'
+}
+
+// isRegexpSpace reports whether c is in RE2's \s class ([\t\n\f\r ]).
+func isRegexpSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
+}
+
+// foldsToASCII reports whether line holds one of the two non-ASCII letters
+// that Go's case-insensitive matching folds to an ASCII letter: U+212A
+// (Kelvin sign, k) and U+017F (long s, s). asciiLower cannot see those, so
+// such lines skip the literal prefilters and get every pattern.
+func foldsToASCII(line []byte) bool {
+	return bytes.Contains(line, []byte("\u212a")) || bytes.Contains(line, []byte("\u017f"))
+}
+
+// asciiLower returns a copy of b with ASCII letters lowercased. Unlike
+// bytes.ToLower it never changes the length, so offsets stay aligned with b.
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		out[i] = c
+	}
+	return out
+}
+
+// redactLine applies the per-line passes: the YAML/text key pass (not for
+// JSON documents, where it would cut structure), the quoted-key passes
+// (JSON, Python dict and escaped JSON inside text) and the value passes.
+// Each pattern runs only if the line has the literal it cannot match without
+// (lower is the original line with ASCII letters lowercased); the result is
+// the same as running redactSensitiveValues and the key passes on every line.
+// With filtered false every pattern runs (lines with foldsToASCII letters).
+func redactLine(line, lower []byte, isJSONDoc, filtered bool) []byte {
+	has := func(s string) bool { return !filtered || bytes.Contains(lower, []byte(s)) }
+	hasByte := func(c byte) bool { return !filtered || bytes.IndexByte(lower, c) >= 0 }
+	if !isJSONDoc && (!filtered || wordBefore(lower, ':', keyWordsBeforeColon)) {
+		line = redactSensitiveYAMLLine(line)
+	}
+	if !filtered || hasQuotedCredentialKey(lower, '"') {
+		line = jsonSensitiveValueRe.ReplaceAll(line, []byte(`$1"[REDACTED]"`))
+	}
+	if has(`\"`) && hasByte(':') {
+		line = jsonEscapedValueRe.ReplaceAll(line, []byte(`${1}[REDACTED]${2}`))
+	}
+	if !filtered || hasQuotedCredentialKey(lower, '\'') {
+		line = jsonSingleQuotedValueRe.ReplaceAll(line, []byte(`$1'[REDACTED]'`))
+	}
+	if has("authorization") {
+		line = authHeaderRe.ReplaceAll(line, []byte("${1}[REDACTED]"))
+	}
+	if has("--") {
+		line = cliFlagRe.ReplaceAll(line, []byte("${1}[REDACTED]"))
+		line = cliFlagQuotedRe.ReplaceAll(line, []byte("${1}[REDACTED]${2}"))
+	}
+	if has("srt") {
+		line = srtTokenRe.ReplaceAll(line, []byte("[REDACTED]"))
+	}
+	if !filtered || wordBefore(lower, '=', keyWordsBeforeEquals) {
+		line = redactAssignments(line)
+	}
+	if has("hvs.") || has("hvb.") || has("hvr.") {
+		line = vaultTokenRe.ReplaceAll(line, []byte("[REDACTED]"))
+	}
+	if has("weka") {
+		line = wekaCLIPasswordRe.ReplaceAll(line, []byte("${1}[REDACTED]"))
+	}
+	return line
+}
+
+// looksLikeJSON reports whether b starts with { or [ after whitespace.
+func looksLikeJSON(b []byte) bool {
+	trimmed := bytes.TrimLeft(b, " \t\r\n")
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+}
+
+// isJSONDocument reports whether b is one valid JSON document. Only those
+// skip the line-based key pass, which would cut JSON structure. Starting with
+// { or [ is not enough: kubectl logs --prefix lines start with "[pod/...]",
+// dmesg lines with "[   12.3]", and JSON cut short by a timeout or followed
+// by a trailer line does not parse; all of these keep the line pass.
+func isJSONDocument(b []byte) bool {
+	return looksLikeJSON(b) && json.Valid(bytes.TrimLeft(b, " \t\r\n"))
+}
+
+// redactSensitive redacts credentials in collected text. Content that starts
+// with { or [ after whitespace first gets the whole-document JSON pass, the
+// only pass that redacts multi-line arrays (join_secret); it runs whether or
+// not the content parses, so JSON cut short (also inside such an array) or
+// followed by a trailer line is covered too. Then every line
+// that contains a credential hint gets redactLine (without the line-based key
+// pass for a valid JSON document); other lines are copied unchanged, which
+// keeps this fast on large logs. Safe to call on arbitrary command output —
+// content without sensitive keys is returned unchanged.
+func redactSensitive(b []byte) []byte {
+	isJSONDoc := isJSONDocument(b)
+	lower := asciiLower(b)
+	if looksLikeJSON(b) && (foldsToASCII(b) || hasQuotedCredentialKey(lower, '"')) {
+		b = redactSensitiveJSON(b)
+		lower = asciiLower(b)
+	}
+	out := make([]byte, 0, len(b)) // grows by append when a line gets longer
+	start := 0
+	for {
+		end := bytes.IndexByte(b[start:], '\n')
+		last := end < 0
+		if last {
+			end = len(b)
+		} else {
+			end += start
+		}
+		line, lline := b[start:end], lower[start:end]
+		if foldsToASCII(line) {
+			line = redactLine(line, lline, isJSONDoc, false)
+		} else if lineMayHoldSecret(lline) {
+			line = redactLine(line, lline, isJSONDoc, true)
+		}
+		out = append(out, line...)
+		if last {
+			break
+		}
+		out = append(out, '\n')
+		start = end + 1
+	}
+	return redactSplitFlagValues(out)
+}
+
+// bareCredentialFlagRe is a credential-named flag token with no value.
+var bareCredentialFlagRe = regexp.MustCompile(
+	`(?i)^--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*$`)
+
+// redactSplitFlagValues handles argv printed one element per line, as in
+// kubectl describe Args/Command: a line whose last token is a credential flag
+// without a value ("--api-token") has the first token of the next line
+// redacted, unless that token is another option. All other patterns stay on
+// one line.
+func redactSplitFlagValues(b []byte) []byte {
+	if !bytes.Contains(b, []byte("--")) {
+		return b
+	}
+	var out []byte
+	last, start := 0, 0 // b[last:] not yet copied to out
+	prevFlag := false
+	for {
+		end := bytes.IndexByte(b[start:], '\n')
+		if end < 0 {
+			end = len(b)
+		} else {
+			end += start
+		}
+		line := b[start:end]
+		if prevFlag {
+			if red, ok := redactFirstToken(line); ok {
+				out = append(out, b[last:start]...)
+				out = append(out, red...)
+				last = end
+			}
+		}
+		prevFlag = endsWithBareCredentialFlag(line)
+		if end == len(b) {
+			break
+		}
+		start = end + 1
+	}
+	if out == nil {
+		return b
+	}
+	return append(out, b[last:]...)
+}
+
+func endsWithBareCredentialFlag(line []byte) bool {
+	t := bytes.TrimRight(line, " \t\r")
+	tok := t[bytes.LastIndexAny(t, " \t")+1:]
+	return len(tok) > 2 && tok[0] == '-' && tok[1] == '-' && bareCredentialFlagRe.Match(tok)
+}
+
+// redactFirstToken replaces the first word of line with [REDACTED] unless it
+// is empty, an option (-x/--x) or already redacted.
+func redactFirstToken(line []byte) ([]byte, bool) {
+	i := 0
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	if i == len(line) || line[i] == '-' || line[i] == '\r' || bytes.HasPrefix(line[i:], []byte("[REDACTED]")) {
+		return line, false
+	}
+	j := i
+	for j < len(line) && !bytes.ContainsRune([]byte(" \t\r\"',;"), rune(line[j])) {
+		j++
+	}
+	if j == i {
+		return line, false
+	}
+	out := append(append(append([]byte{}, line[:i]...), "[REDACTED]"...), line[j:]...)
+	return out, true
 }
 
 // ─── anonymizer ──────────────────────────────────────────────────────────────
@@ -1050,13 +1581,63 @@ func parseInputTime(s string) (time.Time, error) {
 		}
 		return time.Now().Add(-dur), nil
 	}
-	// Try absolute formats: YYYY-MM-DDTHH:MM:SS then YYYY-MM-DDTHH:MM
+	// Absolute with an explicit zone (2026-03-04T10:30:00Z, ...+02:00). The
+	// result is converted to local time so that every consumer (journalctl,
+	// weka CLI, file mtimes) keeps working in the host's own zone.
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Local(), nil
+		}
+	}
+	// Absolute without a zone, in local time: YYYY-MM-DDTHH:MM:SS then YYYY-MM-DDTHH:MM
 	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04"} {
 		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
 			return t, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("cannot parse time %q: use YYYY-MM-DDTHH:MM[:SS] or relative like -2h, -30m, -1d", s)
+	return time.Time{}, fmt.Errorf("cannot parse time %q: use YYYY-MM-DDTHH:MM[:SS] (local), RFC3339 with a zone (2026-03-04T10:30:00Z, +02:00) or relative like -2h, -30m, -1d", s)
+}
+
+// splitCommaList flattens values that may each hold a comma-separated list
+// ("drives0,compute0") into individual trimmed, non-empty items.
+func splitCommaList(values []string) []string {
+	var out []string
+	for _, v := range values {
+		for _, item := range strings.Split(v, ",") {
+			if item = strings.TrimSpace(item); item != "" {
+				out = append(out, item)
+			}
+		}
+	}
+	return out
+}
+
+// oneLine collapses whitespace (including newlines) and truncates s to max bytes.
+func oneLine(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > max {
+		s = s[:max]
+	}
+	return s
+}
+
+// windowIsEmpty reports whether the collection window [from, to] ends before
+// it starts; a zero to means now.
+func windowIsEmpty(from, to, now time.Time) bool {
+	if from.IsZero() {
+		return false
+	}
+	if to.IsZero() {
+		to = now
+	}
+	return to.Before(from)
+}
+
+// remoteTimeArg formats a window bound for a remote --start-time/--end-time:
+// UTC RFC3339 with seconds, so the remote host reads the same instant
+// whatever its own time zone, without losing the seconds.
+func remoteTimeArg(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
 }
 
 // ── collection profiles ───────────────────────────────────────────────────────
@@ -1094,6 +1675,9 @@ type CommandSpec struct {
 	NodeLocal    bool   // if true, output varies per node (weka local *); otherwise cluster-wide
 	NodeOptional bool   // if true, failure is expected on some nodes/distros — logged at verbose only, not WARN
 	LocalOnly    bool   // if true, run even when cluster auth is unavailable (weka local commands only)
+	// MinTimeout raises the per-command timeout for this command (for slow
+	// commands such as weka events with a large --num-results).
+	MinTimeout time.Duration
 }
 
 // defaultCommands are run on every node that has the weka CLI available.
@@ -1108,11 +1692,14 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_cloud_status", Cmd: "weka cloud status"},
 	// ── cluster topology ──────────────────────────────────────────
 	{Name: "weka_cluster_servers", Cmd: "weka cluster servers list"},
-	{Name: "weka_cluster_container", Cmd: "weka cluster container"},
+	// -v keeps the verbose-only columns: container mode / kernel release,
+	// process fencing / join-reject / blacklisting reasons, drive serial /
+	// firmware (needsPhaseOut on 5.1), bucket fill level.
+	{Name: "weka_cluster_container", Cmd: "weka cluster container -v"},
 	{Name: "weka_cluster_container_net", Cmd: "weka cluster container net"},
-	{Name: "weka_cluster_process", Cmd: "weka cluster process"},
-	{Name: "weka_cluster_drive", Cmd: "weka cluster drive"},
-	{Name: "weka_cluster_bucket", Cmd: "weka cluster bucket"},
+	{Name: "weka_cluster_process", Cmd: "weka cluster process -v"},
+	{Name: "weka_cluster_drive", Cmd: "weka cluster drive -v"},
+	{Name: "weka_cluster_bucket", Cmd: "weka cluster bucket -v"},
 	{Name: "weka_cluster_failure_domain", Cmd: "weka cluster failure-domain"},
 	{Name: "weka_cluster_task", Cmd: "weka cluster task"},
 	{Name: "weka_cluster_resources", Cmd: "weka cluster container resources 0"},
@@ -1158,23 +1745,50 @@ var defaultCommands = []CommandSpec{
 	{Name: "weka_stats_obs_errors", Cmd: "weka stats --category object_storage --stat RESPONSE_COUNT_BAD_GATEWAY,RESPONSE_COUNT_GATEWAY_TIMEOUT,RESPONSE_COUNT_HTTP_VERSION_NOT_SUPPORTED,RESPONSE_COUNT_NOT_IMPLEMENTED,RESPONSE_COUNT_SERVER_ERROR,RESPONSE_COUNT_SERVICE_UNAVAILABLE --start-time -30m -Z"},
 }
 
+// eventsMaxResults is passed as --num-results to weka events. The CLI default
+// is the 50 newest events, which on a busy cluster pushes the incident's
+// events out of the window; an explicit large number works on 4.4 and 5.1.
+const eventsMaxResults = "100000"
+
+// eventsMinTimeout: weka events pages through Weka Home 1000 events at a time
+// and prints nothing until it is done, so a timeout loses all of it.
+const eventsMinTimeout = 5 * time.Minute
+
 // buildWindowedDefaultCmds returns default commands whose --start-time must align with
-// the collection window. Uses a relative offset (e.g. -9h) rather than an absolute
-// timestamp — weka events only reliably accepts relative offsets for --start-time.
+// the collection window. Uses relative offsets (e.g. -9h, -37m) rather than absolute
+// timestamps — weka events only reliably accepts relative offsets.
 // Contrast with the diagnostic stats in defaultCommands that intentionally use short
 // fixed windows (e.g. -10m for RDMA errors) to capture current cluster state.
 func buildWindowedDefaultCmds(from, to time.Time) []CommandSpec {
+	return buildWindowedDefaultCmdsAt(from, to, time.Now())
+}
+
+func buildWindowedDefaultCmdsAt(from, to, now time.Time) []CommandSpec {
 	effectiveFrom := from
 	if from.IsZero() {
-		effectiveFrom = time.Now().Add(-8 * time.Hour)
+		effectiveFrom = now.Add(-8 * time.Hour)
 	}
 	// Convert absolute time to a relative offset that weka events accepts.
 	// Round up by one hour so we don't miss events right at the window boundary.
-	hours := int(time.Since(effectiveFrom).Hours()) + 1
-	startFlag := fmt.Sprintf(" --start-time -%dh", hours)
+	hours := int(now.Sub(effectiveFrom).Hours()) + 1
+	if hours < 1 {
+		hours = 1
+	}
+	window := fmt.Sprintf(" --start-time -%dh", hours)
+	// End of the window, rounded down to whole minutes (so the window only
+	// grows). Omitted when the window ends within the last minute.
+	if !to.IsZero() {
+		if mins := int(now.Sub(to).Minutes()); mins >= 1 {
+			window += fmt.Sprintf(" --end-time -%dm", mins)
+		}
+	}
+	window += " --num-results " + eventsMaxResults
 	return []CommandSpec{
-		// All events at major+ severity within the collection window.
-		{Name: "weka_events_major", Cmd: "weka events --severity major" + startFlag},
+		// Events at major+ severity within the collection window.
+		{Name: "weka_events_major", Cmd: "weka events --severity major" + window, MinTimeout: eventsMinTimeout},
+		// Warning+ within the window: disconnects and other early signs that
+		// are not major (a superset of weka_events_major).
+		{Name: "weka_events_warning", Cmd: "weka events --severity warning" + window, MinTimeout: eventsMinTimeout},
 	}
 }
 
@@ -1979,6 +2593,21 @@ type HostManifest struct {
 	FailedFiles    int             `json:"failed_files"`
 	TotalCommands  int             `json:"total_commands"`
 	FailedCommands int             `json:"failed_commands"`
+	Traces         *TraceResult    `json:"traces,omitempty"`
+}
+
+// TraceResult records what trace collection did on one host. It is written to
+// collection_manifest.json and summarised in cluster_summary.json so that a
+// skipped, failed or empty trace collection is visible in the bundle.
+type TraceResult struct {
+	Status        string   `json:"status"` // ok | no_shards | failed | timeout | skipped
+	Reason        string   `json:"reason,omitempty"`
+	Shards        int      `json:"shards"`
+	Histograms    int      `json:"histograms"`
+	UnparsedFiles int      `json:"unparsed_files,omitempty"` // files trace_extractor could not parse and skipped
+	ExitCode      int      `json:"exit_code,omitempty"`
+	Duration      string   `json:"duration,omitempty"`
+	Archives      []string `json:"archives,omitempty"`
 }
 
 // ── progress output ───────────────────────────────────────────────────────────
@@ -2102,6 +2731,9 @@ func truncateCmdError(msg string) string {
 }
 
 func runCommand(spec CommandSpec, timeout time.Duration) (CommandResult, []byte) {
+	if spec.MinTimeout > timeout {
+		timeout = spec.MinTimeout
+	}
 	start := time.Now()
 	result := CommandResult{
 		Name:     spec.Name,
@@ -3149,6 +3781,48 @@ type HostResult struct {
 	Manifest *HostManifest
 	TempFile string // path to temp .tar.gz on disk; caller must os.Remove when done
 	Err      error
+	Stderr   string // remote stderr when the run failed (written to COLLECTION_FAILED.txt)
+}
+
+// remoteFailure turns a failed remote run into a short error: ssh's own
+// failures (exit 255) as such, otherwise the node's last [ERROR] line (or
+// last line), not its whole collection log.
+func remoteFailure(exitCode int, stderr string) error {
+	stderr = strings.TrimSpace(stderr)
+	if exitCode == 255 {
+		return fmt.Errorf("SSH failed (exit 255): %s", lastNonEmptyLine(stderr))
+	}
+	return fmt.Errorf("remote run failed (exit %d): %s", exitCode, remoteErrorSummary(stderr))
+}
+
+// remoteErrorSummary picks the line that names the cause in a node's stderr:
+// the first [ERROR] line that is not a "Tip:" or an indented continuation,
+// else a Go panic line, else the last line.
+func remoteErrorSummary(stderr string) string {
+	var firstErr string
+	for _, raw := range strings.Split(stderr, "\n") {
+		if !strings.HasPrefix(raw, "[ERROR]") {
+			continue
+		}
+		rest := strings.TrimPrefix(raw, "[ERROR]")
+		msg := strings.TrimSpace(rest)
+		if firstErr == "" {
+			firstErr = msg
+		}
+		// errorf writes "[ERROR] msg"; continuation lines are indented further.
+		if msg != "" && !strings.HasPrefix(msg, "Tip:") && !strings.HasPrefix(rest, "  ") {
+			return msg
+		}
+	}
+	if firstErr != "" {
+		return firstErr
+	}
+	for _, raw := range strings.Split(stderr, "\n") {
+		if l := strings.TrimSpace(raw); strings.HasPrefix(l, "panic:") {
+			return l
+		}
+	}
+	return lastNonEmptyLine(stderr)
 }
 
 // activeRemoteHosts tracks hosts currently being collected/uploaded via SSH.
@@ -3165,7 +3839,212 @@ var (
 	collectTraces              bool
 	traceFilters               []string // values from --trace-filter; empty → pass --all to trace_extractor
 	resolvedTraceExtractorPath string   // validated binary path, set after findTraceExtractor succeeds
+	traceTimeout               = defaultTraceTimeout
+	// traceExtractorSource is the extractor that was found; it differs from
+	// resolvedTraceExtractorPath when a non-executable file is run from a copy.
+	traceExtractorSource string
+	// traceSkipReason explains why --collect-traces was requested but will not
+	// run on this node; recorded in the host manifest so the skip is visible.
+	traceSkipReason string
+	// traceDeployFailed records hosts (key: host) where copying trace_extractor
+	// failed (value: error text). Those hosts collect logs without traces.
+	traceDeployFailed sync.Map
 )
+
+// traceUploadAllowance is extra remote time in --upload mode when traces are
+// collected. It matches what the node's own uploadBundle waits for a ~1 GB
+// archive (4 s per MB, about 68 minutes, plus 2), so the outer timeout does
+// not cut off an upload the node would still have waited for.
+const traceUploadAllowance = 75 * time.Minute
+
+// minTraceStreamAllowance is the least extra remote time in merged cluster
+// mode for what follows the trace step: --trace-timeout bounds only the
+// extractor run, and its archives (several GB on a busy backend) are then
+// added to the host stream and the bundle is finished.
+const minTraceStreamAllowance = 10 * time.Minute
+
+// maxTraceTimeout caps --trace-timeout, which is doubled in remoteRunTimeout.
+const maxTraceTimeout = 24 * time.Hour
+
+// remoteRunTimeout is the timeout(1) limit for a node's remote run: base for
+// the logs, plus, when the node collects traces, room for the trace step and
+// for what follows it. Merged mode streams the extractor's output back, given
+// as long again as the extractor had (at least minTraceStreamAllowance);
+// --upload uploads the larger bundle (traceUploadAllowance). This is room,
+// not a bound: streaming time depends on the archive size and the link, and
+// a node still over the limit is killed and its partial bundle discarded.
+func remoteRunTimeout(base time.Duration, host string, upload bool) time.Duration {
+	if !tracesEnabledForHost(host) {
+		return base
+	}
+	if upload {
+		return base + traceTimeout + traceUploadAllowance
+	}
+	return base + traceTimeout + max(traceTimeout, minTraceStreamAllowance)
+}
+
+// remoteRun returns the remote time limit for a node's run and the shell
+// command that runs collectionCmd under it (see remoteRunTimeout).
+func remoteRun(host, remoteBin, collectionCmd string, base time.Duration, upload bool) (time.Duration, string) {
+	limit := remoteRunTimeout(base, host, upload)
+	return limit, remoteShellCommand(host, remoteBin, collectionCmd, limit)
+}
+
+// collectRemoteCommand builds a merged-mode node run: the remote time limit
+// and the shell command. --node-only skips cluster-wide commands (run once
+// by the orchestrator); the bundle is streamed back on stdout. Traces run
+// after log collection under their own --trace-timeout, so the limit leaves
+// room for them and for streaming them back.
+func collectRemoteCommand(host, remoteBin, profile string, from, to time.Time, containerNames []string, base time.Duration) (time.Duration, string) {
+	collectionCmd := shellJoin(append([]string{
+		remoteBin,
+		"--local",
+		"--node-only",
+		"--profile", profile,
+		"--output", "-",
+	}, remoteNodeArgs(host, from, to, containerNames)...))
+	return remoteRun(host, remoteBin, collectionCmd, base, false)
+}
+
+// uploadRemoteCommand builds a node run with --upload: the node collects
+// and uploads its own bundle. The limit leaves room for the trace step and
+// for uploading its archive, which can be much larger than the logs.
+func uploadRemoteCommand(host, remoteBin, profile string, from, to time.Time, containerNames []string, sessionID int64, compression string, base time.Duration) (time.Duration, string) {
+	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile,
+		"--upload-session-id", strconv.FormatInt(sessionID, 10)}
+	if compression != "" && compression != "gzip" {
+		args = append(args, "--compression", compression)
+	}
+	args = append(args, remoteNodeArgs(host, from, to, containerNames)...)
+	return remoteRun(host, remoteBin, shellJoin(args), base, true)
+}
+
+// validateTraceTimeout checks --trace-timeout: positive and at most
+// maxTraceTimeout, so the remote limit cannot overflow.
+func validateTraceTimeout(d time.Duration) error {
+	if d <= 0 || d > maxTraceTimeout {
+		return fmt.Errorf("--trace-timeout must be positive and at most %s", maxTraceTimeout)
+	}
+	return nil
+}
+
+// traceWindowTolerance is the slack allowed on top of traceMaxWindow.
+const traceWindowTolerance = time.Minute
+
+// exitCleanups holds local cleanups (temp files) that must also run when the
+// process ends through os.Exit, which skips deferred calls: exitProcess and
+// the Ctrl-C handlers run them.
+var (
+	exitCleanupsMu sync.Mutex
+	exitCleanups   []func()
+)
+
+// addExitCleanup registers f to run on exitProcess and in the Ctrl-C handlers.
+func addExitCleanup(f func()) {
+	exitCleanupsMu.Lock()
+	exitCleanups = append(exitCleanups, f)
+	exitCleanupsMu.Unlock()
+}
+
+// runExitCleanups runs every registered cleanup (a snapshot, so a cleanup
+// registered concurrently cannot race the iteration).
+func runExitCleanups() {
+	exitCleanupsMu.Lock()
+	fs := append([]func(){}, exitCleanups...)
+	exitCleanupsMu.Unlock()
+	for _, f := range fs {
+		f()
+	}
+}
+
+// exitProcess runs exitCleanups and exits. Used instead of os.Exit on paths
+// that can run after a cleanup was registered (the trace_extractor copy).
+func exitProcess(code int) {
+	runExitCleanups()
+	os.Exit(code)
+}
+
+// uploadSignalSetup arranges Ctrl-C cleanup of an upload's staged files and
+// returns a function that undoes it. Under the cluster handler (cluster
+// --upload, where the orchestrator uploads its own bundle while remote nodes
+// still run) it only registers the cleanup, which that handler runs after
+// killing the remote collectors; a second handler would exit first and leave
+// them running. Otherwise it installs its own handler.
+func uploadSignalSetup(linkCleanup func()) func() {
+	if clusterSignalHandler.Load() {
+		addExitCleanup(linkCleanup)
+		return func() {}
+	}
+	stopEarlySignalHandler()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-sigCh; ok {
+			linkCleanup()
+			warnf("Upload interrupted — cleaned up staging files")
+			exitProcess(1)
+		}
+	}()
+	return func() {
+		signal.Stop(sigCh)
+		close(sigCh)
+	}
+}
+
+// clusterSignalHandler is set once the cluster-mode Ctrl-C handler is
+// installed. That handler must kill the remote collectors before the process
+// exits, so no other handler may be installed next to it; code that needs
+// cleanup on Ctrl-C registers it with addExitCleanup instead.
+var clusterSignalHandler atomic.Bool
+
+// earlySig is the Ctrl-C handler installed once a cleanup is registered and
+// before a more specific handler exists; stopEarlySignalHandler hands over.
+var (
+	earlySigMu sync.Mutex
+	earlySig   chan os.Signal
+)
+
+// startEarlySignalHandler makes SIGINT/SIGTERM run exitCleanups (and release
+// the run lock when this run holds it) until stopEarlySignalHandler is called.
+func startEarlySignalHandler(holdsRunLock bool) {
+	earlySigMu.Lock()
+	defer earlySigMu.Unlock()
+	if earlySig != nil {
+		return
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	earlySig = ch
+	go func() {
+		if _, ok := <-ch; !ok {
+			return
+		}
+		runExitCleanups()
+		if holdsRunLock {
+			releaseRunLock()
+		}
+		os.Exit(1)
+	}()
+}
+
+// stopEarlySignalHandler stops the early handler before another handler is
+// installed, so two handlers never race to exit.
+func stopEarlySignalHandler() {
+	earlySigMu.Lock()
+	defer earlySigMu.Unlock()
+	if earlySig != nil {
+		signal.Stop(earlySig)
+		close(earlySig)
+		earlySig = nil
+	}
+}
+
+// traceWindowEnd is the end of the trace window when no --end-time was given:
+// the time at which the 60-minute cap was checked.
+var traceWindowEnd time.Time
+
+// defaultTraceTimeout bounds one trace_extractor run (--trace-timeout).
+const defaultTraceTimeout = 15 * time.Minute
 
 // sshUser returns the username to use for SSH connections.
 // Priority: --ssh-user flag > current OS user > "root" (fallback).
@@ -3241,6 +4120,27 @@ func remoteBinPath() string {
 	return fmt.Sprintf("%s/weka-log-collector-%d", wlcBaseDir, os.Getpid())
 }
 
+// remoteTraceExtractorPath is where this run deploys trace_extractor on each
+// host. Like remoteBinPath it carries the orchestrator's PID, so deploying to
+// the orchestrator itself can never overwrite or delete the source copy (for
+// example when wlc lives in wlcBaseDir), and concurrent runs do not collide.
+func remoteTraceExtractorPath() string {
+	return fmt.Sprintf("%s/%s-%d", wlcBaseDir, traceExtractorBin, os.Getpid())
+}
+
+// pkillSelfSafePattern wraps the first letter of a path's base name in [ ]
+// (weka-log-collector-1 -> [w]eka-log-collector-1). As a pkill -f regex it
+// still matches the process, and as a shell glob it still names the file,
+// but the text itself does not match the pattern — so a cleanup command that
+// spells every name this way can never pkill its own sh -c / sudo process.
+func pkillSelfSafePattern(p string) string {
+	dir, base := filepath.Split(p)
+	if base == "" {
+		return p
+	}
+	return dir + "[" + base[:1] + "]" + base[1:]
+}
+
 // remoteNeedsSudo reports whether remote SSH commands need sudo.
 // When the SSH user is not root, weka commands and writes to /opt/weka/
 // require privilege escalation. Assumes passwordless sudo (standard on
@@ -3257,11 +4157,84 @@ func maybeRemoteSudo(cmd string) string {
 	return cmd
 }
 
+// bundledTraceExtractorNames returns the trace_extractor file names to look for
+// next to the wlc binary, most specific first. The repo ships
+// trace_extractor-amd64 and trace_extractor-arm64 (Linux). The plain
+// trace_extractor is the older build, left untouched so that "git pull" keeps
+// working on nodes where an earlier wlc chmod'ed it in place; it is only a
+// fallback (or a user-placed copy). A non-Linux wlc (macOS) only orchestrates
+// remote hosts, which are x86_64 in the common case, so it uses the amd64 build.
+func bundledTraceExtractorNames(goos, goarch string) []string {
+	if goos == "linux" && goarch == "arm64" {
+		return []string{traceExtractorBin + "-arm64", traceExtractorBin}
+	}
+	return []string{traceExtractorBin + "-amd64", traceExtractorBin}
+}
+
+// executableTraceExtractor returns path if it is executable, otherwise a 0755
+// copy in the temp dir (and a cleanup func). wlc never chmods the file in
+// place: inside a git checkout that would make the next "git pull" refuse.
+func executableTraceExtractor(path string) (string, func(), error) {
+	noop := func() {}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", noop, err
+	}
+	if fi.Mode()&0111 != 0 {
+		return path, noop, nil
+	}
+	// Prefer wlcBaseDir (outside any git checkout, on /opt, which is not
+	// mounted noexec the way a hardened /tmp can be), then the temp dir, so
+	// a full /opt still works.
+	var dirs []string
+	if fi, err := os.Stat(wlcBaseDir); err == nil && fi.IsDir() {
+		dirs = append(dirs, wlcBaseDir)
+	}
+	dirs = append(dirs, "")
+	var lastErr error
+	for _, dir := range dirs {
+		p, err := copyExecutable(path, dir)
+		if err == nil {
+			return p, func() { os.Remove(p) }, nil
+		}
+		lastErr = err
+	}
+	return "", noop, lastErr
+}
+
+// copyExecutable copies src into a new 0755 file in dir ("" = temp dir) and
+// returns its path; on any error nothing is left behind.
+func copyExecutable(src, dir string) (string, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	dst, err := os.CreateTemp(dir, "wlc-trace_extractor-*")
+	if err != nil {
+		return "", err
+	}
+	name := dst.Name()
+	_, err = io.Copy(dst, in)
+	if cerr := dst.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(name, 0755)
+	}
+	if err != nil {
+		os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
 // findTraceExtractor locates the trace_extractor binary. Discovery order:
 //  1. override (--trace-extractor-path flag)
-//  2. PATH (which trace_extractor)
-//  3. wlcBaseDir/trace_extractor (matches the remote deploy path)
-//  4. Same directory as the running wlc binary (typical in the git repo layout)
+//  2. Same directory as the running wlc binary (the copy bundled in the git
+//     repo, whose version is known), arch-specific name first
+//  3. PATH (which trace_extractor)
+//  4. wlcBaseDir/trace_extractor (where older versions deployed it)
 func findTraceExtractor(override string) (string, error) {
 	if override != "" {
 		if _, err := os.Stat(override); err != nil {
@@ -3269,19 +4242,22 @@ func findTraceExtractor(override string) (string, error) {
 		}
 		return override, nil
 	}
+	if self, err := os.Executable(); err == nil {
+		for _, name := range bundledTraceExtractorNames(runtime.GOOS, runtime.GOARCH) {
+			p := filepath.Join(filepath.Dir(self), name)
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+	}
 	if p, err := exec.LookPath(traceExtractorBin); err == nil {
 		return p, nil
 	}
-	if _, err := os.Stat(remoteTraceExtractorPath); err == nil {
-		return remoteTraceExtractorPath, nil
+	if _, err := os.Stat(legacyTraceExtractorPath); err == nil {
+		return legacyTraceExtractorPath, nil
 	}
-	if self, err := os.Executable(); err == nil {
-		p := filepath.Join(filepath.Dir(self), traceExtractorBin)
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("trace_extractor binary not found; place it alongside the wlc binary or use --trace-extractor-path")
+	return "", fmt.Errorf("trace_extractor binary not found; place %s alongside the wlc binary or use --trace-extractor-path",
+		strings.Join(bundledTraceExtractorNames(runtime.GOOS, runtime.GOARCH), " or "))
 }
 
 // addRawFileToArchive streams a file into the tar without loading it into memory.
@@ -3313,11 +4289,93 @@ func addRawFileToArchive(tw *tar.Writer, destPath, srcPath string) error {
 	return err
 }
 
+var (
+	reExtractorShards     = regexp.MustCompile(`(?m)^\s+(\d+) shards\s*$`)
+	reExtractorHistograms = regexp.MustCompile(`(?m)^\s+(\d+) histogram files\s*$`)
+	reExtractorUnparsed   = regexp.MustCompile(`(?m): (\d+) skipped \(parse\)`)
+	reExtractorDirWarning = regexp.MustCompile(`(?m)^warning: cannot read trace directory .*$`)
+	reExtractorShardGlob  = regexp.MustCompile(`(?m): (\d+) files match glob \*\.shard\s*$`)
+	reExtractorParseSkip  = regexp.MustCompile(`(?m)^verbose: (.*): (\d+) skipped \(parse\)`)
+)
+
+// parseExtractorOutput fills the shard, histogram and unparsed-file counts from
+// trace_extractor's stderr (its "Collecting:" summary and --verbose lines).
+// It returns how many *.shard files the extractor saw in the trace directory
+// (-1 if its output does not say) and how many of those it could not parse.
+func parseExtractorOutput(out string, r *TraceResult) (shardsSeen, shardsUnparsed int) {
+	shardsSeen = -1
+	if m := reExtractorShardGlob.FindStringSubmatch(out); m != nil {
+		shardsSeen, _ = strconv.Atoi(m[1])
+	}
+	for _, m := range reExtractorParseSkip.FindAllStringSubmatch(out, -1) {
+		if !strings.HasSuffix(m[1], "/histograms") {
+			n, _ := strconv.Atoi(m[2])
+			shardsUnparsed += n
+		}
+	}
+	if m := reExtractorShards.FindStringSubmatch(out); m != nil {
+		r.Shards, _ = strconv.Atoi(m[1])
+	}
+	if m := reExtractorHistograms.FindStringSubmatch(out); m != nil {
+		r.Histograms, _ = strconv.Atoi(m[1])
+	}
+	for _, m := range reExtractorUnparsed.FindAllStringSubmatch(out, -1) {
+		n, _ := strconv.Atoi(m[1])
+		r.UnparsedFiles += n
+	}
+	if m := reExtractorDirWarning.FindString(out); m != "" && r.Reason == "" {
+		r.Reason = m
+	}
+	return shardsSeen, shardsUnparsed
+}
+
+// traceResultLine renders a TraceResult as one summary line.
+func traceResultLine(r *TraceResult) string {
+	line := fmt.Sprintf("%s, %d shards", r.Status, r.Shards)
+	if r.UnparsedFiles > 0 {
+		line += fmt.Sprintf(", %d unparsed files skipped", r.UnparsedFiles)
+	}
+	if r.Reason != "" && r.Status != "ok" {
+		line += ": " + r.Reason
+	}
+	return line
+}
+
+// fileSHA256 returns the hex SHA-256 of a file, or "" if it cannot be read.
+// Recorded in extractor.log so a bundle shows exactly which build ran.
+func fileSHA256(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// lastNonEmptyLine returns the last non-blank line of s, for short error text.
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			return l
+		}
+	}
+	return ""
+}
+
 // runTraceExtractor invokes trace_extractor for the local node and adds its
-// output archive(s) into the bundle under hosts/<hostname>/traces/.
-// Uses the package-level resolvedTraceExtractorPath and traceFilters globals.
-func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, to time.Time) {
-	args := []string{}
+// output archive(s) into the bundle under hosts/<hostname>/traces/, together
+// with extractor.log (command, timing, exit status and the extractor's
+// --verbose output). It returns the outcome for the host manifest.
+// Uses the package-level resolvedTraceExtractorPath, traceFilters and
+// traceTimeout globals.
+func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, to time.Time) *TraceResult {
+	res := &TraceResult{}
+	args := []string{"--verbose"}
 	if len(traceFilters) == 0 {
 		args = append(args, "--all")
 	} else {
@@ -3325,39 +4383,95 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 			args = append(args, "--filter", f)
 		}
 	}
+	// RFC3339 with seconds and zone: trace_extractor honours the zone, and
+	// minute precision would cut up to 59 s off the end of the window.
 	if !from.IsZero() {
-		args = append(args, "--from", from.Format("2006-01-02T15:04"))
+		args = append(args, "--from", from.Format(time.RFC3339))
 	}
-	if !to.IsZero() {
-		args = append(args, "--to", to.Format("2006-01-02T15:04"))
+	end := to
+	if end.IsZero() {
+		end = traceWindowEnd
+	}
+	if !end.IsZero() {
+		args = append(args, "--to", end.Format(time.RFC3339))
 	}
 
 	tmpDir, err := os.MkdirTemp("", "wlc-traces-*")
 	if err != nil {
 		warnf("[traces] could not create temp dir: %v", err)
-		return
+		res.Status = "failed"
+		res.Reason = fmt.Sprintf("could not create temp dir: %v", err)
+		return res
 	}
 	defer os.RemoveAll(tmpDir)
 
 	logf("[traces] running trace_extractor %s", strings.Join(args, " "))
-	cmd := exec.Command(resolvedTraceExtractorPath, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), traceTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, resolvedTraceExtractorPath, args...)
 	cmd.Dir = tmpDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		warnf("[traces] trace_extractor failed: %v\n%s", err, strings.TrimSpace(string(out)))
-		return
+	cmd.WaitDelay = 10 * time.Second
+	start := time.Now()
+	out, runErr := cmd.CombinedOutput()
+	res.Duration = time.Since(start).Round(time.Second).String()
+	shardFilesSeen, shardFilesUnparsed := parseExtractorOutput(string(out), res)
+
+	exitDesc := "0"
+	switch {
+	case runErr != nil && ctx.Err() == context.DeadlineExceeded:
+		res.Status = "timeout"
+		res.ExitCode = -1
+		res.Reason = fmt.Sprintf("trace_extractor did not finish within %s (--trace-timeout)", traceTimeout)
+		exitDesc = "killed after timeout"
+	case runErr != nil:
+		res.Status = "failed"
+		res.ExitCode = -1
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			res.ExitCode = exitErr.ExitCode()
+		}
+		res.Reason = runErr.Error()
+		if l := lastNonEmptyLine(string(out)); l != "" {
+			res.Reason += ": " + l
+		}
+		exitDesc = runErr.Error()
 	}
-	if len(out) > 0 {
-		vlogf("[traces] %s", strings.TrimSpace(string(out)))
+	if res.Status != "" {
+		// Nothing was added to the bundle: report no shards, and say how
+		// many the extractor had selected (explains most timeouts).
+		if res.Shards > 0 {
+			res.Reason += fmt.Sprintf(" (%d shards had been selected)", res.Shards)
+		}
+		res.Shards, res.Histograms = 0, 0
+	}
+
+	logHeader := fmt.Sprintf("command: %s %s\n", resolvedTraceExtractorPath, strings.Join(args, " "))
+	if traceExtractorSource != "" && traceExtractorSource != resolvedTraceExtractorPath {
+		logHeader += fmt.Sprintf("source: %s (run from a copy: not executable)\n", traceExtractorSource)
+	}
+	if sum := fileSHA256(resolvedTraceExtractorPath); sum != "" {
+		logHeader += "sha256: " + sum + "\n"
+	}
+	logHeader += fmt.Sprintf("started: %s\nduration: %s\nexit: %s\n\n",
+		start.UTC().Format(time.RFC3339), res.Duration, exitDesc)
+	logDest := filepath.Join(archiveRoot, "hosts", pathHostname, "traces", "extractor.log")
+	if err := addBytesToArchive(tw, logDest, append([]byte(logHeader), out...)); err != nil {
+		warnf("[traces] could not add extractor.log to archive: %v", err)
+	}
+
+	if res.Status != "" {
+		warnf("[traces] %s: %s (details in traces/extractor.log)", res.Status, res.Reason)
+		return res
 	}
 
 	entries, readErr := os.ReadDir(tmpDir)
 	if readErr != nil {
 		warnf("[traces] could not list output dir: %v", readErr)
-		return
+		res.Status = "failed"
+		res.Reason = fmt.Sprintf("could not list output dir: %v", readErr)
+		res.Shards, res.Histograms = 0, 0
+		return res
 	}
 
-	added := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
 			continue
@@ -3368,12 +4482,39 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 			warnf("[traces] could not add %s to archive: %v", e.Name(), err)
 		} else {
 			logf("[traces] added %s", e.Name())
-			added++
+			res.Archives = append(res.Archives, e.Name())
 		}
 	}
-	if added == 0 {
+
+	switch {
+	case len(res.Archives) == 0:
+		res.Status = "failed"
+		res.Reason = "trace_extractor ran but no archive was added"
+		if res.Shards > 0 {
+			res.Reason += fmt.Sprintf(" (%d shards had been selected)", res.Shards)
+		}
+		res.Shards, res.Histograms = 0, 0
 		warnf("[traces] trace_extractor ran but produced no output files")
+	case res.Shards == 0:
+		res.Status = "no_shards"
+		switch {
+		case res.Reason != "": // e.g. trace directory not readable
+		case shardFilesSeen == 0:
+			res.Reason = "no shard files in the trace directory"
+		case shardFilesSeen > 0 && shardFilesUnparsed >= shardFilesSeen:
+			res.Reason = fmt.Sprintf("none of the %d shard files had a name trace_extractor could parse", shardFilesSeen)
+		default:
+			res.Reason = "no shard files matched the time window and filter"
+		}
+		warnf("[traces] 0 shards collected: %s", res.Reason)
+	default:
+		res.Status = "ok"
+		logf("[traces] %d shards, %d histogram files in %s", res.Shards, res.Histograms, res.Duration)
 	}
+	if res.UnparsedFiles > 0 {
+		warnf("[traces] %d trace file(s) had names trace_extractor could not parse and were skipped (see traces/extractor.log)", res.UnparsedFiles)
+	}
+	return res
 }
 
 // scpFileToRemote copies localPath to sshTarget:remotePath using the standard
@@ -3420,8 +4561,9 @@ func deployToHost(host, selfPath string) error {
 	}
 
 	if collectTraces && resolvedTraceExtractorPath != "" {
-		if err := scpFileToRemote(target, resolvedTraceExtractorPath, remoteTraceExtractorPath); err != nil {
-			warnf("[%s] trace_extractor deploy failed (trace collection may fail on this node): %v", host, err)
+		if err := scpFileToRemote(target, resolvedTraceExtractorPath, remoteTraceExtractorPath()); err != nil {
+			traceDeployFailed.Store(host, err.Error())
+			warnf("[%s] trace_extractor deploy failed; collecting logs without traces on this node: %v", host, err)
 		}
 	}
 	return nil
@@ -3440,12 +4582,16 @@ const deployWorkers = 20
 // If all hosts reject the current SSH user with a "Please login as user X"
 // message (common on OCI/EC2 where root SSH is blocked), deployAll
 // automatically retries once with the suggested user.
-func deployAll(hosts []string, displayNames map[string]string, selfPath string) []string {
+//
+// It returns the hosts that were deployed and, for every other host, the
+// deploy error text.
+func deployAll(hosts []string, displayNames map[string]string, selfPath string) ([]string, map[string]string) {
 	return deployAllInner(hosts, displayNames, selfPath, false)
 }
 
-func deployAllInner(hosts []string, displayNames map[string]string, selfPath string, isRetry bool) []string {
+func deployAllInner(hosts []string, displayNames map[string]string, selfPath string, isRetry bool) ([]string, map[string]string) {
 	type deployErr struct {
+		host    string
 		display string
 		msg     string
 	}
@@ -3468,7 +4614,7 @@ func deployAllInner(hosts []string, displayNames map[string]string, selfPath str
 			}
 			if err := deployToHost(host, selfPath); err != nil {
 				mu.Lock()
-				failures = append(failures, deployErr{display, err.Error()})
+				failures = append(failures, deployErr{host, display, err.Error()})
 				mu.Unlock()
 				return
 			}
@@ -3479,8 +4625,12 @@ func deployAllInner(hosts []string, displayNames map[string]string, selfPath str
 	}
 	wg.Wait()
 
+	failedMsgs := make(map[string]string, len(failures))
+	for _, f := range failures {
+		failedMsgs[f.host] = f.msg
+	}
 	if len(failures) == 0 {
-		return succeeded
+		return succeeded, failedMsgs
 	}
 
 	// Check whether all failures are SSH user rejections pointing to the same user.
@@ -3525,7 +4675,114 @@ func deployAllInner(hosts []string, displayNames map[string]string, selfPath str
 		sort.Strings(users)
 		warnf("SSH user rejected — re-run with: --ssh-user %s", strings.Join(users, " or "))
 	}
-	return succeeded
+	return succeeded, failedMsgs
+}
+
+// deployFailureResults turns deploy failures into HostResults so that hosts
+// which never ran a collection still appear in the bundle (COLLECTION_FAILED.txt),
+// in the host counts and in the failed-host list.
+func deployFailureResults(hosts []string, failed map[string]string) []HostResult {
+	var out []HostResult
+	for _, h := range hosts {
+		if msg, ok := failed[h]; ok {
+			out = append(out, HostResult{Host: h, Err: fmt.Errorf("deploy failed: %s", msg)})
+		}
+	}
+	return out
+}
+
+// remoteKillCommand builds the Ctrl-C cleanup run on each active host: kill
+// the deployed wlc (and trace_extractor) and remove them. Every name is
+// written in pkillSelfSafePattern form (the rm paths as shell globs), so the
+// pkill cannot match the cleanup shell's own command line and the rm runs.
+func remoteKillCommand(remoteBin string) string {
+	// "( |$)" anchors the end of the name so ...-123 does not match ...-1234.
+	files := pkillSelfSafePattern(remoteBin)
+	kill := maybeRemoteSudo("pkill -f '"+pkillSelfSafePattern(filepath.Base(remoteBin))+"( |$)'") + " 2>/dev/null"
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		te := pkillSelfSafePattern(remoteTraceExtractorPath())
+		files += " " + te
+		kill += "; " + maybeRemoteSudo("pkill -f '"+te+"( |$)'") + " 2>/dev/null"
+	}
+	// The [x]name globs must be expanded by a shell that can read wlcBaseDir,
+	// so with sudo the rm runs in a root shell.
+	rm := "rm -f " + files
+	if remoteNeedsSudo() {
+		rm = `sudo sh -c "` + rm + `"`
+	}
+	return kill + "; " + rm + "; true"
+}
+
+// tracesEnabledForHost reports whether the remote run on host should collect
+// traces: --collect-traces is on and trace_extractor was copied successfully.
+func tracesEnabledForHost(host string) bool {
+	if !collectTraces || resolvedTraceExtractorPath == "" {
+		return false
+	}
+	_, failed := traceDeployFailed.Load(host)
+	return !failed
+}
+
+// remoteNodeArgs returns the flags shared by every remote --local --node-only
+// invocation (collection and upload): time window, verbosity, privacy,
+// container scoping and trace collection.
+func remoteNodeArgs(host string, from, to time.Time, containerNames []string) []string {
+	var extra []string
+	if !from.IsZero() {
+		extra = append(extra, "--start-time", remoteTimeArg(from))
+	}
+	if !to.IsZero() {
+		extra = append(extra, "--end-time", remoteTimeArg(to))
+	}
+	if verbose {
+		extra = append(extra, "--verbose")
+	}
+	if noShellHistory {
+		extra = append(extra, "--no-shell-history")
+	}
+	for _, name := range containerNames {
+		extra = append(extra, "--container-name", name)
+	}
+	if !collectTraces && traceSkipReason != "" {
+		// The whole run skipped traces (no --start-time, window too long):
+		// record it in every node's manifest, also in --upload mode.
+		extra = append(extra, "--trace-skip-reason", oneLine(traceSkipReason, 300))
+	}
+	if v, failed := traceDeployFailed.Load(host); failed && collectTraces && resolvedTraceExtractorPath != "" {
+		// Let the node record why its bundle has no traces (also in --upload
+		// mode, where the orchestrator never sees the node's manifest).
+		extra = append(extra, "--trace-skip-reason", oneLine("trace_extractor deploy failed: "+v.(string), 300))
+	}
+	if tracesEnabledForHost(host) {
+		extra = append(extra, "--collect-traces")
+		extra = append(extra, "--trace-extractor-path", remoteTraceExtractorPath())
+		extra = append(extra, "--trace-timeout", traceTimeout.String())
+		for _, f := range traceFilters {
+			extra = append(extra, "--trace-filter", f)
+		}
+	}
+	return extra
+}
+
+// remoteShellCommand wraps a remote collection command: chmod the deployed
+// binaries, remove them on exit (also on failure or a dropped connection) and
+// bound the run with timeout(1) so no orphan is left behind.
+func remoteShellCommand(host, remoteBin, collectionCmd string, timeout time.Duration) string {
+	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
+	cleanup := "rm -f " + remoteBin
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		cleanup += " " + remoteTraceExtractorPath()
+		if tracesEnabledForHost(host) {
+			chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath())
+		}
+	}
+	return fmt.Sprintf(
+		"%s; trap '%s' EXIT; timeout %d %s",
+		chmodSetup,
+		maybeRemoteSudo(cleanup),
+		int(timeout.Seconds()),
+		maybeRemoteSudo(collectionCmd),
+	)
 }
 
 // collectFromHost SSHs into a host, runs weka-log-collector --local (binary already
@@ -3549,51 +4806,7 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 	// timeout kills the process if it exceeds the SSH timeout, preventing orphans
 	// when the orchestrator can no longer wait (e.g. after SSH connection drops).
 	// --node-only skips cluster-wide commands (run once by the orchestrator locally).
-	collectionCmd := shellJoin(append([]string{
-		remoteBin,
-		"--local",
-		"--node-only",
-		"--profile", profile,
-		"--output", "-",
-	}, func() []string {
-		var extra []string
-		if !from.IsZero() {
-			extra = append(extra, "--start-time", from.Format("2006-01-02T15:04"))
-		}
-		if !to.IsZero() {
-			extra = append(extra, "--end-time", to.Format("2006-01-02T15:04"))
-		}
-		if verbose {
-			extra = append(extra, "--verbose")
-		}
-		if noShellHistory {
-			extra = append(extra, "--no-shell-history")
-		}
-		if len(containerNames) > 0 {
-			extra = append(extra, "--container-name", strings.Join(containerNames, ","))
-		}
-		if collectTraces && resolvedTraceExtractorPath != "" {
-			extra = append(extra, "--collect-traces")
-			extra = append(extra, "--trace-extractor-path", remoteTraceExtractorPath)
-			for _, f := range traceFilters {
-				extra = append(extra, "--trace-filter", f)
-			}
-		}
-		return extra
-	}()...))
-
-	timeoutSecs := int(sshTimeout.Seconds())
-	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
-	if collectTraces && resolvedTraceExtractorPath != "" {
-		chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath)
-	}
-	remoteShellCmd := fmt.Sprintf(
-		"%s; trap '%s' EXIT; timeout %d %s",
-		chmodSetup,
-		maybeRemoteSudo("rm -f "+remoteBin),
-		timeoutSecs,
-		maybeRemoteSudo(collectionCmd),
-	)
+	sshTimeout, remoteShellCmd := collectRemoteCommand(host, remoteBin, profile, from, to, containerNames, sshTimeout)
 
 	// ── run collection via SSH, streaming output to a temp file ──────────
 	// Streaming to disk (not RAM) prevents accumulating 200-400 MB per host
@@ -3620,10 +4833,11 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 			if exitCode == 124 {
 				result.Err = fmt.Errorf("timed out after %s — collection took too long", sshTimeout)
 			} else if exitCode == 137 {
-				result.Err = fmt.Errorf("process killed (OOM) on remote host — try --start-time to reduce collection size: %s", errMsg)
+				result.Err = fmt.Errorf("process killed (OOM) on remote host — try --start-time to reduce collection size: %s", remoteErrorSummary(errMsg))
 			} else {
-				result.Err = fmt.Errorf("SSH command failed (exit %d): %s", exitCode, errMsg)
+				result.Err = remoteFailure(exitCode, errMsg)
 			}
+			result.Stderr = errMsg
 		} else {
 			result.Err = fmt.Errorf("SSH error: %v", runErr)
 		}
@@ -4234,22 +5448,15 @@ func uploadBundle(archivePath string, sessionID int64) error {
 	setActive := func(p string) { mu.Lock(); activeLinkPath = p; mu.Unlock() }
 	getActive := func() string { mu.Lock(); defer mu.Unlock(); return activeLinkPath }
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		if _, ok := <-sigCh; ok {
-			if lp := getActive(); lp != "" {
-				os.Remove(lp)
-			}
-			if staged {
-				os.Remove(stagedPath)
-			}
-			warnf("Upload interrupted — cleaned up staging files")
-			os.Exit(1)
+	linkCleanup := func() {
+		if lp := getActive(); lp != "" {
+			os.Remove(lp)
 		}
-	}()
-	defer signal.Stop(sigCh)
-	defer close(sigCh)
+		if staged {
+			os.Remove(stagedPath)
+		}
+	}
+	defer uploadSignalSetup(linkCleanup)()
 
 	// A healthy uploader picks up inotify events nearly immediately and moves
 	// the symlink to .uploaded/ when done. Allow at least 5 min per container
@@ -4524,7 +5731,7 @@ _weka_log_collector() {
           --start-time --end-time --profile --output --host --container-id
           --extra-commands --cmd-timeout --no-shell-history --compression --anonymize --anonymize-key --force
           --list-bundles --rm-bundle --clean-bundles --ssh-user --cluster-cmd-workers
-          --collect-traces --trace-filter --trace-extractor-path"
+          --collect-traces --trace-filter --trace-extractor-path --trace-timeout"
 
     case "$prev" in
         --profile)
@@ -4566,10 +5773,11 @@ complete -F _weka_log_collector weka-log-collector ./weka-log-collector
 
 // mergeArchive reads a tar.gz from src and re-writes every entry into
 // the destination tar.Writer under a new root prefix.
-func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
+func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) (*HostManifest, error) {
+	var hostManifest *HostManifest
 	gr, err := gzip.NewReader(src)
 	if err != nil {
-		return fmt.Errorf("gzip open: %w", err)
+		return nil, fmt.Errorf("gzip open: %w", err)
 	}
 	defer gr.Close()
 	tr := tar.NewReader(gr)
@@ -4580,7 +5788,7 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("tar read: %w", err)
+			return nil, fmt.Errorf("tar read: %w", err)
 		}
 		// strip old root prefix (first path component) and replace with newRoot
 		parts := strings.SplitN(hdr.Name, "/", 2)
@@ -4589,6 +5797,28 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			rest = parts[1]
 		}
 		hdr.Name = filepath.Join(newRoot, rest)
+
+		// The host's collection_manifest.json: a --node-only archive keeps it
+		// at the archive root. Read it to report the host's trace outcome,
+		// and file it under hosts/<host>/ — otherwise every host writes the
+		// same <root>/collection_manifest.json entry into the merged bundle.
+		var data []byte
+		buffered := false
+		atRoot := rest == "collection_manifest.json"
+		if (atRoot || (strings.HasPrefix(rest, "hosts/") && strings.HasSuffix(rest, "/collection_manifest.json"))) &&
+			hdr.Size <= maxManifestSize {
+			data, err = io.ReadAll(tr)
+			if err != nil {
+				return nil, fmt.Errorf("tar read entry: %w", err)
+			}
+			buffered = true
+			if m := parseHostManifest(data); m != nil {
+				hostManifest = m
+				if atRoot && isSafePathComponent(m.Hostname) {
+					hdr.Name = filepath.Join(newRoot, "hosts", m.Hostname, "collection_manifest.json")
+				}
+			}
+		}
 
 		// Anonymize the path itself when --anonymize is on. Remote nodes
 		// wrote these paths as hosts/<real-hostname>/... because the
@@ -4604,9 +5834,11 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			// the (possibly changed) size. Text content gets the full pipeline;
 			// binary content gets the literal-only pass (safe substring
 			// substitution of known sensitive values, no regex on binary).
-			data, readErr := io.ReadAll(tr)
-			if readErr != nil {
-				return fmt.Errorf("tar read entry: %w", readErr)
+			if !buffered {
+				data, err = io.ReadAll(tr)
+				if err != nil {
+					return nil, fmt.Errorf("tar read entry: %w", err)
+				}
 			}
 			if isLikelyText(data) {
 				data = redactSensitive(data)
@@ -4614,24 +5846,46 @@ func mergeArchive(tw *tar.Writer, src io.Reader, newRoot string) error {
 			} else {
 				data = globalAnonymizer.ApplyLiteralOnly(data)
 			}
+			buffered = true
+		}
+
+		if buffered {
 			hdr.Size = int64(len(data))
 			if err := tw.WriteHeader(hdr); err != nil {
-				return fmt.Errorf("tar write header: %w", err)
+				return nil, fmt.Errorf("tar write header: %w", err)
 			}
 			if _, err := tw.Write(data); err != nil {
-				return fmt.Errorf("tar write data: %w", err)
+				return nil, fmt.Errorf("tar write data: %w", err)
 			}
 			continue
 		}
-
 		if err := tw.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("tar write header: %w", err)
+			return nil, fmt.Errorf("tar write header: %w", err)
 		}
 		if _, err := io.Copy(tw, tr); err != nil {
-			return fmt.Errorf("tar copy: %w", err)
+			return nil, fmt.Errorf("tar copy: %w", err)
 		}
 	}
-	return nil
+	return hostManifest, nil
+}
+
+// isSafePathComponent reports whether s can be used as one archive path
+// element (no separators, not empty, not . or ..).
+func isSafePathComponent(s string) bool {
+	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, "/\\\x00")
+}
+
+// maxManifestSize bounds how much of a host's collection_manifest.json the
+// merge reads into memory to extract the per-host summary.
+const maxManifestSize = 16 << 20
+
+// parseHostManifest decodes a host's collection_manifest.json; nil on error.
+func parseHostManifest(data []byte) *HostManifest {
+	var m HostManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil
+	}
+	return &m
 }
 
 // archiveExt returns the file extension for the given compression format.
@@ -4739,7 +5993,16 @@ func sanitizeErrStr(s string) string {
 // run invokes kubectl (locally or via SSH jump host) with a timeout and returns
 // combined stdout+stderr. Non-zero exit returns an error containing the output.
 func (k *kubectlRunner) run(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	return k.runTimeout(k.timeout, args...)
+}
+
+// errKubectlTimeout is wrapped into the error of a kubectl call that hit its
+// deadline, so callers can tell a timeout from a command failure.
+var errKubectlTimeout = errors.New("kubectl timed out")
+
+// runTimeout is run with an explicit timeout instead of the runner default.
+func (k *kubectlRunner) runTimeout(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	kcArgs := k.buildKubectlArgs(args)
@@ -4758,8 +6021,14 @@ func (k *kubectlRunner) run(args ...string) ([]byte, error) {
 		cmd = exec.CommandContext(ctx, "kubectl", kcArgs...)
 	}
 
+	// A killed kubectl (or ssh to the jump host) can leave a child holding
+	// the output pipe; do not wait for it past the deadline.
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return out, fmt.Errorf("kubectl %s: %w after %s", args[0], errKubectlTimeout, timeout)
+		}
 		return out, fmt.Errorf("kubectl %s: %w: %s", args[0], err, sanitizeErrStr(string(out)))
 	}
 	return out, nil
@@ -4801,13 +6070,18 @@ func (k *kubectlRunner) runExternal(binary string, args ...string) ([]byte, erro
 // execInPod runs a command inside a pod via kubectl exec.
 // container may be "" to use the pod's default container.
 func (k *kubectlRunner) execInPod(ns, pod, container string, cmd ...string) ([]byte, error) {
+	return k.execInPodTimeout(k.timeout, ns, pod, container, cmd...)
+}
+
+// execInPodTimeout is execInPod with an explicit timeout.
+func (k *kubectlRunner) execInPodTimeout(timeout time.Duration, ns, pod, container string, cmd ...string) ([]byte, error) {
 	args := []string{"exec", pod, "-n", ns}
 	if container != "" {
 		args = append(args, "-c", container)
 	}
 	args = append(args, "--")
 	args = append(args, cmd...)
-	return k.run(args...)
+	return k.runTimeout(timeout, args...)
 }
 
 // podLogs fetches logs for a pod. When container is "", collects all containers
@@ -5270,6 +6544,74 @@ func collectK8sTroubledPods(tw *tar.Writer, kc *kubectlRunner, root, ns string, 
 	}
 }
 
+// runK8sClusterWideCommands runs clusterWideCLICommands once each, on the
+// first weka container pod that answers, and adds the output under
+// weka-commands/.
+func runK8sClusterWideCommands(tw *tar.Writer, kc *kubectlRunner, root, clusterNS string, pods []string, m *k8sManifest) {
+	// lastGood is the pod that last answered a cluster-wide command. Each
+	// command tries it first, so one hung pod costs a timeout once, not per
+	// command; a slow command is only given up after a timeout on a pod that
+	// has already answered (then the query itself is slow, not the pod).
+	lastGood := ""
+	for _, spec := range clusterWideCLICommands {
+		timeout := kc.timeout
+		minTimeout, slow := k8sCommandMinTimeout[spec.name]
+		if minTimeout > timeout {
+			timeout = minTimeout
+		}
+		for _, pod := range podsPreferring(pods, lastGood) {
+			if !isWekaContainerPod(pod) {
+				continue
+			}
+			m.TotalCommands++
+			out, err := kc.execInPodTimeout(timeout, clusterNS, pod, "", spec.cmd...)
+			if err != nil {
+				m.FailedCommands++
+				errStr := err.Error()
+				if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot get resource") || strings.Contains(errStr, "cannot list resource") {
+					warnf("k8s: %s: RBAC permission denied — skipping (grant exec access in a ClusterRole/RoleBinding)", spec.name)
+					break // RBAC denial is cluster-wide; retrying other pods will not help
+				}
+				if slow && pod == lastGood && errors.Is(err, errKubectlTimeout) {
+					warnf("k8s: %s timed out after %s on %s, which answered earlier commands; not retrying on other pods (cluster-wide query)", spec.name, timeout, pod)
+					break
+				}
+				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
+				continue
+			}
+			_ = addBytesToArchive(tw, root+"/weka-commands/"+spec.name, out)
+			lastGood = pod
+			break // success — no need to try other pods
+		}
+	}
+}
+
+// podsPreferring returns pods with first moved to the front (if present).
+func podsPreferring(pods []string, first string) []string {
+	if first == "" {
+		return pods
+	}
+	out := make([]string, 0, len(pods))
+	for _, p := range pods {
+		if p == first {
+			out = append([]string{p}, out...)
+		} else {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// k8sCommandMinTimeout raises the per-command timeout (--cmd-timeout, default
+// 60s) for slow cluster-wide commands. weka events with a large --num-results
+// pages through all results and prints nothing until done, so a timeout loses
+// every event. A command listed here is also not retried on other pods after a
+// timeout: the query is cluster-wide, so another pod is not faster.
+var k8sCommandMinTimeout = map[string]time.Duration{
+	"weka_events_major.txt":   eventsMinTimeout,
+	"weka_events_warning.txt": eventsMinTimeout,
+}
+
 // clusterWideCLICommands are run once per cluster from the first responsive
 // compute pod. Output is identical on every pod so there is no value running
 // them per-pod — doing so only inflates the failure count on non-compute pods.
@@ -5286,11 +6628,11 @@ var clusterWideCLICommands = []struct {
 	{"weka_user.txt", []string{"weka", "user"}},
 	// cluster topology
 	{"weka_cluster_servers.txt", []string{"weka", "cluster", "servers", "list"}},
-	{"weka_cluster_container.txt", []string{"weka", "cluster", "container"}},
+	{"weka_cluster_container.txt", []string{"weka", "cluster", "container", "-v"}},
 	{"weka_cluster_container_net.txt", []string{"weka", "cluster", "container", "net"}},
-	{"weka_cluster_process.txt", []string{"weka", "cluster", "process"}},
-	{"weka_cluster_drive.txt", []string{"weka", "cluster", "drive"}},
-	{"weka_cluster_bucket.txt", []string{"weka", "cluster", "bucket"}},
+	{"weka_cluster_process.txt", []string{"weka", "cluster", "process", "-v"}},
+	{"weka_cluster_drive.txt", []string{"weka", "cluster", "drive", "-v"}},
+	{"weka_cluster_bucket.txt", []string{"weka", "cluster", "bucket", "-v"}},
 	{"weka_cluster_failure_domain.txt", []string{"weka", "cluster", "failure-domain"}},
 	{"weka_cluster_task.txt", []string{"weka", "cluster", "task"}},
 	// filesystems & snapshots
@@ -5299,7 +6641,8 @@ var clusterWideCLICommands = []struct {
 	{"weka_fs_snapshot.txt", []string{"weka", "fs", "snapshot", "-v"}},
 	{"weka_fs_tier_s3.txt", []string{"weka", "fs", "tier", "s3", "-v"}},
 	// events (last 8 hours)
-	{"weka_events_major.txt", []string{"weka", "events", "--severity", "major", "--start-time", "-8h"}},
+	{"weka_events_major.txt", []string{"weka", "events", "--severity", "major", "--start-time", "-8h", "--num-results", eventsMaxResults}},
+	{"weka_events_warning.txt", []string{"weka", "events", "--severity", "warning", "--start-time", "-8h", "--num-results", eventsMaxResults}},
 	// security
 	{"weka_security_kms.txt", []string{"weka", "security", "kms"}},
 	// debug
@@ -5441,27 +6784,7 @@ func collectK8sWekaCluster(tw *tar.Writer, kc *kubectlRunner, root, clusterNS, o
 
 	// Cluster-wide CLI: run once from the first responsive compute pod.
 	// weka status / weka alerts return the same output on every pod.
-	for _, spec := range clusterWideCLICommands {
-		for _, pod := range pods {
-			if !isWekaContainerPod(pod) {
-				continue
-			}
-			m.TotalCommands++
-			out, err := kc.execInPod(clusterNS, pod, "", spec.cmd...)
-			if err != nil {
-				m.FailedCommands++
-				errStr := err.Error()
-				if strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "cannot get resource") || strings.Contains(errStr, "cannot list resource") {
-					warnf("k8s: %s: RBAC permission denied — skipping (grant exec access in a ClusterRole/RoleBinding)", spec.name)
-					break // RBAC denial is cluster-wide; retrying other pods will not help
-				}
-				vlogf("k8s: cluster CLI %s from %s: %v", spec.cmd[0], pod, err)
-				continue
-			}
-			_ = addBytesToArchive(tw, root+"/weka-commands/"+spec.name, out)
-			break // success — no need to try other pods
-		}
-	}
+	runK8sClusterWideCommands(tw, kc, root, clusterNS, pods, m)
 
 	// Per-pod collection
 	for _, pod := range pods {
@@ -5557,7 +6880,7 @@ OPTIONS
                        or alongside the bundle when --output is specified).
   --upload             Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)
   --compression FMT    Compression format: gzip|xz (default: gzip; xz requires xz binary on PATH)
-  --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s)
+  --cmd-timeout DUR    Per-kubectl-command timeout (default: 60s; weka events gets at least 5m)
   --anonymize          Replace identifying values (hostnames, IPs, MACs, cluster name) with placeholders.
                        Anonymization mapping JSON is written next to the bundle (kept at your site; not in the archive).
   --anonymize-key PATH Override path for the anonymization mapping JSON (default: alongside the bundle)
@@ -5589,7 +6912,8 @@ EXAMPLES
 // runK8sMode is the entry point for `weka-log-collector k8s [args]`.
 // It parses k8s-specific flags, discovers Weka namespaces, collects diagnostics
 // from all Weka components in the K8s cluster, and produces a .tar.gz bundle.
-func runK8sMode(args []string) {
+// It returns the process exit code: 1 when --upload was requested and failed.
+func runK8sMode(args []string) int {
 	fs := flag.NewFlagSet("k8s", flag.ExitOnError)
 	fs.Usage = k8sUsageFunc
 
@@ -5601,7 +6925,7 @@ func runK8sMode(args []string) {
 	csiNS := fs.String("csi-ns", "", "Override CSI plugin namespace")
 	outputPath := fs.String("output", "", fmt.Sprintf("Output .tar.gz path (default: %s/<cluster>-weka-logs-<ts>.tar.gz when /opt/weka exists, otherwise ./weka-log-collector/bundles/)", wlcBundlesDir))
 	upload := fs.Bool("upload", false, "Upload bundle to Weka Home after collection (requires 'weka cloud enable' inside a compute pod)")
-	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout")
+	cmdTimeout := fs.Duration("cmd-timeout", 60*time.Second, "Per-kubectl-command timeout (weka events gets at least 5m)")
 	verboseFlag := fs.Bool("verbose", false, "Verbose output")
 	ver := fs.Bool("version", false, "Print version and exit")
 	compression := fs.String("compression", "gzip", "Compression format: gzip|xz")
@@ -5614,7 +6938,7 @@ func runK8sMode(args []string) {
 
 	if *ver {
 		fmt.Printf("weka-log-collector %s\n", version)
-		return
+		return 0
 	}
 
 	if extra := fs.Args(); len(extra) > 0 {
@@ -5825,9 +7149,11 @@ func runK8sMode(args []string) {
 	}
 	logf("  Commands: %d total, %d failed", m.TotalCommands, m.FailedCommands)
 
+	uploadFailed := false
 	if *upload {
 		if err := uploadK8sBundle(kc, ns.Cluster, outPath); err != nil {
 			errorf("Upload failed: %v", err)
+			uploadFailed = true
 		}
 	}
 
@@ -5839,6 +7165,10 @@ func runK8sMode(args []string) {
 			logf("Keep this file at your site — it is needed to decode anonymized values when troubleshooting.")
 		}
 	}
+	if uploadFailed {
+		return 1
+	}
+	return 0
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -6167,15 +7497,25 @@ func handleCleanBundles() {
 }
 
 func main() {
+	// exitCode lets a path report failure after the deferred cleanups (run
+	// lock release, anonymization key) have run: this defer is registered
+	// first, so it runs last.
+	exitCode := 0
+	defer func() {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+	}()
+
 	// Subcommand routing: must precede flag.Parse() so k8s-specific flags are
 	// not seen by the global flag set and --help stays uncluttered.
 	if len(os.Args) > 1 && os.Args[1] == "k8s" {
-		runK8sMode(os.Args[2:])
+		exitCode = runK8sMode(os.Args[2:])
 		return
 	}
 
 	var (
-		startTimeStr       = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30)")
+		startTimeStr       = flag.String("start-time", "", "Start of time window (e.g. -2h, -30m, 2026-03-04T10:30, 2026-03-04T10:30:00Z)")
 		endTimeStr         = flag.String("end-time", "", "End of time window (default: now)")
 		profileStr         = flag.String("profile", ProfileDefault, fmt.Sprintf("Collection profile: %s", strings.Join(validProfiles, "|")))
 		outputPath         = flag.String("output", "", "Output .tar.gz path (default: /opt/weka/weka-log-collector/bundles/<name>-weka-logs-<ts>.tar.gz). Use - for stdout.")
@@ -6201,6 +7541,8 @@ func main() {
 		force              = flag.Bool("force", false, "Override the run lock (use only when an earlier run is known to be hung)")
 		collectTracesFlag  = flag.Bool("collect-traces", false, "Collect traces via trace_extractor (WEKA v5.x+ only; requires --start-time; window capped at 1 hour)")
 		traceExtractorPath = flag.String("trace-extractor-path", "", "Path to trace_extractor binary (default: auto-discover alongside wlc binary or in PATH)")
+		traceTimeoutFlag   = flag.Duration("trace-timeout", defaultTraceTimeout, "Maximum run time of trace_extractor on each node (e.g. 10m, 30m)")
+		traceSkipFlag      = flag.String("trace-skip-reason", "", "Internal: why this node collects no traces (set by the orchestrator when trace_extractor could not be deployed)")
 	)
 	var hosts multiStringFlag
 	var containerIDs multiIntFlag
@@ -6356,10 +7698,16 @@ func main() {
 	}
 
 	// ── validate trace collection window and resolve binary ───────────────
+	if err := validateTraceTimeout(*traceTimeoutFlag); err != nil {
+		errorf("%v", err)
+		os.Exit(1)
+	}
+	traceTimeout = *traceTimeoutFlag
 	if *collectTracesFlag {
 		if from.IsZero() {
 			// No explicit --start-time: default window (8h) is too large for traces.
-			logf("Note: --collect-traces skipped — requires an explicit --start-time (max 1 hour).")
+			traceSkipReason = "no --start-time given (traces need an explicit window of at most 1 hour)"
+			warnf("--collect-traces skipped: requires an explicit --start-time (max 1 hour).")
 			logf("      Traces are targeted; use e.g. --start-time -30m --collect-traces")
 			*collectTracesFlag = false
 		} else {
@@ -6367,13 +7715,25 @@ func main() {
 			if effectiveTo.IsZero() {
 				effectiveTo = time.Now()
 			}
-			if effectiveTo.Sub(from) > traceMaxWindow {
-				logf("Note: --collect-traces skipped — time window is %.0f minutes (max: 60 minutes).",
+			// One minute of tolerance: "--start-time -1h" resolves to a window
+			// a few microseconds over 60 minutes by the time it is checked.
+			if effectiveTo.Sub(from) > traceMaxWindow+traceWindowTolerance {
+				traceSkipReason = fmt.Sprintf("time window is %.0f minutes (max: 60 minutes)", effectiveTo.Sub(from).Minutes())
+				warnf("--collect-traces skipped: time window is %.0f minutes (max: 60 minutes).",
 					effectiveTo.Sub(from).Minutes())
 				logf("      Narrow the window with --start-time / --end-time to at most 1 hour.")
 				*collectTracesFlag = false
+			} else {
+				// The extractor runs after log collection. Without an end
+				// time (--local) it would otherwise take "now" at that point
+				// and the window would grow past the cap by the collection
+				// time; fix the end where the cap was checked.
+				traceWindowEnd = effectiveTo
 			}
 		}
+	}
+	if *traceSkipFlag != "" && !*collectTracesFlag {
+		traceSkipReason = *traceSkipFlag
 	}
 	if *collectTracesFlag {
 		collectTraces = true
@@ -6386,14 +7746,37 @@ func main() {
 		}
 		var err error
 		resolvedTraceExtractorPath, err = findTraceExtractor(*traceExtractorPath)
-		if err != nil {
+		if err != nil && *nodeOnly {
+			// Sub-invocation on a remote node: keep the node's logs and record
+			// why traces are missing instead of losing the whole host.
+			traceSkipReason = fmt.Sprintf("trace_extractor not usable on this node: %v", err)
+			warnf("--collect-traces skipped: %s", traceSkipReason)
+			collectTraces = false
+			resolvedTraceExtractorPath = ""
+		} else if err != nil {
 			errorf("--collect-traces: %v", err)
 			os.Exit(1)
 		}
-		// Ensure the binary is executable for local invocations. The SSH path
-		// does chmod +x on remote nodes, but the orchestrating node runs the
-		// binary directly without going through that path.
-		_ = os.Chmod(resolvedTraceExtractorPath, 0755)
+		// The orchestrating node runs the extractor directly (remote nodes get
+		// chmod +x in the ssh command). If it is not executable, run a copy.
+		if resolvedTraceExtractorPath != "" {
+			p, cleanup, err := executableTraceExtractor(resolvedTraceExtractorPath)
+			if err != nil {
+				errorf("--collect-traces: %s: %v", resolvedTraceExtractorPath, err)
+				exitCode = 1
+				return
+			}
+			defer cleanup()
+			addExitCleanup(cleanup)
+			traceExtractorSource = resolvedTraceExtractorPath
+			if p != resolvedTraceExtractorPath {
+				logf("Traces:   %s is not executable; running a copy (%s)", resolvedTraceExtractorPath, p)
+				// Until a more specific handler takes over (the cluster
+				// handler, or uploadBundle's), Ctrl-C removes the copy.
+				startEarlySignalHandler(!*nodeOnly)
+			}
+			resolvedTraceExtractorPath = p
+		}
 	}
 
 	// ── default time window ───────────────────────────────────────────────
@@ -6402,7 +7785,32 @@ func main() {
 	// scopes journalctl, weka stats (perf profile), and rotated log files (by mtime).
 	defaultWindow := from.IsZero()
 	if defaultWindow {
-		from = time.Now().Add(-8 * time.Hour)
+		// Anchor the default 8h window at --end-time when only that is given.
+		base := time.Now()
+		if !to.IsZero() {
+			base = to
+		}
+		from = base.Add(-8 * time.Hour)
+	}
+	// Cluster mode: fix the end of the window once, here, so every host and
+	// the cluster-wide commands use the same bounds. Without this each remote
+	// node resolved "now" itself, minutes apart (and could then reject the
+	// trace window as too long).
+	if to.IsZero() && !*localOnly {
+		to = time.Now()
+	}
+	// A --start-time in the future leaves an empty window, in every mode (a
+	// --local run has no end set yet; its end is "now"). Stop here instead of
+	// collecting nothing or deploying to every host only to have each reject it.
+	if windowIsEmpty(from, to, time.Now()) {
+		end := to
+		if end.IsZero() {
+			end = time.Now()
+		}
+		errorf("The time window is empty: start %s is after end %s.", from.Format(time.RFC3339), end.Format(time.RFC3339))
+		errorf("Times without a zone are read in this host's local time zone (%s); use e.g. 2026-03-04T10:30:00Z for UTC.", from.Format("MST"))
+		exitCode = 1
+		return
 	}
 
 	// ── build anonymizer (must happen before output path / archive root are
@@ -6517,7 +7925,7 @@ func main() {
 		if err != nil {
 			errorf("disk space check failed for %s: %v", outputDir, err)
 			errorf("Tip: use --output to write to a different location (e.g. --output /data/weka-logs.tar.gz)")
-			os.Exit(1)
+			exitProcess(1)
 		}
 		logf("Disk:     %d MB available on %s", di.AvailMB, di.Path)
 		if di.AvailMB < minFreeSpaceMB {
@@ -6525,7 +7933,7 @@ func main() {
 				di.Path, di.AvailMB, minFreeSpaceMB)
 			errorf("Tip: use --output /path/on/bigger/disk to write to a different filesystem.")
 			errorf("     Or free up space on %s first.", di.Path)
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}
 
@@ -6534,7 +7942,7 @@ func main() {
 	// so remote nodes only collect /opt/weka/logs/<name>/ for those containers.
 	// --container-name is an internal flag set by the orchestrator; honour it
 	// directly when running as a remote node (--local --node-only).
-	containerNames := []string(containerNamesFlag)
+	containerNames := splitCommaList([]string(containerNamesFlag))
 	if len(containerNames) == 0 && len(containerIDs) > 0 {
 		nameMap := resolveContainerNames([]int(containerIDs))
 		for _, id := range containerIDs {
@@ -6571,6 +7979,9 @@ func main() {
 		if *upload && !toStdout {
 			if err := uploadBundle(outPath, *uploadSessionID); err != nil {
 				errorf("Upload failed: %v", err)
+				// Non-zero so an orchestrating run sees the failure (and keeps
+				// the bundle) instead of counting this node as uploaded.
+				exitCode = 1
 			} else {
 				os.Remove(outPath) // uploaded; no need to keep local copy
 			}
@@ -6609,6 +8020,7 @@ func main() {
 				if *upload && !toStdout {
 					if err := uploadBundle(outPath, 0); err != nil {
 						errorf("Upload failed: %v", err)
+						exitCode = 1
 					} else {
 						os.Remove(outPath)
 					}
@@ -6619,7 +8031,7 @@ func main() {
 				nodes = filterClientNodes(nodes)
 				if len(nodes) == 0 {
 					errorf("No client nodes found in cluster. Are there any Weka client containers?")
-					os.Exit(1)
+					exitProcess(1)
 				}
 				logf("Filtered to %d client node(s)", len(nodes))
 			}
@@ -6627,7 +8039,7 @@ func main() {
 				nodes = filterNodesByContainerID(nodes, []int(containerIDs))
 				if len(nodes) == 0 {
 					errorf("No nodes found matching --container-id %v", []int(containerIDs))
-					os.Exit(1)
+					exitProcess(1)
 				}
 				logf("Filtered to %d node(s) matching --container-id %v", len(nodes), []int(containerIDs))
 			}
@@ -6655,21 +8067,22 @@ func main() {
 	selfPath, err := os.Executable()
 	if err != nil {
 		errorf("Could not determine executable path: %v", err)
-		os.Exit(1)
+		exitProcess(1)
 	}
 	// ── signal handler: clean up remote processes on interrupt ───────────
 	// If the user hits Ctrl+C (or SIGTERM arrives), SSH to every host that is
 	// currently being collected and kill the remote weka-log-collector process
 	// and its binary. We wait for all kills to complete before exiting so we
 	// don't leave orphaned processes consuming CPU/disk on production nodes.
+	stopEarlySignalHandler()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	clusterSignalHandler.Store(true)
 	go func() {
 		<-sigCh
 		logf("\nInterrupted — killing remote processes and cleaning up...")
 		remoteBin := remoteBinPath()
-		killCmd := fmt.Sprintf("pkill -f '%s' 2>/dev/null; rm -f %s; true",
-			filepath.Base(remoteBin), remoteBin)
+		killCmd := remoteKillCommand(remoteBin)
 		var cleanupWg sync.WaitGroup
 		activeRemoteHosts.Range(func(k, _ interface{}) bool {
 			host := k.(string)
@@ -6682,6 +8095,7 @@ func main() {
 			return true
 		})
 		cleanupWg.Wait()
+		runExitCleanups()
 		releaseRunLock()
 		logf("Cleanup complete.")
 		os.Exit(1)
@@ -6769,7 +8183,7 @@ func main() {
 		// Fail fast if Weka Home is unreachable from the orchestrator.
 		if _, err := checkCloudEnabled(); err != nil {
 			errorf("Cannot upload: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 
 		// Single session ID shared by all nodes so Weka Home groups their
@@ -6854,9 +8268,15 @@ func main() {
 		elapsed := time.Since(collectionStart).Round(time.Second)
 		logf("\nCluster upload complete  —  Duration: %s", elapsed)
 		logf("  Nodes:    %d total, %d uploaded, %d failed", len(allResults), succeeded, failed)
+		if traceSkipReason != "" {
+			logf("  Traces:   skipped: %s", traceSkipReason)
+		}
 		if len(failedDisplays) > 0 {
 			logf("  Failed:   %s", strings.Join(failedDisplays, ", "))
 			logf("  Tip: check SSH access and 'weka cloud status' on failed nodes.")
+		}
+		if succeeded == 0 {
+			exitCode = 1
 		}
 		return
 	}
@@ -6865,7 +8285,9 @@ func main() {
 	phase("Collecting from cluster hosts")
 	results := collectCluster(clusterHosts, nodeDisplayMap, selfPath, *profileStr, from, to, *cmdTimeout, 10, containerNames)
 	phase("Writing archive")
-	writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, *statsTimeout, *noStats, collectionStart, extraCmds, *compression)
+	if writeMergedArchive(outPath, toStdout, results, *profileStr, from, to, *cmdTimeout, *statsTimeout, *noStats, collectionStart, extraCmds, *compression) == 0 {
+		exitCode = 1
+	}
 }
 
 // collectCluster deploys the binary to all hosts first, then fans out collection
@@ -6874,10 +8296,11 @@ func main() {
 func collectCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string) []HostResult {
 	// ── phase 1: deploy binary to all hosts ───────────────────────────────
 	phase("Deploying binary to cluster hosts")
-	deployed := deployAll(hosts, displayNames, selfPath)
+	deployed, deployFailed := deployAll(hosts, displayNames, selfPath)
+	failures := deployFailureResults(hosts, deployFailed)
 	if len(deployed) == 0 {
 		errorf("Deploy failed on all hosts — nothing to collect.")
-		return nil
+		return failures
 	}
 	if len(deployed) < len(hosts) {
 		logf("  Deploy: %d/%d succeeded — collecting from reachable nodes only", len(deployed), len(hosts))
@@ -6917,13 +8340,15 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, pr
 		}()
 	}
 	wg.Wait()
-	return results
+	return append(results, failures...)
 }
 
 // uploadFromHost runs collection + upload on a remote host (binary already deployed
 // by deployAll). The remote node collects its own logs, uploads to Weka Home via its
 // local uploader, and cleans up the local archive. The caller handles start/completion logs.
-func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64, compression string) error {
+// It returns the node's own "Traces:" summary line (empty when traces were
+// not collected), since in --upload mode no merged summary is written.
+func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64, compression string) (string, error) {
 	if displayName == "" {
 		displayName = host
 	}
@@ -6934,49 +8359,7 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	activeRemoteHosts.Store(host, remoteBin)
 	defer activeRemoteHosts.Delete(host)
 
-	// Build remote command: --local --node-only --upload [flags]
-	// --node-only: skip cluster-wide commands (run once by orchestrator locally).
-	// timeout kills the process if it exceeds the SSH timeout, preventing orphans.
-	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile,
-		"--upload-session-id", strconv.FormatInt(sessionID, 10)}
-	if !from.IsZero() {
-		args = append(args, "--start-time", from.Format("2006-01-02T15:04"))
-	}
-	if !to.IsZero() {
-		args = append(args, "--end-time", to.Format("2006-01-02T15:04"))
-	}
-	if verbose {
-		args = append(args, "--verbose")
-	}
-	if noShellHistory {
-		args = append(args, "--no-shell-history")
-	}
-	if len(containerNames) > 0 {
-		args = append(args, "--container-name", strings.Join(containerNames, ","))
-	}
-	if compression != "" && compression != "gzip" {
-		args = append(args, "--compression", compression)
-	}
-	if collectTraces && resolvedTraceExtractorPath != "" {
-		args = append(args, "--collect-traces")
-		args = append(args, "--trace-extractor-path", remoteTraceExtractorPath)
-		for _, f := range traceFilters {
-			args = append(args, "--trace-filter", f)
-		}
-	}
-	collectionCmd := shellJoin(args)
-	timeoutSecs := int(sshTimeout.Seconds())
-	chmodSetup := maybeRemoteSudo("chmod +x " + remoteBin)
-	if collectTraces && resolvedTraceExtractorPath != "" {
-		chmodSetup += "; " + maybeRemoteSudo("chmod +x "+remoteTraceExtractorPath)
-	}
-	remoteShellCmd := fmt.Sprintf(
-		"%s; trap '%s' EXIT; timeout %d %s",
-		chmodSetup,
-		maybeRemoteSudo("rm -f "+remoteBin),
-		timeoutSecs,
-		maybeRemoteSudo(collectionCmd),
-	)
+	sshTimeout, remoteShellCmd := uploadRemoteCommand(host, remoteBin, profile, from, to, containerNames, sessionID, compression, sshTimeout)
 
 	var stderrBuf bytes.Buffer
 	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
@@ -6986,20 +8369,36 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 			exitCode := exitErr.ExitCode()
 			errMsg := strings.TrimSpace(stderrBuf.String())
 			if exitCode == 124 {
-				return fmt.Errorf("timed out after %s — collection/upload took too long", sshTimeout)
+				return "", fmt.Errorf("timed out after %s — collection/upload took too long", sshTimeout)
 			}
 			if exitCode == 137 {
-				return fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", errMsg)
+				vlogf("[%s] remote output:\n%s", host, errMsg)
+				return "", fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", remoteErrorSummary(errMsg))
 			}
-			return fmt.Errorf("SSH command failed (exit %d): %s", exitCode, errMsg)
+			// The full node output goes to the debug log (and --verbose); the
+			// returned error keeps only the cause.
+			vlogf("[%s] remote output:\n%s", host, errMsg)
+			return "", remoteFailure(exitCode, errMsg)
 		}
-		return fmt.Errorf("SSH error: %v", err)
+		return "", fmt.Errorf("SSH error: %v", err)
 	}
 	// Clean up remote logs/ and bundles/ after successful upload.
 	// Debug logs are already inside the uploaded bundle; no need to keep them on disk.
 	cleanupCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz", wlcBaseDir, wlcBaseDir, wlcBaseDir)
 	exec.Command("ssh", append(sshArgs(), sshTarget, cleanupCmd)...).Run() //nolint:errcheck
-	return nil
+	return remoteTraceLine(stderrBuf.String()), nil
+}
+
+// remoteTraceLine returns the status part of a node's end-of-run
+// "  Traces:   <status>" line from its stderr, or "".
+func remoteTraceLine(stderr string) string {
+	line := ""
+	for _, l := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(l, "  Traces:") {
+			line = strings.TrimSpace(strings.TrimPrefix(l, "  Traces:"))
+		}
+	}
+	return line
 }
 
 // uploadCluster deploys the binary to all remote hosts first, then fans out
@@ -7007,10 +8406,11 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 func uploadCluster(hosts []string, displayNames map[string]string, selfPath, profile string, from, to time.Time, cmdTimeout time.Duration, workers int, containerNames []string, sessionID int64, compression string) []HostResult {
 	// ── phase 1: deploy binary to all remote hosts ────────────────────────
 	phase("Deploying binary to remote hosts")
-	deployed := deployAll(hosts, displayNames, selfPath)
+	deployed, deployFailed := deployAll(hosts, displayNames, selfPath)
+	failures := deployFailureResults(hosts, deployFailed)
 	if len(deployed) == 0 {
 		errorf("Deploy failed on all remote hosts — nothing to upload.")
-		return nil
+		return failures
 	}
 	if len(deployed) < len(hosts) {
 		logf("  Deploy: %d/%d succeeded — uploading from reachable nodes only", len(deployed), len(hosts))
@@ -7036,7 +8436,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			logf("  [%s] collecting and uploading...", display)
-			err := uploadFromHost(host, display, selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID, compression)
+			traceLine, err := uploadFromHost(host, display, selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID, compression)
 			mu.Lock()
 			done++
 			n := done
@@ -7047,10 +8447,17 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 			} else {
 				logf("  [%s] upload complete  [%d/%d]", display, n, total)
 			}
+			if traceLine != "" && (collectTraces || traceSkipReason == "") {
+				if strings.HasPrefix(traceLine, "ok") && !strings.Contains(traceLine, "unparsed") {
+					logf("  [%s] traces: %s", display, traceLine)
+				} else {
+					warnf("  [%s] traces: %s", display, traceLine)
+				}
+			}
 		}()
 	}
 	wg.Wait()
-	return results
+	return append(results, failures...)
 }
 
 // writeArchive performs a local collection and writes to outPath (or stdout).
@@ -7077,7 +8484,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 		if err != nil {
 			errorf("Cannot create output file %s: %v", outPath, err)
 			errorf("Tip: check write permissions or use --output /data/weka-logs.tar.gz")
-			os.Exit(1)
+			exitProcess(1)
 		}
 		defer f.Close()
 		outWriter = f
@@ -7101,7 +8508,9 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 			pathHostname = string(globalAnonymizer.Apply([]byte(hostname)))
 		}
 		phase(fmt.Sprintf("[%s] Collecting traces", hostname))
-		runTraceExtractor(tw, archiveRoot, pathHostname, from, to)
+		manifest.Traces = runTraceExtractor(tw, archiveRoot, pathHostname, from, to)
+	} else if traceSkipReason != "" {
+		manifest.Traces = &TraceResult{Status: "skipped", Reason: traceSkipReason}
 	}
 
 	// When acting as orchestrator (not a --node-only sub-invocation), also run
@@ -7149,6 +8558,9 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 	logf("  Commands: %d total, %d failed", manifest.TotalCommands+clusterTotal, manifest.FailedCommands+clusterFailed)
 	logf("  Files:    %d collected, %d failed",
 		manifest.CollectedFiles, manifest.FailedFiles)
+	if manifest.Traces != nil {
+		logf("  Traces:   %s", traceResultLine(manifest.Traces))
+	}
 	if !toStdout {
 		if info, err := os.Stat(outPath); err == nil {
 			logf("  Size:     %d KB", info.Size()/1024)
@@ -7239,7 +8651,9 @@ func addClusterWideCmdsToArchive(tw *tar.Writer, archiveRoot, profile string, fr
 }
 
 // writeMergedArchive merges results from all cluster hosts into a single archive.
-func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout, statsTimeout time.Duration, noStats bool, collectionStart time.Time, extraCmds []CommandSpec, compression string) {
+//
+// It returns the number of hosts whose data made it into the bundle.
+func writeMergedArchive(outPath string, toStdout bool, results []HostResult, profile string, from, to time.Time, cmdTimeout, statsTimeout time.Duration, noStats bool, collectionStart time.Time, extraCmds []CommandSpec, compression string) int {
 	clusterName := getClusterName()
 	if globalAnonymizer.enabled {
 		clusterName = "weka-cluster"
@@ -7262,7 +8676,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		if err != nil {
 			errorf("Cannot create output file %s: %v", outPath, err)
 			errorf("Tip: check write permissions or use --output /data/weka-logs.tar.gz")
-			os.Exit(1)
+			exitProcess(1)
 		}
 		defer f.Close()
 		outWriter = f
@@ -7295,16 +8709,27 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		}
 	}
 
+	type hostFailure struct {
+		Host   string `json:"host"`
+		Reason string `json:"reason"`
+	}
 	var succeeded, failed int
 	var failedHosts []string
+	var failedReasons []hostFailure
+	traces := map[string]*TraceResult{}
+	var traceProblems []string
 
 	for _, r := range results {
 		if r.Err != nil {
 			failed++
 			failedHosts = append(failedHosts, r.Host)
+			failedReasons = append(failedReasons, hostFailure{r.Host, r.Err.Error()})
 			errorf("[%s] FAILED: %v", r.Host, r.Err)
 			// Write a placeholder error file so the host is visible in the archive
 			errContent := []byte(fmt.Sprintf("Collection failed for host %s\nError: %v\n", r.Host, r.Err))
+			if r.Stderr != "" {
+				errContent = append(errContent, []byte("\nRemote output:\n"+r.Stderr+"\n")...)
+			}
 			_ = addBytesToArchive(tw,
 				filepath.Join(archiveRoot, "hosts", r.Host, "COLLECTION_FAILED.txt"),
 				errContent)
@@ -7316,6 +8741,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			errorf("[%s] failed to open temp archive %s: %v", r.Host, r.TempFile, openErr)
 			failed++
 			failedHosts = append(failedHosts, r.Host)
+			failedReasons = append(failedReasons, hostFailure{r.Host, "open host archive: " + openErr.Error()})
 			os.Remove(r.TempFile)
 			continue
 		}
@@ -7324,13 +8750,14 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 			logf("  [%s] anonymizing and merging (%d KB)...", r.Host, stat.Size()/1024)
 		}
 		mergeStart := time.Now()
-		mergeErr := mergeArchive(tw, f, archiveRoot)
+		hostManifest, mergeErr := mergeArchive(tw, f, archiveRoot)
 		f.Close()
 		os.Remove(r.TempFile)
 		if mergeErr != nil {
 			errorf("[%s] failed to merge archive: %v", r.Host, mergeErr)
 			failed++
 			failedHosts = append(failedHosts, r.Host)
+			failedReasons = append(failedReasons, hostFailure{r.Host, "merge host archive: " + mergeErr.Error()})
 			continue
 		}
 		succeeded++
@@ -7339,18 +8766,45 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		} else {
 			logf("  [%s] merged OK (%d KB)", r.Host, stat.Size()/1024)
 		}
+		if tr := hostTraceResult(r.Host, hostManifest); tr != nil {
+			// Key by the host's directory name in the bundle (hosts/<name>/),
+			// which --anonymize maps to a unique placeholder; masked IPs
+			// (x.x.x.5) can collide.
+			key := r.Host
+			if hostManifest != nil && isSafePathComponent(hostManifest.Hostname) {
+				key = hostManifest.Hostname
+			}
+			if globalAnonymizer.enabled {
+				key = string(globalAnonymizer.Apply([]byte(key)))
+			}
+			for base, n := key, 2; traces[key] != nil; n++ {
+				key = fmt.Sprintf("%s#%d", base, n)
+			}
+			traces[key] = tr
+			if tr.Status == "skipped" && tr.Reason == traceSkipReason {
+				// Run-level skip: reported once at the end, not per host.
+			} else if tr.Status != "ok" || tr.UnparsedFiles > 0 {
+				warnf("  [%s] traces: %s", r.Host, traceResultLine(tr))
+				traceProblems = append(traceProblems, key)
+			} else {
+				logf("  [%s] traces: %s", r.Host, traceResultLine(tr))
+			}
+		}
 	}
 
 	// Write cluster-level summary
 	type clusterSummary struct {
-		CollectedAt time.Time `json:"collected_at"`
-		Profile     string    `json:"profile"`
-		From        string    `json:"from,omitempty"`
-		To          string    `json:"to,omitempty"`
-		TotalHosts  int       `json:"total_hosts"`
-		Succeeded   int       `json:"succeeded"`
-		Failed      int       `json:"failed"`
-		FailedHosts []string  `json:"failed_hosts,omitempty"`
+		CollectedAt time.Time               `json:"collected_at"`
+		Profile     string                  `json:"profile"`
+		From        string                  `json:"from,omitempty"`
+		To          string                  `json:"to,omitempty"`
+		TotalHosts  int                     `json:"total_hosts"`
+		Succeeded   int                     `json:"succeeded"`
+		Failed      int                     `json:"failed"`
+		FailedHosts []string                `json:"failed_hosts,omitempty"`
+		FailReasons []hostFailure           `json:"failed_reasons,omitempty"`
+		Traces      map[string]*TraceResult `json:"traces,omitempty"`
+		TraceSkip   string                  `json:"traces_skipped,omitempty"`
 	}
 	summary := clusterSummary{
 		CollectedAt: time.Now(),
@@ -7360,6 +8814,11 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		Failed:      failed,
 		FailedHosts: failedHosts,
 	}
+	if len(traces) > 0 {
+		summary.Traces = traces
+	}
+	summary.FailReasons = failedReasons
+	summary.TraceSkip = traceSkipReason
 	if !from.IsZero() {
 		summary.From = from.Format(time.RFC3339)
 	}
@@ -7383,12 +8842,40 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		logf("  Failed:   %s", strings.Join(failedHosts, ", "))
 		logf("  Tip: check SSH access and ensure weka-log-collector binary is at the expected path on failed hosts.")
 	}
+	if len(traces) > 0 && traceSkipReason == "" {
+		logf("  Traces:   %d host(s) reported, %d with problems", len(traces), len(traceProblems))
+		if len(traceProblems) > 0 {
+			logf("            check: %s (details in cluster_summary.json and hosts/<host>/traces/extractor.log)", strings.Join(traceProblems, ", "))
+		}
+	}
+	if traceSkipReason != "" {
+		logf("  Traces:   skipped: %s", traceSkipReason)
+	}
 	if !toStdout {
 		if info, err := os.Stat(outPath); err == nil {
 			logf("  Size:     %d KB", info.Size()/1024)
 		}
 	}
 	logf("  Duration: %s", elapsed)
+	if succeeded == 0 {
+		errorf("No host data was collected (%d host(s) failed). The bundle holds only cluster-wide output and the failure list.", failed)
+	}
+	return succeeded
+}
+
+// hostTraceResult returns the trace outcome for one merged host: from its
+// manifest, or "skipped" when trace_extractor could not be copied there.
+func hostTraceResult(host string, m *HostManifest) *TraceResult {
+	if m != nil && m.Traces != nil {
+		return m.Traces
+	}
+	if v, failed := traceDeployFailed.Load(host); failed {
+		return &TraceResult{Status: "skipped", Reason: "trace_extractor deploy failed: " + v.(string)}
+	}
+	if collectTraces && resolvedTraceExtractorPath != "" {
+		return &TraceResult{Status: "failed", Reason: "host archive has no trace result (older wlc on the node?)"}
+	}
+	return nil
 }
 
 func sanitizeHostname(h string) string {
@@ -7406,8 +8893,9 @@ USAGE
   weka-log-collector k8s [options]      Weka-on-Kubernetes (run --help after k8s for flags)
 
 TIME
-  --start-time TIME  Relative: -2h, -30m, -1d  |  Absolute: 2026-03-04T10:30[:00]
-  --end-time   TIME  Default: now
+  --start-time TIME  Relative: -2h, -30m, -1d  |  Absolute local: 2026-03-04T10:30[:00]
+                     |  With zone: 2026-03-04T10:30:00Z, 2026-03-04T12:30:00+02:00
+  --end-time   TIME  Default: now (in cluster mode fixed once at start, for all hosts)
   Default window: last 8h. Pass --start-time -24h, -7d, etc. for longer windows.
 
 PROFILES  (--profile NAME)
@@ -7445,8 +8933,13 @@ TRACES  (requires WEKA v5.x+ on each node; window is capped at 1 hour)
                                e.g. --trace-filter "container=drives0 and slot=7"
                                Default when omitted: collect all traces (--all).
   --trace-extractor-path PATH  Override the trace_extractor binary path.
-                               Default: auto-discovered alongside the wlc binary, in PATH,
-                               or at /opt/weka/weka-log-collector/trace_extractor.
+                               Default: alongside the wlc binary (trace_extractor-amd64, or
+                               -arm64 on aarch64, then trace_extractor), then PATH, then
+                               /opt/weka/weka-log-collector/trace_extractor.
+  --trace-timeout DURATION     Maximum trace_extractor run time per node (default: 15m).
+                               The outcome per node (status, shard count, skipped files)
+                               is in collection_manifest.json, cluster_summary.json and
+                               hosts/<host>/traces/extractor.log.
 
 BUNDLE MANAGEMENT
   --list-bundles       List bundles in /opt/weka/weka-log-collector/bundles
