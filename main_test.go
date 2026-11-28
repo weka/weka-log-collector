@@ -1065,17 +1065,53 @@ func TestRedactSensitive_PrefilterEquivalence(t *testing.T) {
 		"to\u212aen: " + fakePW,
 		"pa\u017f\u017fword=" + fakePW,
 		"API_\u212aEY=" + fakePW,
+		"Credentials\t: " + fakePW,
+		"db PASSS: " + fakePW,
+		"tokens =" + fakePW,
+		"API-KEYS=" + fakePW,
+		"x_PWDS=" + fakePW,
+		"to\u212aens: " + fakePW,
+		"PASSPHRASE: " + fakePW,
+		"Secret-Key: " + fakePW,
+		"export S3_SECRET_KEYS=" + fakePW,
+		"weka cluster license payg plan-1 " + fakePW,
+		"weka s3 bucket migrate attach b1 https://h:9000 AK " + fakePW + " ca.pem",
+		"weka local resources join-secret --purge " + fakePW,
+		"x --admin-password \"" + fakePW + "\" --y",
+		"Proxy-Authorization: Basic " + fakePW,
 		"plain line without anything",
 	}, "\n")
-	for _, in := range [][]byte{src, []byte(strings.ToUpper(string(src))), []byte(extra)} {
+	// Content starting with { or [ takes the JSON branches of both
+	// functions: a valid document, one cut short, prefixed pod logs, dmesg.
+	jsonInputs := []string{
+		"{\n  \"join_secret\": [\n    \"" + fakePW + "\"\n  ],\n  \"api-key\": \"" + fakePW + "\",\n  \"note\": \"password: x\"\n}\n",
+		"{\n  \"name\": \"c1\",\n  \"auth.token\": \"" + fakePW + "\",\n  \"tokens\": [\n    \"" + fakePW,
+		"[pod/op/m] {\"msg\":\"x\",\"auth-token\":\"" + fakePW + "\"}\n[pod/op/m] password: " + fakePW + "\n",
+		"[    1.000000] secret_key: " + fakePW + "\n[    1.000001] ok\n",
+		"{\n  \"join-secret\": [\n    \"" + fakePW + "\"\n  ],\n  \"db.passwords\": [\n    \"" + fakePW,
+		"{\"msg\": \"{\\\"x\\\": 1}\", \"db_pwd\": \"" + fakePW + "\", \"credential\": \"" + fakePW + "\"}\n",
+		"{\n  \"toKens\": [\n    \"" + fakePW + "\"\n  ]\n}\n",
+		"{\"other\": \"ok\", \"password\": \"abc\\\"def" + fakePW,
+	}
+	inputs := [][]byte{src, []byte(strings.ToUpper(string(src))), []byte(extra)}
+	for _, s := range jsonInputs {
+		inputs = append(inputs, []byte(s))
+	}
+	for _, in := range inputs {
 		fast, ref := redactSensitive(in), refRedactAll(in)
 		if !bytes.Equal(fast, ref) {
 			fl, rl := bytes.Split(fast, []byte("\n")), bytes.Split(ref, []byte("\n"))
+			t.Errorf("fast path differs from reference (%d vs %d lines) for input starting %q", len(fl), len(rl), bytes.SplitN(in, []byte("\n"), 2)[0])
 			for i := range fl {
 				if i < len(rl) && !bytes.Equal(fl[i], rl[i]) {
 					t.Errorf("line %d differs:\nfast: %q\nref:  %q", i, fl[i], rl[i])
 				}
 			}
+		}
+	}
+	for _, s := range jsonInputs {
+		if got := string(redactSensitive([]byte(s))); strings.Contains(got, fakePW) {
+			t.Errorf("secret survived in JSON-shaped input:\n%s", got)
 		}
 	}
 	got := string(redactSensitive([]byte(extra)))
@@ -1263,10 +1299,20 @@ func TestRedactSensitive_PrefixedPodLogsGetKeyPass(t *testing.T) {
 // redacts a multi-line array such as join_secret.
 func TestRedactSensitive_InvalidJSONGetsArrayPass(t *testing.T) {
 	doc := "{\n  \"name\": \"c1\",\n  \"join_secret\": [\n    \"" + fakePW + "\"\n  ],\n  \"other\": \"ok\""
+	cutIn := "{\n  \"other\": \"ok\",\n  \"join_secret\": [\n    \""
 	for name, in := range map[string]string{
-		"truncated":       doc + ",\n  \"more\": [\n    \"x",
-		"trailer":         doc + "\n}\nerror: command timed out\n",
-		"array top level": "[\n {\"join_secret\": [\n   \"" + fakePW + "\"\n ]},\n {\"a\": ",
+		"truncated":          doc + ",\n  \"more\": [\n    \"x",
+		"trailer":            doc + "\n}\nerror: command timed out\n",
+		"array top level":    "[\n {\"other\": \"ok\", \"join_secret\": [\n   \"" + fakePW + "\"\n ]},\n {\"a\": ",
+		"cut inside array":   cutIn + fakePW + "\"\n",
+		"cut inside value":   cutIn + fakePW,
+		"bracket in value":   cutIn + "x]" + fakePW,
+		"cut on one line":    `{"other": "ok", "join_secret": ["` + fakePW + `"`,
+		"cut after an entry": cutIn + "a\", \"" + fakePW,
+		"escaped quote":      cutIn + "a\\\"]\", \"" + fakePW,
+		"cut scalar":         "{\"other\": \"ok\", \"password\": \"" + fakePW,
+		"cut scalar lines":   "{\n  \"other\": \"ok\",\n  \"join_secret\": \"" + fakePW,
+		"cut after escape":   "{\"other\": \"ok\", \"password\": \"abc\\\"def" + fakePW,
 	} {
 		if isJSONDocument([]byte(in)) {
 			t.Fatalf("%s: test input parses as JSON", name)
@@ -1275,8 +1321,258 @@ func TestRedactSensitive_InvalidJSONGetsArrayPass(t *testing.T) {
 		if strings.Contains(got, fakePW) {
 			t.Errorf("%s: join_secret array not redacted:\n%s", name, got)
 		}
-		if !strings.Contains(got, `"other": "ok"`) && name != "array top level" {
+		if !strings.Contains(got, `"other": "ok"`) {
 			t.Errorf("%s: unrelated key changed:\n%s", name, got)
+		}
+	}
+	// Valid JSON never ends inside an array or string, so the end-of-content
+	// passes leave it alone, also with escaped quotes and backslashes.
+	for _, in := range []string{
+		`{"tokens": ["a", "b"], "x": 1}`,
+		"{\"join_secret\": [\n  \"[REDACTED]\"\n]}\n",
+		`{"tokens": [["a"],["b"]]}`,
+		`{"tokens": ["a\"b"], "x": 1}`,
+		`{"tokens": ["a\\"], "password": "c\\", "x": "y"}`,
+		`{"password": "a\"b", "x": 1}`,
+	} {
+		if jsonUnclosedArrayRe.MatchString(in) || jsonUnclosedValueRe.MatchString(in) {
+			t.Errorf("end-of-content pattern matched valid JSON %q", in)
+		}
+		if got := string(redactSensitive([]byte(in))); !strings.HasSuffix(strings.TrimSpace(got), "}") {
+			t.Errorf("valid JSON lost its end: %q -> %q", in, got)
+		}
+	}
+	// An escaped quote inside a credential value no longer ends it.
+	if got := string(redactSensitive([]byte(`{"password": "abc\"` + fakePW + `", "x": 1}`))); strings.Contains(got, fakePW) || !strings.Contains(got, `"x": 1`) {
+		t.Errorf("escaped quote in value: %q", got)
+	}
+	if got := string(redactSensitive([]byte(`{"tokens": ["a\"` + fakePW + `"], "x": 1}`))); strings.Contains(got, fakePW) || !strings.Contains(got, `"x": 1`) {
+		t.Errorf("escaped quote in array: %q", got)
+	}
+}
+
+// Credential forms that other patterns already covered for the same name:
+// positional join secrets on the weka CLI, quoted flag values, secret_key,
+// passphrase, other Authorization schemes and hyphenated or dotted JSON keys.
+func TestRedactSensitive_SiblingForms(t *testing.T) {
+	for _, in := range []string{
+		"weka cluster container join-secret 3 " + fakePW,
+		"weka local resources join-secret " + fakePW,
+		"weka local resources join-secret --purge " + fakePW,
+		"weka local resources join-secret -C drives0 " + fakePW,
+		"weka cluster container join-token 3 " + fakePW,
+		"weka local resources join-token " + fakePW,
+		"weka cluster license payg plan-1 " + fakePW,
+		"weka s3 bucket migrate attach b1 https://10.0.0.1:9000 AKEXAMPLE " + fakePW + " /root/ca.pem",
+		"weka cluster create h1 h2 --admin-password \"" + fakePW + "\" --join-secret 'x" + fakePW + "'",
+		"weka local setup container --join-secret \"" + fakePW + "\"",
+		"weka fs tier s3 add obs --secret-key \"" + fakePW + "\"; echo done",
+		"Access-Key: AKEXAMPLE\nSecret-Key: " + fakePW + "\nSession-Token: x",
+		"secret_key: " + fakePW,
+		"    secretKey: " + fakePW,
+		"secret_key = " + fakePW,
+		"export S3_SECRET_KEY=" + fakePW,
+		"obs_add(name='obs1', secret_key='" + fakePW + "')",
+		"passphrase: " + fakePW,
+		"  ssl_key_passphrase: " + fakePW,
+		"PASSPHRASES: " + fakePW,
+		"curl -sk -H 'Authorization: Basic " + fakePW + "' https://h:14000/api/v2/cluster",
+		"Proxy-Authorization: Basic " + fakePW,
+		"Authorization: Negotiate " + fakePW,
+		"Authorization: NTLM " + fakePW,
+		"Authorization: Bearer \"" + fakePW + "\"",
+		"Authorization: ApiKey " + fakePW,
+		"Authorization: SSWS " + fakePW,
+		"Authorization: AWS AKEXAMPLE:" + fakePW,
+		"weka cluster container join-secret -H 10.0.0.1 3 " + fakePW,
+		"weka cluster license payg -H backend1 plan-1 " + fakePW,
+		"weka s3 bucket migrate attach -H backend1 b1 https://h:9000 AK " + fakePW + " ca.pem",
+		"weka user login -H 10.0.0.1 admin " + fakePW,
+		`{"cmd": "weka local setup container --join-secret '` + fakePW + `'"}`,
+		`sh -c 'weka cluster create h1 h2 --admin-password "` + fakePW + `"'`,
+		`  command: ["sh", "-c", "weka local setup container --join-secret '` + fakePW + `'"]`,
+		`{"cmd": "weka cluster create h1 --admin-password \"` + fakePW + `\""}`,
+		`run --password "ab\" ` + fakePW + `"`,
+		`weka x --admin-pass="` + fakePW + `"`,
+		`weka x --db-pwd='` + fakePW + `'`,
+		`weka x --api-auth="` + fakePW + `", next`,
+		`{"join-secret": "` + fakePW + `"}`,
+		"headers={'Host': 'h', 'x-amz-security-token': '" + fakePW + "'}",
+		`{"X-Auth-Token": "` + fakePW + `"}`,
+		`msg="{\"client-secret\": \"` + fakePW + `\"}"`,
+		`{"spring.datasource.password": "` + fakePW + `"}`,
+		`[pod/a/b] kubectl.kubernetes.io/last-applied-configuration: {"data":{"access-token":"` + fakePW + `"}}`,
+		"{\"tokens-v2\": [\n  \"" + fakePW + "\"\n], \"x\": 1}\n",
+	} {
+		if got := string(redactSensitive([]byte(in))); strings.Contains(got, fakePW) {
+			t.Errorf("not redacted: %q", got)
+		}
+	}
+	for _, in := range []string{
+		`cmd="weka local setup container --join-secret ", next="foo"`,
+		`{"cmd": "weka local setup container --join-secret ", "x": "y"}`,
+		"weka local resources join-secret --help",
+		"weka cluster container join-secret",
+		"        secretKeyRef:",
+		"  - key: node-role.kubernetes.io/control-plane",
+		"partition_key: id",
+		"weka cluster container join-secret -H 10.0.0.1 --help",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("changed: %q -> %q", in, got)
+		}
+	}
+}
+
+// redactSensitiveValues runs the same value passes as redactLine, so the
+// table tests that use it see the quoted-flag pass too.
+func TestRedactSensitiveValues_MatchesLinePass(t *testing.T) {
+	for _, in := range []string{
+		"x --admin-password \"" + fakePW + "\" --y",
+		"x --join-secret='" + fakePW + "'",
+		"Authorization: Basic " + fakePW,
+	} {
+		vals := string(redactSensitiveValues([]byte(in)))
+		line := string(redactLine([]byte(in), nil, true, false))
+		if strings.Contains(vals, fakePW) || vals != line {
+			t.Errorf("redactSensitiveValues %q, redactLine %q", vals, line)
+		}
+	}
+}
+
+// hasQuotedCredentialKey gates the quoted-key patterns, so it must be true
+// wherever one of them matches.
+func TestHasQuotedCredentialKey_CoversPatterns(t *testing.T) {
+	src, err := os.ReadFile("main_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(src)+"\n"+strings.ToUpper(string(src)), "\n")
+	lines = append(lines,
+		"{\"a-b.password\"\n  :\n  [\"x\"]}",
+		"x 'Secret-Key' :\t'v'",
+		`{"API_KEY":"v"}`,
+		`"a"b-token": "v"`,
+	)
+	matched := 0
+	for _, l := range lines {
+		b := []byte(l)
+		if foldsToASCII(b) {
+			continue
+		}
+		lower := asciiLower(b)
+		if jsonSensitiveValueRe.Match(b) || jsonSensitiveArrayRe.Match(b) || jsonUnclosedArrayRe.Match(b) || jsonUnclosedValueRe.Match(b) {
+			matched++
+			if !hasQuotedCredentialKey(lower, '"') {
+				t.Errorf("gate false but a double-quoted pattern matches: %q", l)
+			}
+		}
+		if jsonSingleQuotedValueRe.Match(b) {
+			matched++
+			if !hasQuotedCredentialKey(lower, '\'') {
+				t.Errorf("gate false but the single-quoted pattern matches: %q", l)
+			}
+		}
+	}
+	if matched < 20 {
+		t.Errorf("only %d lines matched a pattern; the check is too weak", matched)
+	}
+}
+
+// A credential key with nothing after its colon (a YAML parent key) has no
+// value on that line: the line, trailing spaces and CR included, stays.
+func TestRedactSensitive_KeyWithoutValueUnchanged(t *testing.T) {
+	for _, in := range []string{
+		"apiVersion: v1\r\nkind: ServiceAccount\r\nsecrets:\r\n- name: default-token-abcde\r\n",
+		"secrets:   \n- name: x\n",
+		"credentials:\t\n  user: x\n",
+	} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("changed: %q -> %q", in, got)
+		}
+	}
+	if got := string(redactSensitive([]byte("password: " + fakePW + "\r\n"))); strings.Contains(got, fakePW) {
+		t.Errorf("value with CRLF not redacted: %q", got)
+	}
+}
+
+// Plural key names hold credentials as often as singular ones.
+func TestRedactSensitive_PluralKeys(t *testing.T) {
+	for _, in := range []string{
+		"credentials: " + fakePW,
+		"2026-11-28T10:00:01Z host app[1]: ldap passwords : " + fakePW,
+		"  API_KEYS:" + fakePW,
+		"secrets:\t" + fakePW,
+		"DB_PASSWORDS=" + fakePW,
+		"export VAULT_TOKENS=" + fakePW,
+		"aws_access_keys = " + fakePW,
+		"https://x/cb?client_secrets=" + fakePW + "&a=1",
+	} {
+		if got := string(redactSensitive([]byte(in))); strings.Contains(got, fakePW) {
+			t.Errorf("plural key not redacted: %q", got)
+		}
+	}
+	for _, in := range []string{"max_token_count=5", "spec_store_bypass_disable=on", "tokenizer: bpe"} {
+		if got := string(redactSensitive([]byte(in))); got != in {
+			t.Errorf("non-credential name changed: %q -> %q", in, got)
+		}
+	}
+}
+
+func TestRemoteRunTimeout(t *testing.T) {
+	oldCT, oldPath, oldTT := collectTraces, resolvedTraceExtractorPath, traceTimeout
+	defer func() { collectTraces, resolvedTraceExtractorPath, traceTimeout = oldCT, oldPath, oldTT }()
+	base := 10 * time.Minute
+
+	collectTraces, resolvedTraceExtractorPath = false, ""
+	if got := remoteRunTimeout(base, "h", false); got != base {
+		t.Errorf("no traces: got %s, want %s", got, base)
+	}
+
+	collectTraces, resolvedTraceExtractorPath = true, "/x/trace_extractor"
+	traceDeployFailed.Store("bad-host", "scp failed")
+	defer traceDeployFailed.Delete("bad-host")
+	if got := remoteRunTimeout(base, "bad-host", false); got != base {
+		t.Errorf("deploy failed: got %s, want %s", got, base)
+	}
+	for _, c := range []struct {
+		trace  time.Duration
+		upload bool
+		want   time.Duration
+	}{
+		{15 * time.Minute, false, base + 30*time.Minute},
+		{time.Second, false, base + time.Second + minTraceStreamAllowance},
+		{time.Hour, false, base + 2*time.Hour},
+		{15 * time.Minute, true, base + 15*time.Minute + traceUploadAllowance},
+	} {
+		traceTimeout = c.trace
+		if got := remoteRunTimeout(base, "h", c.upload); got != c.want {
+			t.Errorf("trace-timeout %s upload=%v: got %s, want %s", c.trace, c.upload, got, c.want)
+		}
+		// remoteRun, used by both remote paths, puts the same limit into
+		// the remote timeout(1) command.
+		limit, cmd := remoteRun("h", "/opt/x/wlc", "true", base, c.upload)
+		if want := fmt.Sprintf("timeout %d ", int(c.want.Seconds())); limit != c.want || !strings.Contains(cmd, want) {
+			t.Errorf("remoteRun upload=%v: limit %s, command %q, want %q", c.upload, limit, cmd, want)
+		}
+	}
+	// The two remote paths build their commands with the right limit.
+	traceTimeout = 15 * time.Minute
+	from, to := time.Unix(1764320400, 0), time.Unix(1764322200, 0)
+	limit, cmd := collectRemoteCommand("h", "/opt/x/wlc", "default", from, to, nil, base)
+	if want := base + 30*time.Minute; limit != want || !strings.Contains(cmd, fmt.Sprintf("timeout %d ", int(want.Seconds()))) || !strings.Contains(cmd, "'--output' '-'") {
+		t.Errorf("collectRemoteCommand: limit %s, command %q", limit, cmd)
+	}
+	limit, cmd = uploadRemoteCommand("h", "/opt/x/wlc", "default", from, to, nil, 7, "gzip", base)
+	if want := base + 15*time.Minute + traceUploadAllowance; limit != want || !strings.Contains(cmd, fmt.Sprintf("timeout %d ", int(want.Seconds()))) || !strings.Contains(cmd, "--upload") {
+		t.Errorf("uploadRemoteCommand: limit %s, command %q", limit, cmd)
+	}
+	// --trace-timeout is bounded, so the doubled limit cannot overflow.
+	for d, ok := range map[time.Duration]bool{
+		0: false, -time.Second: false, time.Second: true, maxTraceTimeout: true, maxTraceTimeout + time.Second: false,
+	} {
+		if err := validateTraceTimeout(d); (err == nil) != ok {
+			t.Errorf("validateTraceTimeout(%s): %v", d, err)
 		}
 	}
 }

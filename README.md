@@ -130,6 +130,10 @@ Flags:
                        cluster_summary.json and printed at the end of the run (with
                        --upload: one line per node as it finishes, no summary file); the
                        extractor's full output is in hosts/<host>/traces/extractor.log.
+                       In cluster mode without --upload each node's time limit grows by
+                       --trace-timeout, plus as long again (at least 10m) for streaming
+                       the traces back; a node still running at the limit is killed and
+                       reported as failed. Maximum 24h.
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
   --extra-commands     Run extra commands from /opt/weka/weka-log-collector/extra-commands

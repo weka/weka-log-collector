@@ -88,17 +88,20 @@ func stripANSI(b []byte) []byte { return ansiEscape.ReplaceAll(b, nil) }
 // Permissive on purpose: the bare "pass" alternative catches camelCase variants
 // (pcsPass, dbPass, ldapPass) and prefixed forms (pgpass, db_password). False
 // positives like "bypass:" or "compass:" are accepted — over-redacting a
-// non-secret is far less harmful than leaking a credential.
+// non-secret is far less harmful than leaking a credential. Plurals
+// (credentials:, passwords:, api_keys:) match too.
 var sensitiveKeyRe = regexp.MustCompile(
-	`(?i)(password|passwd|pwd|pass|token|secret|secret[-_]?id|api[-_]?key|auth|authtok|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\s*:`)
+	`(?i)(password|passwd|passphrase|pwd|pass|token|secret|secret[-_]?id|secret[-_]?key|api[-_]?key|auth|authtok|credential|private[-_]?key|access[-_]?key|signing[-_]?key)s?\s*:`)
 
 // jsonSensitiveValueRe matches a JSON `"key": "value"` pair where the key
 // contains a credential-like substring. Captures the prefix (key + colon +
 // opening quote) so the replacement preserves quotes and only the value text
 // is replaced with [REDACTED]. Operates on raw JSON bytes (no parse / re-marshal)
-// so Weka's grep-friendly JSON formatting is preserved exactly.
+// so Weka's grep-friendly JSON formatting is preserved exactly. The value
+// honours backslash escapes ("a\"b" is one string); a string that only ends at
+// an escaped quote is still taken as the fallback.
 var jsonSensitiveValueRe = regexp.MustCompile(
-	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)"[^"\n]*"`)
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)(?:"(?:[^"\\\n]|\\.)*"|"[^"\n]*")`)
 
 // jsonSingleQuotedValueRe and jsonEscapedValueRe are the same key/value pair
 // as jsonSensitiveValueRe, written as a Python-style dict ('password': 'x')
@@ -106,16 +109,32 @@ var jsonSensitiveValueRe = regexp.MustCompile(
 // Both appear inside ordinary text lines (journal, output.log).
 var (
 	jsonSingleQuotedValueRe = regexp.MustCompile(
-		`(?i)('\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*'[ \t]*:[ \t]*)'[^'\n]*'`)
+		`(?i)('[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*'[ \t]*:[ \t]*)'[^'\n]*'`)
 	jsonEscapedValueRe = regexp.MustCompile(
-		`(?i)(\\"\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*\\"[ \t]*:[ \t]*\\")(?:[^"\\\n]|\\[^"\n])*(\\")`)
+		`(?i)(\\"[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*\\"[ \t]*:[ \t]*\\")(?:[^"\\\n]|\\[^"\n])*(\\")`)
 )
 
 // jsonSensitiveArrayRe matches a JSON `"key": [...]` pair where the key contains
 // a credential-like substring and the value is a JSON array. Needed for fields
 // like join_secret that Weka stores as single-element string arrays.
 var jsonSensitiveArrayRe = regexp.MustCompile(
-	`(?i)("\w*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)\w*"\s*:\s*)\[(?:"[^"]*"|[^"\]])*\]`)
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)\[(?:"(?:[^"\\]|\\(?s:.))*"|"[^"]*"|[^"\]])*\]`)
+
+// jsonUnclosedArrayRe is the same pair when the content ends inside the array
+// (output cut short there), including a value string cut in the middle, and
+// jsonUnclosedValueRe a string value cut in the middle. Their strings honour
+// backslash escapes, so neither can match valid JSON, where every array and
+// string is closed. (The closed patterns also accept a string ended by an
+// escaped quote, a fallback for text that only looks like JSON.)
+var jsonUnclosedArrayRe = regexp.MustCompile(
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)\[(?:"(?:[^"\\]|\\(?s:.))*"|[^"\]])*(?:"(?:[^"\\]|\\(?s:.))*\\?)?\z`)
+var jsonUnclosedValueRe = regexp.MustCompile(
+	`(?i)("[\w.-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[\w.-]*"\s*:\s*)"(?:[^"\\\n]|\\.)*\\?\z`)
+
+// unclosedArrayTail is how much of the end of the content jsonUnclosedArrayRe
+// looks at: an array cut at the end starts well within it, and scanning only
+// the tail keeps large inputs fast.
+const unclosedArrayTail = 64 << 10
 
 // redactSensitiveYAML replaces the value of any YAML/text line whose key matches
 // sensitiveKeyRe with [REDACTED]. Only single-line scalar values are redacted;
@@ -132,8 +151,11 @@ func redactSensitiveYAML(b []byte) []byte {
 	return bytes.Join(lines, []byte("\n"))
 }
 
+// redactSensitiveYAMLLine leaves a key with nothing but whitespace after its
+// colon alone (a YAML parent key such as "secrets:" with trailing spaces or
+// a CRLF ending): there is no value on the line to redact.
 func redactSensitiveYAMLLine(line []byte) []byte {
-	if loc := sensitiveKeyRe.FindIndex(line); loc != nil && loc[1] < len(line) {
+	if loc := sensitiveKeyRe.FindIndex(line); loc != nil && len(bytes.TrimRight(line[loc[1]:], " \t\r\f\v")) > 0 {
 		return append(line[:loc[1]:loc[1]], []byte(" [REDACTED]")...)
 	}
 	return line
@@ -142,10 +164,26 @@ func redactSensitiveYAMLLine(line []byte) []byte {
 // redactSensitiveJSON replaces the value of any JSON key whose name contains a
 // credential-like substring with [REDACTED]. Handles both string scalar values
 // ("key": "val") and array values ("key": [...]) — the latter covers fields like
-// join_secret that Weka stores as single-element arrays.
+// join_secret that Weka stores as single-element arrays — and an array the
+// content ends inside.
 func redactSensitiveJSON(b []byte) []byte {
+	// The end-of-content passes run first: a closed-pattern match on a cut
+	// value (taking an escaped quote as the end) would hide the rest of it.
+	b = redactUnclosedTail(b, jsonUnclosedArrayRe, `["[REDACTED]"`)
+	b = redactUnclosedTail(b, jsonUnclosedValueRe, `"[REDACTED]`)
 	b = jsonSensitiveValueRe.ReplaceAll(b, []byte(`$1"[REDACTED]"`))
 	b = jsonSensitiveArrayRe.ReplaceAll(b, []byte(`$1["[REDACTED]"]`))
+	return b
+}
+
+// redactUnclosedTail replaces what follows group 1 of an end-anchored match
+// of re in the last unclosedArrayTail bytes of b with repl.
+func redactUnclosedTail(b []byte, re *regexp.Regexp, repl string) []byte {
+	tail := max(len(b)-unclosedArrayTail, 0)
+	if loc := re.FindSubmatchIndex(b[tail:]); loc != nil {
+		end := tail + loc[3]
+		b = append(b[:end:end], repl...)
+	}
 	return b
 }
 
@@ -154,9 +192,13 @@ func redactSensitiveJSON(b []byte) []byte {
 // cases that fall through (e.g. CLI args in ps aux, Authorization headers in
 // shelld.log, bare Weka SRT tokens).
 //
-//	[1] HTTP Authorization header: "Authorization: Bearer <token>" or "Authorization: Token <token>"
+//	[1] HTTP Authorization header (also Proxy-Authorization and Go's
+//	    map[Authorization:[...]] form) with the Bearer, Token, Basic,
+//	    Negotiate, NTLM, ApiKey, SSWS or AWS scheme
 //	[2] CLI flag whose name contains a credential substring (aligned with sensitiveKeyRe):
 //	    --token, --access-token, --refresh-token, --join-secret, --private-key, etc.
+//	    cliFlagRe takes a bare value, cliFlagQuotedRe a quoted one
+//	    (--admin-password 'x', --db-pwd="x", JSON-escaped \"x\").
 //	[3] Weka SRT token: a bare SRT… string of ≥20 chars (download/activation tokens)
 //	[4] KEY=value assignments whose name ends in a credential word (redactAssignments)
 //	[5] HashiCorp Vault tokens (hvs./hvb./hvr.)
@@ -168,15 +210,23 @@ func redactSensitiveJSON(b []byte) []byte {
 // Separators use [ \t] rather than \s so a match never crosses a line break.
 var (
 	authHeaderRe = regexp.MustCompile(
-		`(?i)(Authorization[ \t]*:[ \t]*(?:Bearer|Token)[ \t]+)[^\s"',;]+`)
+		`(?i)(Authorization[ \t]*[:=][ \t]*\[?[ \t]*(?:Bearer|Token|Basic|Negotiate|NTLM|ApiKey|SSWS|AWS)[ \t]+"?)[^\s"',;\]]+`)
 	cliFlagRe = regexp.MustCompile(
-		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|[ \t]+))[^\s"',;]+`)
+		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|[ \t]+))(?:\\[^"]|[^\s"',;\\])[^\s"',;]*`)
+	// The quoted value must end the argument (space, shell separator, comma,
+	// the other quote of an enclosing string, or end of line after the
+	// closing quote), so a flag at the end of a quoted string
+	// ("cmd --join-secret ", next) is not taken as one. Double-quoted values
+	// honour backslash escapes.
+	cliFlagQuotedRe = regexp.MustCompile(
+		`(?i)(--[a-z0-9_-]*(?:password|passwd|pwd|pass|token|secret|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key|signing[-_]?key)[a-z0-9_-]*(?:=|[ \t]+))(?:"(?:[^"\\\n]|\\.)+"|'[^'\n]+'|\\"(?:[^"\\\n]|\\[^"\n])*\\")([\s;|&)'",]|$)`)
 	srtTokenRe = regexp.MustCompile(
 		`\bSRT[A-Za-z0-9+/._=-]{20,}`)
 	// [4] NAME=value (shell env, ini, URL query) where NAME ends in a
 	//     credential word: VAULT_TOKEN=..., DB_PASS=..., password = ...,
-	//     ldap_default_authtok = ... The name must END in the word, so
-	//     max_token_count=5 or spec_store_bypass_disable=on are left alone.
+	//     ldap_default_authtok = ... The name must END in the word or its
+	//     plural (DB_PASSWORDS=, API_KEYS=), so max_token_count=5 or
+	//     spec_store_bypass_disable=on are left alone.
 	//     Spaces around "=" only in the ini form (name, space, "="), so an
 	//     empty env value (GITHUB_TOKEN= HOME=/root) never takes the next
 	//     word. Group 1 is the value: a backslash-escaped quoted string, a
@@ -184,7 +234,7 @@ var (
 	//     backslash and stops at structural delimiters. redactAssignments
 	//     drops matches that would cross a string boundary.
 	assignmentRe = regexp.MustCompile(
-		`(?i)[A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|secret[-_]?id|token|authtok|api[-_]?key|access[-_]?key|private[-_]?key|signing[-_]?key|credentials?|_pass|_pwd|pgpass)(?:=|[ \t]+=[ \t]*)` +
+		`(?i)[A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|secret[-_]?id|secret[-_]?key|token|authtok|api[-_]?key|access[-_]?key|private[-_]?key|signing[-_]?key|credential|_pass|_pwd|pgpass)s?(?:=|[ \t]+=[ \t]*)` +
 			`(\\"[^"\\\n]+\\"|"(?:[^"\\\n]|\\.)+"|'[^'\n]+'|` + bareValue + `)`)
 	// [5] HashiCorp Vault tokens (service, batch, recovery) by shape.
 	vaultTokenRe = regexp.MustCompile(
@@ -198,7 +248,7 @@ var (
 // --debug/--no-restart, then options that take a value) and one positional
 // (non-option) argument. Same-line only.
 const (
-	cliOpts       = `(?:[ \t]+(?:--(?:debug|force|json|no-restart|help|verbose|raw-units|utc|no-header|confirmation|without-agent)|-[hJRUfv])\b|[ \t]+--?[A-Za-z][\w-]*(?:=\S*|[ \t]+[^\s-]\S*))*`
+	cliOpts       = `(?:[ \t]+(?:--(?:debug|force|json|no-restart|help|verbose|raw-units|utc|no-header|confirmation|without-agent|purge)|(?-i:-[hJRUfv]))\b|[ \t]+--?[A-Za-z][\w-]*(?:=\S*|[ \t]+[^\s-]\S*))*`
 	cliPositional = `[ \t]+[^\s-]\S*`
 )
 
@@ -212,11 +262,12 @@ const bareValue = `(?:[^\s"',;&\\)}\]]|[)}\]]+[^\s"',;&\\)}\]])(?:[^\s"',;&)}\]]
 // value is known not to be a secret (WEKA's token-timeout event).
 var nonSecretAssignmentNames = map[string]bool{"max_mount_token": true}
 
-// cliPasswordPositions lists weka CLI commands that take a password as a
-// positional argument, with the 1-based position of the password among the
-// positionals (from the CLI definitions in 4.4 and 5.1). With the password
-// left out the CLI prompts for it, which is the safe use; these entries catch
-// the command lines (shell history, ps, logs) where it was typed inline.
+// cliPasswordPositions lists weka CLI commands that take a password, join
+// secret, join token or secret key as a positional argument, with the 1-based
+// position of that argument among the positionals (from the CLI definitions
+// in 4.4 and 5.1). With a password left out the CLI prompts for it, which is
+// the safe use; these entries catch the command lines (shell history, ps,
+// logs) where it was typed inline.
 var cliPasswordPositions = []struct {
 	path string
 	pos  int
@@ -232,6 +283,12 @@ var cliPasswordPositions = []struct {
 	{"smb domain leave", 2},
 	{"nfs ldap setup-ad-nokrb", 5},
 	{"nfs ldap setup-openldap", 4},
+	{"cluster container join-secret", 2},
+	{"cluster container join-token", 2},
+	{"local resources join-secret", 1},
+	{"local resources join-token", 1},
+	{"cluster license payg", 2},
+	{"s3 bucket migrate attach", 4},
 }
 
 // buildWekaCLIPasswordRe builds one regexp for all cliPasswordPositions:
@@ -322,6 +379,7 @@ func skipAssignmentValue(b []byte, nameStart, vs, ve int) bool {
 func redactSensitiveValues(b []byte) []byte {
 	b = authHeaderRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
 	b = cliFlagRe.ReplaceAll(b, []byte("${1}[REDACTED]"))
+	b = cliFlagQuotedRe.ReplaceAll(b, []byte("${1}[REDACTED]${2}"))
 	b = srtTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
 	b = redactAssignments(b)
 	b = vaultTokenRe.ReplaceAll(b, []byte("[REDACTED]"))
@@ -340,7 +398,7 @@ var credentialHints = [][]byte{
 // cliPasswordHints: a line can hold a positional weka CLI password only if it
 // has "weka" and one of these subcommand words.
 var cliPasswordHints = [][]byte{
-	[]byte("login"), []byte("passwd"), []byte("add"), []byte("create"), []byte("setup"), []byte("domain"),
+	[]byte("login"), []byte("passwd"), []byte("add"), []byte("create"), []byte("setup"), []byte("domain"), []byte("payg"), []byte("attach"),
 }
 
 // lineMayHoldSecret is the cheap prefilter for redactLine; lower is the line
@@ -363,17 +421,19 @@ func lineMayHoldSecret(lower []byte) bool {
 
 // keyWordsBeforeColon and keyWordsBeforeEquals are the lowercase words that
 // sensitiveKeyRe must see right before ":" and assignmentRe right before "="
-// (spaces/tabs allowed in between). wordBefore uses them as a fast exact
+// (spaces/tabs allowed in between), each also with a trailing "s" because
+// both regexes accept the plural. wordBefore uses them as a fast exact
 // prefilter, so the regexes only run on lines that can match.
 var (
-	keyWordsBeforeColon  = splitWords("password passwd pwd pass token secret secret_id secret-id secretid api_key api-key apikey auth authtok credential private_key private-key privatekey access_key access-key accesskey signing_key signing-key signingkey")
-	keyWordsBeforeEquals = splitWords("password passwd passphrase secret secret_id secret-id secretid token authtok api_key api-key apikey access_key access-key accesskey private_key private-key privatekey signing_key signing-key signingkey credential credentials _pass _pwd pgpass")
+	keyWordsBeforeColon  = splitWords("password passwd passphrase pwd pass token secret secret_id secret-id secretid secret_key secret-key secretkey api_key api-key apikey auth authtok credential private_key private-key privatekey access_key access-key accesskey signing_key signing-key signingkey")
+	keyWordsBeforeEquals = splitWords("password passwd passphrase secret secret_id secret-id secretid secret_key secret-key secretkey token authtok api_key api-key apikey access_key access-key accesskey private_key private-key privatekey signing_key signing-key signingkey credential _pass _pwd pgpass")
 )
 
+// splitWords returns the words of s, each also with a trailing "s".
 func splitWords(s string) [][]byte {
 	var out [][]byte
 	for _, w := range strings.Fields(s) {
-		out = append(out, []byte(w))
+		out = append(out, []byte(w), []byte(w+"s"))
 	}
 	return out
 }
@@ -398,6 +458,54 @@ func wordBefore(lower []byte, sep byte, words [][]byte) bool {
 		}
 		off += i + 1
 	}
+}
+
+// quotedKeyWords holds a lowercase literal from every credential word of the
+// quoted-key patterns ("key" covers api_key, private-key, access_key, ...).
+var quotedKeyWords = [][]byte{
+	[]byte("pass"), []byte("pwd"), []byte("token"), []byte("secret"), []byte("auth"), []byte("credential"), []byte("key"),
+}
+
+// hasQuotedCredentialKey is the exact prefilter for the quoted-key patterns:
+// jsonSensitiveValueRe, jsonUnclosedValueRe and the array patterns take the
+// double quote as quote, jsonSingleQuotedValueRe the single quote. lower
+// (ASCII-lowercased) must hold a key of [\w.-] bytes between two quote
+// characters that contains a credential word and is followed, after optional
+// whitespace, by a colon. Content with foldsToASCII letters must skip it.
+func hasQuotedCredentialKey(lower []byte, quote byte) bool {
+	off := 0
+	for {
+		i := bytes.IndexByte(lower[off:], ':')
+		if i < 0 {
+			return false
+		}
+		j := off + i
+		off = j + 1
+		for j > 0 && isRegexpSpace(lower[j-1]) {
+			j--
+		}
+		if j == 0 || lower[j-1] != quote {
+			continue
+		}
+		end := j - 1
+		s := end
+		for s > 0 && isKeyByte(lower[s-1]) {
+			s--
+		}
+		if s == 0 || lower[s-1] != quote {
+			continue
+		}
+		for _, w := range quotedKeyWords {
+			if bytes.Contains(lower[s:end], w) {
+				return true
+			}
+		}
+	}
+}
+
+// isKeyByte reports whether c is in [\w.-] (lowercase input).
+func isKeyByte(c byte) bool {
+	return 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '_' || c == '.' || c == '-'
 }
 
 // isRegexpSpace reports whether c is in RE2's \s class ([\t\n\f\r ]).
@@ -439,13 +547,13 @@ func redactLine(line, lower []byte, isJSONDoc, filtered bool) []byte {
 	if !isJSONDoc && (!filtered || wordBefore(lower, ':', keyWordsBeforeColon)) {
 		line = redactSensitiveYAMLLine(line)
 	}
-	if hasByte('"') && hasByte(':') {
+	if !filtered || hasQuotedCredentialKey(lower, '"') {
 		line = jsonSensitiveValueRe.ReplaceAll(line, []byte(`$1"[REDACTED]"`))
-		if has(`\"`) {
-			line = jsonEscapedValueRe.ReplaceAll(line, []byte(`${1}[REDACTED]${2}`))
-		}
 	}
-	if hasByte('\'') && hasByte(':') {
+	if has(`\"`) && hasByte(':') {
+		line = jsonEscapedValueRe.ReplaceAll(line, []byte(`${1}[REDACTED]${2}`))
+	}
+	if !filtered || hasQuotedCredentialKey(lower, '\'') {
 		line = jsonSingleQuotedValueRe.ReplaceAll(line, []byte(`$1'[REDACTED]'`))
 	}
 	if has("authorization") {
@@ -453,6 +561,7 @@ func redactLine(line, lower []byte, isJSONDoc, filtered bool) []byte {
 	}
 	if has("--") {
 		line = cliFlagRe.ReplaceAll(line, []byte("${1}[REDACTED]"))
+		line = cliFlagQuotedRe.ReplaceAll(line, []byte("${1}[REDACTED]${2}"))
 	}
 	if has("srt") {
 		line = srtTokenRe.ReplaceAll(line, []byte("[REDACTED]"))
@@ -487,17 +596,19 @@ func isJSONDocument(b []byte) bool {
 // redactSensitive redacts credentials in collected text. Content that starts
 // with { or [ after whitespace first gets the whole-document JSON pass, the
 // only pass that redacts multi-line arrays (join_secret); it runs whether or
-// not the content parses, so truncated JSON is covered too. Then every line
+// not the content parses, so JSON cut short (also inside such an array) or
+// followed by a trailer line is covered too. Then every line
 // that contains a credential hint gets redactLine (without the line-based key
 // pass for a valid JSON document); other lines are copied unchanged, which
 // keeps this fast on large logs. Safe to call on arbitrary command output —
 // content without sensitive keys is returned unchanged.
 func redactSensitive(b []byte) []byte {
 	isJSONDoc := isJSONDocument(b)
-	if looksLikeJSON(b) {
-		b = redactSensitiveJSON(b)
-	}
 	lower := asciiLower(b)
+	if looksLikeJSON(b) && (foldsToASCII(b) || hasQuotedCredentialKey(lower, '"')) {
+		b = redactSensitiveJSON(b)
+		lower = asciiLower(b)
+	}
 	out := make([]byte, 0, len(b)) // grows by append when a line gets longer
 	start := 0
 	for {
@@ -3746,6 +3857,77 @@ var (
 // not cut off an upload the node would still have waited for.
 const traceUploadAllowance = 75 * time.Minute
 
+// minTraceStreamAllowance is the least extra remote time in merged cluster
+// mode for what follows the trace step: --trace-timeout bounds only the
+// extractor run, and its archives (several GB on a busy backend) are then
+// added to the host stream and the bundle is finished.
+const minTraceStreamAllowance = 10 * time.Minute
+
+// maxTraceTimeout caps --trace-timeout, which is doubled in remoteRunTimeout.
+const maxTraceTimeout = 24 * time.Hour
+
+// remoteRunTimeout is the timeout(1) limit for a node's remote run: base for
+// the logs, plus, when the node collects traces, room for the trace step and
+// for what follows it. Merged mode streams the extractor's output back, given
+// as long again as the extractor had (at least minTraceStreamAllowance);
+// --upload uploads the larger bundle (traceUploadAllowance). This is room,
+// not a bound: streaming time depends on the archive size and the link, and
+// a node still over the limit is killed and its partial bundle discarded.
+func remoteRunTimeout(base time.Duration, host string, upload bool) time.Duration {
+	if !tracesEnabledForHost(host) {
+		return base
+	}
+	if upload {
+		return base + traceTimeout + traceUploadAllowance
+	}
+	return base + traceTimeout + max(traceTimeout, minTraceStreamAllowance)
+}
+
+// remoteRun returns the remote time limit for a node's run and the shell
+// command that runs collectionCmd under it (see remoteRunTimeout).
+func remoteRun(host, remoteBin, collectionCmd string, base time.Duration, upload bool) (time.Duration, string) {
+	limit := remoteRunTimeout(base, host, upload)
+	return limit, remoteShellCommand(host, remoteBin, collectionCmd, limit)
+}
+
+// collectRemoteCommand builds a merged-mode node run: the remote time limit
+// and the shell command. --node-only skips cluster-wide commands (run once
+// by the orchestrator); the bundle is streamed back on stdout. Traces run
+// after log collection under their own --trace-timeout, so the limit leaves
+// room for them and for streaming them back.
+func collectRemoteCommand(host, remoteBin, profile string, from, to time.Time, containerNames []string, base time.Duration) (time.Duration, string) {
+	collectionCmd := shellJoin(append([]string{
+		remoteBin,
+		"--local",
+		"--node-only",
+		"--profile", profile,
+		"--output", "-",
+	}, remoteNodeArgs(host, from, to, containerNames)...))
+	return remoteRun(host, remoteBin, collectionCmd, base, false)
+}
+
+// uploadRemoteCommand builds a node run with --upload: the node collects
+// and uploads its own bundle. The limit leaves room for the trace step and
+// for uploading its archive, which can be much larger than the logs.
+func uploadRemoteCommand(host, remoteBin, profile string, from, to time.Time, containerNames []string, sessionID int64, compression string, base time.Duration) (time.Duration, string) {
+	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile,
+		"--upload-session-id", strconv.FormatInt(sessionID, 10)}
+	if compression != "" && compression != "gzip" {
+		args = append(args, "--compression", compression)
+	}
+	args = append(args, remoteNodeArgs(host, from, to, containerNames)...)
+	return remoteRun(host, remoteBin, shellJoin(args), base, true)
+}
+
+// validateTraceTimeout checks --trace-timeout: positive and at most
+// maxTraceTimeout, so the remote limit cannot overflow.
+func validateTraceTimeout(d time.Duration) error {
+	if d <= 0 || d > maxTraceTimeout {
+		return fmt.Errorf("--trace-timeout must be positive and at most %s", maxTraceTimeout)
+	}
+	return nil
+}
+
 // traceWindowTolerance is the slack allowed on top of traceMaxWindow.
 const traceWindowTolerance = time.Minute
 
@@ -4624,19 +4806,7 @@ func collectFromHost(host, displayName, selfPath, profile string, from, to time.
 	// timeout kills the process if it exceeds the SSH timeout, preventing orphans
 	// when the orchestrator can no longer wait (e.g. after SSH connection drops).
 	// --node-only skips cluster-wide commands (run once by the orchestrator locally).
-	collectionCmd := shellJoin(append([]string{
-		remoteBin,
-		"--local",
-		"--node-only",
-		"--profile", profile,
-		"--output", "-",
-	}, remoteNodeArgs(host, from, to, containerNames)...))
-	if tracesEnabledForHost(host) {
-		// Traces run after log collection under their own --trace-timeout;
-		// the overall deadline must leave room for them.
-		sshTimeout += traceTimeout
-	}
-	remoteShellCmd := remoteShellCommand(host, remoteBin, collectionCmd, sshTimeout)
+	sshTimeout, remoteShellCmd := collectRemoteCommand(host, remoteBin, profile, from, to, containerNames, sshTimeout)
 
 	// ── run collection via SSH, streaming output to a temp file ──────────
 	// Streaming to disk (not RAM) prevents accumulating 200-400 MB per host
@@ -7528,8 +7698,8 @@ func main() {
 	}
 
 	// ── validate trace collection window and resolve binary ───────────────
-	if *traceTimeoutFlag <= 0 {
-		errorf("--trace-timeout must be positive")
+	if err := validateTraceTimeout(*traceTimeoutFlag); err != nil {
+		errorf("%v", err)
 		os.Exit(1)
 	}
 	traceTimeout = *traceTimeoutFlag
@@ -8189,22 +8359,7 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	activeRemoteHosts.Store(host, remoteBin)
 	defer activeRemoteHosts.Delete(host)
 
-	// Build remote command: --local --node-only --upload [flags]
-	// --node-only: skip cluster-wide commands (run once by orchestrator locally).
-	// timeout kills the process if it exceeds the SSH timeout, preventing orphans.
-	args := []string{remoteBin, "--local", "--node-only", "--upload", "--profile", profile,
-		"--upload-session-id", strconv.FormatInt(sessionID, 10)}
-	if compression != "" && compression != "gzip" {
-		args = append(args, "--compression", compression)
-	}
-	args = append(args, remoteNodeArgs(host, from, to, containerNames)...)
-	collectionCmd := shellJoin(args)
-	if tracesEnabledForHost(host) {
-		// Room for the trace step and for uploading its archive, which can
-		// be much larger than the logs.
-		sshTimeout += traceTimeout + traceUploadAllowance
-	}
-	remoteShellCmd := remoteShellCommand(host, remoteBin, collectionCmd, sshTimeout)
+	sshTimeout, remoteShellCmd := uploadRemoteCommand(host, remoteBin, profile, from, to, containerNames, sessionID, compression, sshTimeout)
 
 	var stderrBuf bytes.Buffer
 	sshCmd := exec.Command("ssh", append(sshArgs(), sshTarget, remoteShellCmd)...)
