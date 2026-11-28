@@ -1436,3 +1436,96 @@ func TestExitProcessRunsCleanups(t *testing.T) {
 		t.Errorf("cleanup did not run before exit: %s still exists", path)
 	}
 }
+
+func TestRemoteNodeArgs_RunLevelTraceSkip(t *testing.T) {
+	oldCT, oldReason := collectTraces, traceSkipReason
+	collectTraces, traceSkipReason = false, "time window is 120 minutes (max: 60 minutes)"
+	defer func() { collectTraces, traceSkipReason = oldCT, oldReason }()
+	args := strings.Join(remoteNodeArgs("h", time.Time{}, time.Time{}, nil), " ")
+	if !strings.Contains(args, "--trace-skip-reason time window is 120 minutes (max: 60 minutes)") || strings.Contains(args, "--collect-traces") {
+		t.Errorf("run-level skip not forwarded: %s", args)
+	}
+}
+
+func TestRemoteTraceLine(t *testing.T) {
+	stderr := "Traces:   /opt/weka/weka-log-collector/trace_extractor-1  (filter: --all)\n" +
+		"Traces:   ./te is not executable; running a copy (/tmp/x)\n" +
+		"[traces] 42 shards, 7 histogram files in 3s\n\nCollection complete → x\n" +
+		"  Commands: 80 total, 0 failed\n  Traces:   ok, 42 shards\n"
+	if got := remoteTraceLine(stderr); got != "ok, 42 shards" {
+		t.Errorf("got %q", got)
+	}
+	if got := remoteTraceLine("no traces here\n"); got != "" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestEarlySignalHandler(t *testing.T) {
+	switch os.Getenv("WLC_TEST_EARLY_SIG") {
+	case "handle", "handover":
+		path := os.Getenv("WLC_TEST_EARLY_FILE")
+		exitCleanups = append(exitCleanups, func() { os.Remove(path) })
+		startEarlySignalHandler(false)
+		if os.Getenv("WLC_TEST_EARLY_SIG") == "handover" {
+			stopEarlySignalHandler()
+		}
+		_ = os.WriteFile(path+".ready", nil, 0644)
+		time.Sleep(10 * time.Second)
+		os.Exit(7) // not reached when the signal is handled
+	}
+	for _, mode := range []string{"handle", "handover"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "copy")
+		_ = os.WriteFile(path, []byte("x"), 0755)
+		cmd := exec.Command(os.Args[0], "-test.run=^TestEarlySignalHandler$")
+		cmd.Env = append(os.Environ(), "WLC_TEST_EARLY_SIG="+mode, "WLC_TEST_EARLY_FILE="+path)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 100; i++ {
+			if _, err := os.Stat(path + ".ready"); err == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		_ = cmd.Process.Signal(os.Interrupt)
+		err := cmd.Wait()
+		_, statErr := os.Stat(path)
+		switch mode {
+		case "handle":
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || !os.IsNotExist(statErr) {
+				t.Errorf("handle: want exit 1 and copy removed, got err=%v copyErr=%v", err, statErr)
+			}
+		case "handover":
+			// After stopEarlySignalHandler the early handler must not act:
+			// the default SIGINT action ends the process, the file stays.
+			if err == nil || statErr != nil {
+				t.Errorf("handover: want default signal exit with the file kept, got err=%v copyErr=%v", err, statErr)
+			}
+		}
+	}
+}
+
+func TestRunK8sMode_UploadFailureExitCode(t *testing.T) {
+	if os.Getenv("WLC_TEST_K8S_UPLOAD") != "" {
+		os.Exit(runK8sMode([]string{"--upload", "--cmd-timeout", "5s", "--output", os.Getenv("WLC_TEST_K8S_OUT")}))
+	}
+	dir := t.TempDir()
+	// A kubectl that only answers "version"; everything else fails.
+	script := "#!/bin/sh\ncase \"$1\" in version) echo 'Client Version: v1.29.0'; exit 0;; esac\necho 'error: not found' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunK8sMode_UploadFailureExitCode$")
+	cmd.Env = append(os.Environ(), "WLC_TEST_K8S_UPLOAD=1", "WLC_TEST_K8S_OUT="+filepath.Join(dir, "b.tar.gz"),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Errorf("want exit 1 after a failed k8s upload, got %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "Upload failed") {
+		t.Errorf("exit 1 did not come from the upload step:\n%s", out)
+	}
+}

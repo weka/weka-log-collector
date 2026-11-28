@@ -127,7 +127,8 @@ Flags:
                        Maximum trace_extractor run time per node (default: 15m). Each
                        node's outcome (status, shard count, unparsed files skipped) is
                        recorded in collection_manifest.json ("traces"), summarised in
-                       cluster_summary.json and printed at the end of the run; the
+                       cluster_summary.json and printed at the end of the run (with
+                       --upload: one line per node as it finishes, no summary file); the
                        extractor's full output is in hosts/<host>/traces/extractor.log.
   --clients            Include client nodes in cluster collection (default: backends only)
   --clients-only       Collect from client nodes only (skip backends)
@@ -537,6 +538,8 @@ Add `--upload` to any collection command to send the archive directly to Weka Ho
 weka-log-collector --start-time -2h --upload
 weka-log-collector --local --upload
 ```
+
+A failed upload exits non-zero (1) for `--local --upload` and `k8s --upload`, and for cluster `--upload` when no node uploaded; the local bundle is kept. With `--collect-traces`, each node gets extra time (`--trace-timeout` plus 30 minutes) for the trace step and for uploading the larger archive, and its trace outcome is printed as it finishes.
 
 You can also upload a previously collected file:
 

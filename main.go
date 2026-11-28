@@ -3730,6 +3730,11 @@ var (
 	traceDeployFailed sync.Map
 )
 
+// traceUploadAllowance is extra remote time in --upload mode when traces are
+// collected: the uploader expects about 30 MB/min, so a 1 GB trace archive
+// needs about 33 minutes on top of collection and extraction.
+const traceUploadAllowance = 30 * time.Minute
+
 // traceWindowTolerance is the slack allowed on top of traceMaxWindow.
 const traceWindowTolerance = time.Minute
 
@@ -3745,6 +3750,50 @@ func exitProcess(code int) {
 		f()
 	}
 	os.Exit(code)
+}
+
+// earlySig is the Ctrl-C handler installed once a cleanup is registered and
+// before a more specific handler exists; stopEarlySignalHandler hands over.
+var (
+	earlySigMu sync.Mutex
+	earlySig   chan os.Signal
+)
+
+// startEarlySignalHandler makes SIGINT/SIGTERM run exitCleanups (and release
+// the run lock when this run holds it) until stopEarlySignalHandler is called.
+func startEarlySignalHandler(holdsRunLock bool) {
+	earlySigMu.Lock()
+	defer earlySigMu.Unlock()
+	if earlySig != nil {
+		return
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	earlySig = ch
+	go func() {
+		if _, ok := <-ch; !ok {
+			return
+		}
+		for _, f := range exitCleanups {
+			f()
+		}
+		if holdsRunLock {
+			releaseRunLock()
+		}
+		os.Exit(1)
+	}()
+}
+
+// stopEarlySignalHandler stops the early handler before another handler is
+// installed, so two handlers never race to exit.
+func stopEarlySignalHandler() {
+	earlySigMu.Lock()
+	defer earlySigMu.Unlock()
+	if earlySig != nil {
+		signal.Stop(earlySig)
+		close(earlySig)
+		earlySig = nil
+	}
 }
 
 // traceWindowEnd is the end of the trace window when no --end-time was given:
@@ -4450,6 +4499,11 @@ func remoteNodeArgs(host string, from, to time.Time, containerNames []string) []
 	}
 	for _, name := range containerNames {
 		extra = append(extra, "--container-name", name)
+	}
+	if !collectTraces && traceSkipReason != "" {
+		// The whole run skipped traces (no --start-time, window too long):
+		// record it in every node's manifest, also in --upload mode.
+		extra = append(extra, "--trace-skip-reason", oneLine(traceSkipReason, 300))
 	}
 	if v, failed := traceDeployFailed.Load(host); failed && collectTraces && resolvedTraceExtractorPath != "" {
 		// Let the node record why its bundle has no traces (also in --upload
@@ -5163,6 +5217,7 @@ func uploadBundle(archivePath string, sessionID int64) error {
 	setActive := func(p string) { mu.Lock(); activeLinkPath = p; mu.Unlock() }
 	getActive := func() string { mu.Lock(); defer mu.Unlock(); return activeLinkPath }
 
+	stopEarlySignalHandler()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -6634,7 +6689,8 @@ EXAMPLES
 // runK8sMode is the entry point for `weka-log-collector k8s [args]`.
 // It parses k8s-specific flags, discovers Weka namespaces, collects diagnostics
 // from all Weka components in the K8s cluster, and produces a .tar.gz bundle.
-func runK8sMode(args []string) {
+// It returns the process exit code: 1 when --upload was requested and failed.
+func runK8sMode(args []string) int {
 	fs := flag.NewFlagSet("k8s", flag.ExitOnError)
 	fs.Usage = k8sUsageFunc
 
@@ -6659,7 +6715,7 @@ func runK8sMode(args []string) {
 
 	if *ver {
 		fmt.Printf("weka-log-collector %s\n", version)
-		return
+		return 0
 	}
 
 	if extra := fs.Args(); len(extra) > 0 {
@@ -6870,9 +6926,11 @@ func runK8sMode(args []string) {
 	}
 	logf("  Commands: %d total, %d failed", m.TotalCommands, m.FailedCommands)
 
+	uploadFailed := false
 	if *upload {
 		if err := uploadK8sBundle(kc, ns.Cluster, outPath); err != nil {
 			errorf("Upload failed: %v", err)
+			uploadFailed = true
 		}
 	}
 
@@ -6884,6 +6942,10 @@ func runK8sMode(args []string) {
 			logf("Keep this file at your site — it is needed to decode anonymized values when troubleshooting.")
 		}
 	}
+	if uploadFailed {
+		return 1
+	}
+	return 0
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -7225,7 +7287,7 @@ func main() {
 	// Subcommand routing: must precede flag.Parse() so k8s-specific flags are
 	// not seen by the global flag set and --help stays uncluttered.
 	if len(os.Args) > 1 && os.Args[1] == "k8s" {
-		runK8sMode(os.Args[2:])
+		exitCode = runK8sMode(os.Args[2:])
 		return
 	}
 
@@ -7486,18 +7548,9 @@ func main() {
 			traceExtractorSource = resolvedTraceExtractorPath
 			if p != resolvedTraceExtractorPath {
 				logf("Traces:   %s is not executable; running a copy (%s)", resolvedTraceExtractorPath, p)
-				if *localOnly {
-					// Cluster mode has its own Ctrl-C handler that runs
-					// exitCleanups; a --local run has none.
-					localSig := make(chan os.Signal, 1)
-					signal.Notify(localSig, os.Interrupt, syscall.SIGTERM)
-					go func() {
-						<-localSig
-						cleanup()
-						releaseRunLock()
-						os.Exit(1)
-					}()
-				}
+				// Until a more specific handler takes over (the cluster
+				// handler, or uploadBundle's), Ctrl-C removes the copy.
+				startEarlySignalHandler(!*nodeOnly)
 			}
 			resolvedTraceExtractorPath = p
 		}
@@ -7798,6 +7851,7 @@ func main() {
 	// currently being collected and kill the remote weka-log-collector process
 	// and its binary. We wait for all kills to complete before exiting so we
 	// don't leave orphaned processes consuming CPU/disk on production nodes.
+	stopEarlySignalHandler()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -8067,7 +8121,9 @@ func collectCluster(hosts []string, displayNames map[string]string, selfPath, pr
 // uploadFromHost runs collection + upload on a remote host (binary already deployed
 // by deployAll). The remote node collects its own logs, uploads to Weka Home via its
 // local uploader, and cleans up the local archive. The caller handles start/completion logs.
-func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64, compression string) error {
+// It returns the node's own "Traces:" summary line (empty when traces were
+// not collected), since in --upload mode no merged summary is written.
+func uploadFromHost(host, displayName, selfPath, profile string, from, to time.Time, sshTimeout time.Duration, containerNames []string, sessionID int64, compression string) (string, error) {
 	if displayName == "" {
 		displayName = host
 	}
@@ -8089,7 +8145,9 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 	args = append(args, remoteNodeArgs(host, from, to, containerNames)...)
 	collectionCmd := shellJoin(args)
 	if tracesEnabledForHost(host) {
-		sshTimeout += traceTimeout
+		// Room for the trace step and for uploading its archive, which can
+		// be much larger than the logs.
+		sshTimeout += traceTimeout + traceUploadAllowance
 	}
 	remoteShellCmd := remoteShellCommand(host, remoteBin, collectionCmd, sshTimeout)
 
@@ -8101,24 +8159,36 @@ func uploadFromHost(host, displayName, selfPath, profile string, from, to time.T
 			exitCode := exitErr.ExitCode()
 			errMsg := strings.TrimSpace(stderrBuf.String())
 			if exitCode == 124 {
-				return fmt.Errorf("timed out after %s — collection/upload took too long", sshTimeout)
+				return "", fmt.Errorf("timed out after %s — collection/upload took too long", sshTimeout)
 			}
 			if exitCode == 137 {
 				vlogf("[%s] remote output:\n%s", host, errMsg)
-				return fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", remoteErrorSummary(errMsg))
+				return "", fmt.Errorf("process killed (OOM) — try --start-time to reduce size: %s", remoteErrorSummary(errMsg))
 			}
 			// The full node output goes to the debug log (and --verbose); the
 			// returned error keeps only the cause.
 			vlogf("[%s] remote output:\n%s", host, errMsg)
-			return remoteFailure(exitCode, errMsg)
+			return "", remoteFailure(exitCode, errMsg)
 		}
-		return fmt.Errorf("SSH error: %v", err)
+		return "", fmt.Errorf("SSH error: %v", err)
 	}
 	// Clean up remote logs/ and bundles/ after successful upload.
 	// Debug logs are already inside the uploaded bundle; no need to keep them on disk.
 	cleanupCmd := fmt.Sprintf("rm -f %s/logs/*.log %s/bundles/*.tar.gz %s/bundles/*.tar.xz", wlcBaseDir, wlcBaseDir, wlcBaseDir)
 	exec.Command("ssh", append(sshArgs(), sshTarget, cleanupCmd)...).Run() //nolint:errcheck
-	return nil
+	return remoteTraceLine(stderrBuf.String()), nil
+}
+
+// remoteTraceLine returns the status part of a node's end-of-run
+// "  Traces:   <status>" line from its stderr, or "".
+func remoteTraceLine(stderr string) string {
+	line := ""
+	for _, l := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(l, "  Traces:") {
+			line = strings.TrimSpace(strings.TrimPrefix(l, "  Traces:"))
+		}
+	}
+	return line
 }
 
 // uploadCluster deploys the binary to all remote hosts first, then fans out
@@ -8156,7 +8226,7 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			logf("  [%s] collecting and uploading...", display)
-			err := uploadFromHost(host, display, selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID, compression)
+			traceLine, err := uploadFromHost(host, display, selfPath, profile, from, to, 10*cmdTimeout, containerNames, sessionID, compression)
 			mu.Lock()
 			done++
 			n := done
@@ -8166,6 +8236,13 @@ func uploadCluster(hosts []string, displayNames map[string]string, selfPath, pro
 				errorf("  [%s] failed [%d/%d]: %v", display, n, total, err)
 			} else {
 				logf("  [%s] upload complete  [%d/%d]", display, n, total)
+			}
+			if traceLine != "" {
+				if strings.HasPrefix(traceLine, "ok") && !strings.Contains(traceLine, "unparsed") {
+					logf("  [%s] traces: %s", display, traceLine)
+				} else {
+					warnf("  [%s] traces: %s", display, traceLine)
+				}
 			}
 		}()
 	}
@@ -8494,7 +8571,9 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 				key = fmt.Sprintf("%s#%d", base, n)
 			}
 			traces[key] = tr
-			if tr.Status != "ok" || tr.UnparsedFiles > 0 {
+			if tr.Status == "skipped" && tr.Reason == traceSkipReason {
+				// Run-level skip: reported once at the end, not per host.
+			} else if tr.Status != "ok" || tr.UnparsedFiles > 0 {
 				warnf("  [%s] traces: %s", r.Host, traceResultLine(tr))
 				traceProblems = append(traceProblems, key)
 			} else {
@@ -8553,12 +8632,13 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		logf("  Failed:   %s", strings.Join(failedHosts, ", "))
 		logf("  Tip: check SSH access and ensure weka-log-collector binary is at the expected path on failed hosts.")
 	}
-	if len(traces) > 0 {
+	if len(traces) > 0 && traceSkipReason == "" {
 		logf("  Traces:   %d host(s) reported, %d with problems", len(traces), len(traceProblems))
 		if len(traceProblems) > 0 {
 			logf("            check: %s (details in cluster_summary.json and hosts/<host>/traces/extractor.log)", strings.Join(traceProblems, ", "))
 		}
-	} else if traceSkipReason != "" {
+	}
+	if traceSkipReason != "" {
 		logf("  Traces:   skipped: %s", traceSkipReason)
 	}
 	if !toStdout {
