@@ -3733,9 +3733,23 @@ var (
 // traceWindowTolerance is the slack allowed on top of traceMaxWindow.
 const traceWindowTolerance = time.Minute
 
-// interruptCleanup holds local cleanups (temp files) that the Ctrl-C handler
-// runs before it exits, since os.Exit skips deferred calls.
-var interruptCleanup []func()
+// exitCleanups holds local cleanups (temp files) that must also run when the
+// process ends through os.Exit, which skips deferred calls: exitProcess and
+// the Ctrl-C handlers run them.
+var exitCleanups []func()
+
+// exitProcess runs exitCleanups and exits. Used instead of os.Exit on paths
+// that can run after a cleanup was registered (the trace_extractor copy).
+func exitProcess(code int) {
+	for _, f := range exitCleanups {
+		f()
+	}
+	os.Exit(code)
+}
+
+// traceWindowEnd is the end of the trace window when no --end-time was given:
+// the time at which the 60-minute cap was checked.
+var traceWindowEnd time.Time
 
 // defaultTraceTimeout bounds one trace_extractor run (--trace-timeout).
 const defaultTraceTimeout = 15 * time.Minute
@@ -4082,8 +4096,12 @@ func runTraceExtractor(tw *tar.Writer, archiveRoot, pathHostname string, from, t
 	if !from.IsZero() {
 		args = append(args, "--from", from.Format(time.RFC3339))
 	}
-	if !to.IsZero() {
-		args = append(args, "--to", to.Format(time.RFC3339))
+	end := to
+	if end.IsZero() {
+		end = traceWindowEnd
+	}
+	if !end.IsZero() {
+		args = append(args, "--to", end.Format(time.RFC3339))
 	}
 
 	tmpDir, err := os.MkdirTemp("", "wlc-traces-*")
@@ -5156,7 +5174,7 @@ func uploadBundle(archivePath string, sessionID int64) error {
 				os.Remove(stagedPath)
 			}
 			warnf("Upload interrupted — cleaned up staging files")
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}()
 	defer signal.Stop(sigCh)
@@ -7420,6 +7438,12 @@ func main() {
 					effectiveTo.Sub(from).Minutes())
 				logf("      Narrow the window with --start-time / --end-time to at most 1 hour.")
 				*collectTracesFlag = false
+			} else {
+				// The extractor runs after log collection. Without an end
+				// time (--local) it would otherwise take "now" at that point
+				// and the window would grow past the cap by the collection
+				// time; fix the end where the cap was checked.
+				traceWindowEnd = effectiveTo
 			}
 		}
 	}
@@ -7458,13 +7482,13 @@ func main() {
 				return
 			}
 			defer cleanup()
-			interruptCleanup = append(interruptCleanup, cleanup)
+			exitCleanups = append(exitCleanups, cleanup)
 			traceExtractorSource = resolvedTraceExtractorPath
 			if p != resolvedTraceExtractorPath {
 				logf("Traces:   %s is not executable; running a copy (%s)", resolvedTraceExtractorPath, p)
 				if *localOnly {
 					// Cluster mode has its own Ctrl-C handler that runs
-					// interruptCleanup; a --local run has none.
+					// exitCleanups; a --local run has none.
 					localSig := make(chan os.Signal, 1)
 					signal.Notify(localSig, os.Interrupt, syscall.SIGTERM)
 					go func() {
@@ -7625,7 +7649,7 @@ func main() {
 		if err != nil {
 			errorf("disk space check failed for %s: %v", outputDir, err)
 			errorf("Tip: use --output to write to a different location (e.g. --output /data/weka-logs.tar.gz)")
-			os.Exit(1)
+			exitProcess(1)
 		}
 		logf("Disk:     %d MB available on %s", di.AvailMB, di.Path)
 		if di.AvailMB < minFreeSpaceMB {
@@ -7633,7 +7657,7 @@ func main() {
 				di.Path, di.AvailMB, minFreeSpaceMB)
 			errorf("Tip: use --output /path/on/bigger/disk to write to a different filesystem.")
 			errorf("     Or free up space on %s first.", di.Path)
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}
 
@@ -7731,7 +7755,7 @@ func main() {
 				nodes = filterClientNodes(nodes)
 				if len(nodes) == 0 {
 					errorf("No client nodes found in cluster. Are there any Weka client containers?")
-					os.Exit(1)
+					exitProcess(1)
 				}
 				logf("Filtered to %d client node(s)", len(nodes))
 			}
@@ -7739,7 +7763,7 @@ func main() {
 				nodes = filterNodesByContainerID(nodes, []int(containerIDs))
 				if len(nodes) == 0 {
 					errorf("No nodes found matching --container-id %v", []int(containerIDs))
-					os.Exit(1)
+					exitProcess(1)
 				}
 				logf("Filtered to %d node(s) matching --container-id %v", len(nodes), []int(containerIDs))
 			}
@@ -7767,7 +7791,7 @@ func main() {
 	selfPath, err := os.Executable()
 	if err != nil {
 		errorf("Could not determine executable path: %v", err)
-		os.Exit(1)
+		exitProcess(1)
 	}
 	// ── signal handler: clean up remote processes on interrupt ───────────
 	// If the user hits Ctrl+C (or SIGTERM arrives), SSH to every host that is
@@ -7793,7 +7817,7 @@ func main() {
 			return true
 		})
 		cleanupWg.Wait()
-		for _, f := range interruptCleanup {
+		for _, f := range exitCleanups {
 			f()
 		}
 		releaseRunLock()
@@ -7883,7 +7907,7 @@ func main() {
 		// Fail fast if Weka Home is unreachable from the orchestrator.
 		if _, err := checkCloudEnabled(); err != nil {
 			errorf("Cannot upload: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 
 		// Single session ID shared by all nodes so Weka Home groups their
@@ -8173,7 +8197,7 @@ func writeArchive(outPath string, toStdout bool, profile string, from, to time.T
 		if err != nil {
 			errorf("Cannot create output file %s: %v", outPath, err)
 			errorf("Tip: check write permissions or use --output /data/weka-logs.tar.gz")
-			os.Exit(1)
+			exitProcess(1)
 		}
 		defer f.Close()
 		outWriter = f
@@ -8365,7 +8389,7 @@ func writeMergedArchive(outPath string, toStdout bool, results []HostResult, pro
 		if err != nil {
 			errorf("Cannot create output file %s: %v", outPath, err)
 			errorf("Tip: check write permissions or use --output /data/weka-logs.tar.gz")
-			os.Exit(1)
+			exitProcess(1)
 		}
 		defer f.Close()
 		outWriter = f

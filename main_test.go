@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -1377,5 +1378,61 @@ func TestK8sHasBothEventsFiles(t *testing.T) {
 		if !names[n] {
 			t.Errorf("k8s clusterWideCLICommands lacks %s", n)
 		}
+	}
+}
+
+func TestRunTraceExtractor_LocalWindowEndFixed(t *testing.T) {
+	// --local leaves "to" unset; the extractor must still get --to, set to
+	// the time the 60 minute cap was checked, not "now" after log collection.
+	end := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+	old := traceWindowEnd
+	traceWindowEnd = end
+	defer func() { traceWindowEnd = old }()
+
+	oldPath, oldTimeout := resolvedTraceExtractorPath, traceTimeout
+	resolvedTraceExtractorPath, traceTimeout = writeFakeExtractor(t, sampleExtractorOutput, 0, 0), time.Minute
+	defer func() { resolvedTraceExtractorPath, traceTimeout = oldPath, oldTimeout }()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	runTraceExtractor(tw, "root", "h1", end.Add(-time.Hour), time.Time{})
+	tw.Close()
+	tr := tar.NewReader(&buf)
+	var log string
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if strings.HasSuffix(hdr.Name, "extractor.log") {
+			b, _ := io.ReadAll(tr)
+			log = string(b)
+		}
+	}
+	if !strings.Contains(log, "--to "+end.Format(time.RFC3339)) {
+		t.Errorf("extractor did not get the fixed window end:\n%s", log)
+	}
+}
+
+func TestExitProcessRunsCleanups(t *testing.T) {
+	if path := os.Getenv("WLC_TEST_EXIT_CLEANUP"); path != "" {
+		// Child: register a cleanup that removes the file, then exit.
+		exitCleanups = append(exitCleanups, func() { os.Remove(path) })
+		exitProcess(3)
+		return
+	}
+	path := filepath.Join(t.TempDir(), "copy")
+	if err := os.WriteFile(path, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestExitProcessRunsCleanups$")
+	cmd.Env = append(os.Environ(), "WLC_TEST_EXIT_CLEANUP="+path)
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("want exit code 3, got %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("cleanup did not run before exit: %s still exists", path)
 	}
 }
