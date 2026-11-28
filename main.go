@@ -469,23 +469,32 @@ func redactLine(line, lower []byte, isJSONDoc, filtered bool) []byte {
 	return line
 }
 
-// isJSONDocument reports whether b is one JSON document. Starting with { or [
-// is not enough: kubectl logs --prefix lines start with "[pod/...]" and dmesg
-// lines with "[   12.3]", and those must get the line-based key pass.
-func isJSONDocument(b []byte) bool {
+// looksLikeJSON reports whether b starts with { or [ after whitespace.
+func looksLikeJSON(b []byte) bool {
 	trimmed := bytes.TrimLeft(b, " \t\r\n")
-	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') && json.Valid(trimmed)
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
 }
 
-// redactSensitive redacts credentials in collected text. A JSON document
-// (starts with { or [ after whitespace) first gets the whole-document JSON
-// pass, which also handles multi-line arrays. Then every line that contains a
-// credential hint gets redactLine; other lines are copied unchanged, which
+// isJSONDocument reports whether b is one valid JSON document. Only those
+// skip the line-based key pass, which would cut JSON structure. Starting with
+// { or [ is not enough: kubectl logs --prefix lines start with "[pod/...]",
+// dmesg lines with "[   12.3]", and JSON cut short by a timeout or followed
+// by a trailer line does not parse; all of these keep the line pass.
+func isJSONDocument(b []byte) bool {
+	return looksLikeJSON(b) && json.Valid(bytes.TrimLeft(b, " \t\r\n"))
+}
+
+// redactSensitive redacts credentials in collected text. Content that starts
+// with { or [ after whitespace first gets the whole-document JSON pass, the
+// only pass that redacts multi-line arrays (join_secret); it runs whether or
+// not the content parses, so truncated JSON is covered too. Then every line
+// that contains a credential hint gets redactLine (without the line-based key
+// pass for a valid JSON document); other lines are copied unchanged, which
 // keeps this fast on large logs. Safe to call on arbitrary command output —
 // content without sensitive keys is returned unchanged.
 func redactSensitive(b []byte) []byte {
 	isJSONDoc := isJSONDocument(b)
-	if isJSONDoc {
+	if looksLikeJSON(b) {
 		b = redactSensitiveJSON(b)
 	}
 	lower := asciiLower(b)

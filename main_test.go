@@ -1044,7 +1044,7 @@ func TestRedactSensitive_CLIValuelessFlagsAndCase(t *testing.T) {
 // line. The fast path must give byte-identical output.
 func refRedactAll(b []byte) []byte {
 	isJSON := isJSONDocument(b)
-	if isJSON {
+	if looksLikeJSON(b) {
 		b = redactSensitiveJSON(b)
 	}
 	lines := bytes.Split(b, []byte("\n"))
@@ -1255,6 +1255,29 @@ func TestRedactSensitive_PrefixedPodLogsGetKeyPass(t *testing.T) {
 	}
 	if !isJSONDocument([]byte(` {"a": 1, "join_secret": ["x"]}`)) || !isJSONDocument([]byte("[\n {\"a\": 1}\n]\n")) {
 		t.Errorf("real JSON not classified as a JSON document")
+	}
+}
+
+// JSON that does not parse (cut short by a command timeout, or followed by a
+// trailer line) still gets the whole-document pass, the only one that
+// redacts a multi-line array such as join_secret.
+func TestRedactSensitive_InvalidJSONGetsArrayPass(t *testing.T) {
+	doc := "{\n  \"name\": \"c1\",\n  \"join_secret\": [\n    \"" + fakePW + "\"\n  ],\n  \"other\": \"ok\""
+	for name, in := range map[string]string{
+		"truncated":       doc + ",\n  \"more\": [\n    \"x",
+		"trailer":         doc + "\n}\nerror: command timed out\n",
+		"array top level": "[\n {\"join_secret\": [\n   \"" + fakePW + "\"\n ]},\n {\"a\": ",
+	} {
+		if isJSONDocument([]byte(in)) {
+			t.Fatalf("%s: test input parses as JSON", name)
+		}
+		got := string(redactSensitive([]byte(in)))
+		if strings.Contains(got, fakePW) {
+			t.Errorf("%s: join_secret array not redacted:\n%s", name, got)
+		}
+		if !strings.Contains(got, `"other": "ok"`) && name != "array top level" {
+			t.Errorf("%s: unrelated key changed:\n%s", name, got)
+		}
 	}
 }
 
